@@ -1,0 +1,98 @@
+# VEP Pipeline Project Configuration
+# ===================================
+#
+# Copy this template to your project directory and customize.
+#
+# Usage:
+#   1. Copy to your project: cp project_config.yaml /path/to/project/vep_config.yaml
+#   2. Update paths below
+#   3. Run: snakemake --configfile vep_config.yaml
+#
+# Author: Kevin R. Roy
+# Date: 2026-02-20
+
+# Project identification
+project_name: "my_vep_project"
+project_dir: "/path/to/project"
+
+# Input paths
+# -----------
+# Provide at least one of these based on which models you want to run:
+#   - fasta_50kb_dir: For Evo2 and Yorzoi (50kb sequences centered on gene)
+#   - fasta_16kb_dir: For Shorkie (16kb sequences)
+#   - protein_variants_file: For ESM1-v (missense variants TSV)
+
+fasta_50kb_dir: "/path/to/project/fasta_50kb"
+fasta_16kb_dir: "/path/to/project/fasta_16kb"
+protein_variants_file: "/path/to/project/protein_variants.tsv"
+
+# Metadata file (optional but recommended)
+# Should have columns: test_id, orf, gene, background_strain, test_type, etc.
+metadata_file: "/path/to/project/test_metadata.tsv"
+
+# Output directory (default: project_dir/vep_results)
+output_dir: "/path/to/project/vep_results"
+
+# Models to run
+# -------------
+# Options: evo2, yorzoi, shorkie, esm1v
+# Default: all models that have available input data
+models_to_run:
+  - evo2
+  - yorzoi
+  - shorkie
+  - esm1v
+
+# Evo2 configuration
+# ------------------
+evo2_model: "evo2_7b"  # or "evo2_40b" (requires 4x H100)
+save_position_logprobs: true
+
+evo2:
+  enabled: true
+  container_path: "/path/to/common/software/evo2_with_dependencies.sif"
+  partition: "gpu"
+  gres: "gpu:1"  # Change to "gpu:4" for evo2_40b
+  constraint: "GPU_SKU:H100_SXM5&GPU_MEM:80GB"
+  mem_gb: 64  # Change to 256 for evo2_40b
+  time_hours: 12
+
+# Yorzoi configuration
+# --------------------
+yorzoi:
+  enabled: true
+  conda_env: "yorzoi_local"
+  partition: "gpu"
+  gres: "gpu:1"
+  constraint: "GPU_SKU:A100_SXM4|GPU_SKU:H100_SXM5"  # Requires Ampere+ for flash-attention
+  mem_gb: 64
+  time_hours: 12
+
+# Shorkie configuration
+# ---------------------
+shorkie:
+  enabled: true
+  conda_env: "shorkie"
+  partition: "gpu"
+  gres: "gpu:1"
+  mem_gb: 64
+  time_hours: 12
+
+# ESM1-v configuration
+# --------------------
+esm1v:
+  enabled: true
+  conda_env: "esm1v"
+  partition: "gpu"
+  gres: "gpu:1"
+  mem_gb: 32
+  time_hours: 2
+
+# Processing options
+# ------------------
+incremental: false  # Skip already-processed sequences
+batch_size: 1
+
+# SLURM defaults
+# --------------
+default_partition: "gpu"

@@ -1,0 +1,22 @@
+# Test configuration for VEP Pipeline
+project_name: "vep_pipeline_test"
+project_dir: "/path/to/common/scripts/variant_effect_prediction/tests"
+
+# Input paths
+fasta_50kb_dir: "/path/to/common/scripts/variant_effect_prediction/tests/fasta_50kb"
+fasta_16kb_dir: "/path/to/common/scripts/variant_effect_prediction/tests/fasta_16kb"
+protein_variants_file: "/path/to/common/scripts/variant_effect_prediction/tests/protein_variants.tsv"
+metadata_file: "/path/to/common/scripts/variant_effect_prediction/tests/metadata.tsv"
+
+# Output directory
+output_dir: "/path/to/common/scripts/variant_effect_prediction/tests/output"
+
+# Models to run
+models_to_run:
+  - evo2
+  - yorzoi
+  - shorkie
+  - esm1v
+
+# Evo2 configuration
+evo2_model: "evo2_7b"
