@@ -25,22 +25,17 @@ Scripts for designing MAGESTIC guide-donor oligonucleotides:
 - `GTF_GFF_manipulation.py` - GFF/GTF file parsing and manipulation
 - `bedgraph_computation.py` - Generate bedgraph coverage files
 
-### Variant Effect Prediction (VEP/)
+### Variant Effect Prediction (VEP)
 
-A unified pipeline for running multiple variant effect prediction models on yeast sequences. See [VEP/README.md](VEP/README.md) for details.
+The VEP pipeline for running variant effect prediction models is maintained in a **separate private repository**.
+
+**Access:** Contact Kevin Roy (kevinrjroy@gmail.com) for access to the VEP-pipeline repository.
 
 **Supported models:**
-- **Evo2 7B/40B** - DNA sequence log-probability scores
-- **Yorzoi** - RNA expression predictions from DNA
-- **Shorkie** - RNA expression (8-fold ensemble)
-- **ESM1-v** - Protein variant effect scores
-
-**Quick start:**
-```bash
-cd VEP/reference_data/
-gunzip -k *.gz
-samtools faidx S288C_reference_sequence_R64-5-1_20240529.fsa
-```
+- Evo2 7B/40B - DNA sequence log-probability scores
+- Yorzoi - RNA expression predictions from DNA
+- Shorkie - RNA expression (8-fold ensemble)
+- ESM1-v - Protein variant effect scores
 
 ## Requirements
 
@@ -48,7 +43,6 @@ samtools faidx S288C_reference_sequence_R64-5-1_20240529.fsa
 - Biopython
 - pandas, numpy
 - samtools (for FASTA indexing)
-- Snakemake 8+ (for VEP pipeline)
 
 ## Citation
 

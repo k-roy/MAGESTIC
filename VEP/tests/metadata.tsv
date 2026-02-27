@@ -1,9 +1,0 @@
-test_id	orf	gene	background_strain	test_type	n_variants
-YNL085W_wt_BY	YNL085W	MKT1	BY	wt	0
-YNL085W_F548L_BY	YNL085W	MKT1	BY	single_variant	1
-YNL085W_wt_RM	YNL085W	MKT1	RM	wt	0
-YNL085W_L548F_RM	YNL085W	MKT1	RM	single_variant	1
-YOR202W_wt_BY	YOR202W	HIS3	BY	wt	0
-YOR202W_D30G_BY	YOR202W	HIS3	BY	single_variant	1
-YOR202W_wt_RM	YOR202W	HIS3	RM	wt	0
-YOR202W_G30D_RM	YOR202W	HIS3	RM	single_variant	1
