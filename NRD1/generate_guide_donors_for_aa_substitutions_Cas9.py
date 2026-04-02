@@ -1,44 +1,72 @@
 # -*- coding: utf-8 -*-
 """
-generate_guide_donors_for_aa_mutations_Cas9_and_Cas12a.py
+generate_guide_donors_for_aa_substitutions_Cas9.py
 
-Designs guides and donors for desired ORF amino acid substitutions.
-Input file: tab-separated, no header. Supports 3, 5, 7, 9, or 11 fields (see docstring for formats).
+Design SpCas9 guide RNA / donor DNA oligonucleotides for introducing specific
+amino acid substitutions into a yeast ORF via CRISPR-mediated HDR.
+
+This script was used to design the NRD1 alanine-scan / PTC / synonymous-control
+oligonucleotide library described in:
+
+    Roy KR et al. (2024) [manuscript in preparation]
+
+Usage
+-----
+    python generate_guide_donors_for_aa_substitutions_Cas9.py \\
+        --ref-dir /path/to/large/reference/files/
+
+All small reference files (codon tables, plasmid FASTAs, primer sequences) are
+bundled in this directory.  The three large reference files must be downloaded
+from Zenodo (see README.md):
+    - MAGESTIC_background_strain.fasta
+    - MAGESTIC_background_strain_annotations.gff
+    - MAGESTIC_base_strain_allowed_Cas9_20mer_guides_NGG.txt
+    - MAGESTIC_base_strain_disallowed_Cas9_20mer_guides_NGG.txt
+
+Outputs (written to --output-dir, default: same directory as this script)
+---------
+    NRD1_SpCas9_NGG_guide_donor_200bp_oligo_pool.tsv  — oligo names + sequences
+    NRD1_SpCas9_NGG_guide_donor_200bp_info.tsv        — full per-oligo design details
+    NRD1_SpCas9_NGG_guide_donor_200bp_untargetable.tsv — mutations that could not be targeted
+
+Author: Kevin R. Roy
 """
 
-import os
-from datetime import date
-from guide_donor_functions import *
+import argparse
+import logging
+import sys
+from pathlib import Path
 
-DATE = date.today().strftime("%Y%m%d")
-
-# Directories and filenames
-BASE_DIR = "/path/to/CloudStorage/GoogleDrive-kevinrjroy@gmail.com/My Drive/SGTC_genome_editing_group/scripts_and_reference_files/guide_donor_design/"
-PROJECT_DIR = BASE_DIR + "20240209_NNS_complex_mutagenesis/"
-os.chdir(PROJECT_DIR)
-
-genome_filename = BASE_DIR + "MAGESTIC_background_strain.fasta"
-gff_filename = BASE_DIR + "MAGESTIC_background_strain_annotations.gff"
-codon_table_file = BASE_DIR + "DNA_codon_to_AA.txt"
-codon_table_subopt_file = BASE_DIR + "DNA_codon_to_AA_suboptimal_codons_removed.txt"
-rev_primer_file = BASE_DIR + "rev_subpool_priming_sequences.txt"
-allowed_guides_file = (
-    BASE_DIR + "MAGESTIC_base_strain_allowed_Cas9_20mer_guides_NGG.txt"
+from guide_donor_functions import (
+    assign_num_syn_changes_for_Cas9,
+    assign_num_syn_changes_for_Cas12a,
+    assemble_donor,
+    get_aa_num_to_codon_coords_aa,
+    get_ORF_seq_and_CDS_coords,
+    get_seq_with_largest_hamming_dist,
+    guide_disruption,
+    load_codon_table,
+    load_genome,
+    load_guides_from_fasta,
+    load_ORF_coordinates,
+    load_processed_guides,
+    load_systematic_to_common_gene_name_dict,
+    remove_BspQI_sites_from_donor_in_final_oligo,
+    restriction_site_in_seq,
+    rev_comp,
 )
-disallowed_guides_file = (
-    BASE_DIR + "MAGESTIC_base_strain_disallowed_Cas9_20mer_guides_NGG.txt"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(name)s: %(message)s",
+    stream=sys.stderr,
 )
+logger = logging.getLogger(__name__)
 
-fasta_files = [
-    BASE_DIR + "MARVEL_round_1_REDI_locus.fasta",
-    BASE_DIR + "pS1380.fasta",
-    BASE_DIR + "pS1381.fasta",
-    BASE_DIR + "yT158.fasta",
-    BASE_DIR + "yT159.fasta",
-    BASE_DIR + "pF433.fasta",
-]
 
-# Cas9 parameters
+# ---------------------------------------------------------------------------
+# SpCas9 / NGG design parameters
+# ---------------------------------------------------------------------------
 GUIDE_UPSTREAM_PAM = True
 NUCLEASE = "SpCas9"
 DEGENERATE_PAM = "NGG"
@@ -50,79 +78,120 @@ OLIGO_LENGTH = 200
 MIN_HOMOLOGY = 24
 MAX_GUIDE_DONORS_PER_EDIT = 2
 NUM_CONSEC_T_ALLOWED = 4
-RESTRICTION_SITES = ("GAAGAGC", "GCTCTTC")
+RESTRICTION_SITES = ("GAAGAGC", "GCTCTTC")  # BspQI / SapI recognition sequences
 FWD_PRIMING_SITE = "ctgcgattggcaggcgcgcc"
 INTERNAL_CLONING_SITE = "gtttgaagagc"
 
+# NRD1 occupies subpool index 0 in the multiplexed library
+SUBPOOL_IDX = 0
 
-# Load reference data
-def load_codon_table(filename):
-    codon_to_aa, aa_to_codon = {}, {}
-    with open(filename) as f:
-        for line in f:
-            codon, aa = line.strip().split()
-            codon_to_aa[codon] = aa
-            aa_to_codon.setdefault(aa, []).append(codon)
-    return codon_to_aa, aa_to_codon
+# Input / output filenames (relative to script directory unless overridden)
+INPUT_FILE = "NRD1_alanine_scan_with_PTC_and_syn_controls.tsv"
+OUTPUT_PREFIX = "NRD1_SpCas9_NGG_guide_donor_200bp"
+
+# Small reference files bundled in this directory
+CODON_TABLE_FILE = "DNA_codon_to_AA.txt"
+CODON_TABLE_SUBOPT_FILE = "DNA_codon_to_AA_suboptimal_codons_removed.txt"
+REV_PRIMER_FILE = "rev_subpool_priming_sequences.txt"
+# GenBank sequence files for the MAGESTIC 3.0 system components and recoded NRD1 strain.
+# All maps live in the NRD1_MAGESTIC_3.0_sequence_maps/ subdirectory.
+# Guides that would target any of these integrated sequences are excluded from the library.
+SEQUENCE_MAP_DIR = "NRD1_MAGESTIC_3.0_sequence_maps"
+SEQUENCE_FILES = [
+    "yT138.gb",          # pRNR2-tetR-TUP1 / pTDH3-tetO-tetR @ YORW∆17
+    "yT170.gb",          # pGalL-SaCas9 / pRPR1-tetO-HHR-SaCas9_X1 sgRNA @ YNRC∆9
+    "yT196.gb",          # MAGESTIC 3.0 Tir1 / Nrd1recoded-AID barcode landing pad @ LEU2
+    "YLS30.gb",          # pADH1-OsTIR1-FLAG-AID-NRD1rec @ YPRC∆15
+    "pS1439.gb",         # Step-2 cloning vector (2µ, SaCas9 cut sites, guide-donor scaffold)
+    "pF834_pF835.gb",    # MAGESTIC 3.0 barcoded insert (pF835)
+]
+
+# Large reference files (downloaded from Zenodo; default: same directory as script)
+GENOME_FILE = "MAGESTIC_background_strain.fasta"
+GFF_FILE = "MAGESTIC_background_strain_annotations.gff"
+ALLOWED_GUIDES_FILE = "MAGESTIC_base_strain_allowed_Cas9_20mer_guides_NGG.txt"
+DISALLOWED_GUIDES_FILE = "MAGESTIC_base_strain_disallowed_Cas9_20mer_guides_NGG.txt"
 
 
-codon_to_aa, aa_to_codon = load_codon_table(codon_table_file)
-subopt_codon_to_aa, subopt_aa_to_codon = load_codon_table(codon_table_subopt_file)
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-with open(rev_primer_file) as f:
-    REV_PRIMERS = [line.strip().lower() for line in f]
-REV_PRIMING_SEQUENCES = [rev_comp(e) for e in REV_PRIMERS]
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--ref-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing the four large reference files "
+            "(genome FASTA, GFF, allowed/disallowed guide databases). "
+            "Defaults to the NRD1 script directory."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for output TSV files. Defaults to the NRD1 script directory.",
+    )
+    return parser.parse_args()
 
-genome_seq = load_genome(genome_filename)
-coords_to_guides_allowed = load_processed_guides(allowed_guides_file, PAMS_TO_USE)
-coords_to_guides_disallowed = load_processed_guides(disallowed_guides_file, PAMS_TO_USE)
-coords_to_guides = {**coords_to_guides_allowed, **coords_to_guides_disallowed}
-guide_sequences_to_exclude = load_guides_from_fasta(
-    fasta_files, PAM_LENGTH, ALL_PAMS, GUIDE_LENGTH, GUIDE_UPSTREAM_PAM
-)
-systematic_to_common_gene_name = load_systematic_to_common_gene_name_dict(gff_filename)
-ORF_dict = load_ORF_coordinates(gff_filename)
 
-project_names = ["NRD1_mut", "NAB3_mut", "SEN1_mut", "SSU72_mut"]
-SUBPOOL_IDX = -1
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-for project_name in project_names:
-    SUBPOOL_IDX += 1
-    infile = PROJECT_DIR + project_name + ".tsv"
-    file_prefix = f"{DATE}_{project_name}"
+def main() -> None:
+    args = parse_args()
 
-    outfilename = f"{PROJECT_DIR}{file_prefix}_{NUCLEASE}_{DEGENERATE_PAM}_codon_change_guide_donor_{OLIGO_LENGTH}_bp_oligos_info.txt"
-    oligo_pool_outfilename = f"{PROJECT_DIR}{file_prefix}_{NUCLEASE}_{DEGENERATE_PAM}_codon_change_guide_donor_{OLIGO_LENGTH}_bp_oligo_pool.txt"
-    untargetable_outfilename = f"{PROJECT_DIR}{file_prefix}_{NUCLEASE}_{DEGENERATE_PAM}_codon_change_guide_donor_{OLIGO_LENGTH}_bp_untargetable.txt"
+    script_dir = Path(__file__).parent
+    ref_dir = args.ref_dir if args.ref_dir is not None else script_dir
+    out_dir = args.output_dir if args.output_dir is not None else script_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    systematic_name_to_ORF_info = {}
-    ORFs_to_codons_to_mutate = {}
+    # --- Load codon tables ---
+    codon_to_aa, aa_to_codon = load_codon_table(script_dir / CODON_TABLE_FILE)
+    subopt_codon_to_aa, subopt_aa_to_codon = load_codon_table(script_dir / CODON_TABLE_SUBOPT_FILE)
+
+    # --- Load reverse priming sequences ---
+    rev_primers = (script_dir / REV_PRIMER_FILE).read_text().splitlines()
+    REV_PRIMING_SEQUENCES = [rev_comp(seq.lower()) for seq in rev_primers if seq.strip()]
+    REV_PRIMING_SITE = REV_PRIMING_SEQUENCES[SUBPOOL_IDX]
+
+    # --- Load genome and annotations ---
+    genome_seq = load_genome(ref_dir / GENOME_FILE)
+    coords_to_guides_allowed = load_processed_guides(ref_dir / ALLOWED_GUIDES_FILE, PAMS_TO_USE)
+    coords_to_guides_disallowed = load_processed_guides(ref_dir / DISALLOWED_GUIDES_FILE, PAMS_TO_USE)
+    coords_to_guides = {**coords_to_guides_allowed, **coords_to_guides_disallowed}
+    guide_sequences_to_exclude = load_guides_from_fasta(
+        [script_dir / SEQUENCE_MAP_DIR / f for f in SEQUENCE_FILES],
+        PAM_LENGTH, ALL_PAMS, GUIDE_LENGTH, GUIDE_UPSTREAM_PAM,
+    )
+    systematic_to_common_gene_name = load_systematic_to_common_gene_name_dict(ref_dir / GFF_FILE)
+    ORF_dict = load_ORF_coordinates(ref_dir / GFF_FILE)
+
+    # --- Parse input mutations ---
+    infile = script_dir / INPUT_FILE
+    systematic_name_to_ORF_info: dict = {}
+    ORFs_to_codons_to_mutate: dict = {}
 
     with open(infile) as fin:
         for line in fin:
             info = line.strip().split("\t")
-            ref_codons, alt_codons = "", ""
+            if not info or not info[0]:
+                continue
+            if info[0] == "systematic_ORF_name":  # skip header row
+                continue
+            ref_codons: list = []
+            alt_codons: list = []
+
             if len(info) == 11:
-                (
-                    systematic_ORF_name,
-                    gene_name,
-                    aa_nums,
-                    ref_aas,
-                    alt_aas,
-                    ref_codons,
-                    alt_codons,
-                    *_,
-                ) = info
+                systematic_ORF_name, gene_name, aa_nums, ref_aas, alt_aas, ref_codons, alt_codons, *_ = info
             elif len(info) == 7:
-                (
-                    systematic_ORF_name,
-                    gene_name,
-                    aa_nums,
-                    ref_aas,
-                    alt_aas,
-                    ref_codons,
-                    alt_codons,
-                ) = info
+                systematic_ORF_name, gene_name, aa_nums, ref_aas, alt_aas, ref_codons, alt_codons = info
             elif len(info) == 5:
                 systematic_ORF_name, gene_name, aa_nums, ref_aas, alt_aas = info
             elif len(info) == 3:
@@ -131,11 +200,8 @@ for project_name in project_names:
                 aa_nums = [e[1:-1] for e in aa_substitution.split(",")]
                 alt_aas = [e[-1] for e in aa_substitution.split(",")]
             else:
-                raise ValueError("Input file format not recognized")
+                raise ValueError(f"Unrecognized input format ({len(info)} fields): {line.rstrip()}")
 
-            common_ORF_name = systematic_to_common_gene_name.get(
-                systematic_ORF_name, systematic_ORF_name
-            )
             if systematic_ORF_name not in systematic_name_to_ORF_info:
                 chrom, strand, exons, seq = get_ORF_seq_and_CDS_coords(
                     systematic_ORF_name, genome_seq, ORF_dict
@@ -144,124 +210,81 @@ for project_name in project_names:
                     chrom, strand, exons, seq, codon_to_aa
                 )
                 systematic_name_to_ORF_info[systematic_ORF_name] = (
-                    chrom,
-                    strand,
-                    exons,
-                    seq,
-                    ORF_info,
-                    aa_num_to_exon,
+                    chrom, strand, exons, seq, ORF_info, aa_num_to_exon
                 )
 
-            chrom, strand, exons, seq, ORF_info, aa_num_to_exon = (
-                systematic_name_to_ORF_info[systematic_ORF_name]
-            )
+            chrom, strand, exons, seq, ORF_info, aa_num_to_exon = systematic_name_to_ORF_info[systematic_ORF_name]
 
-            if len(info) in [5, 7, 11]:
+            if len(info) in (5, 7, 11):
                 ref_aas = ref_aas.split(",")
                 aa_nums = aa_nums.split(",")
                 alt_aas = alt_aas.split(",")
-                ref_codons = ref_codons.split(",") if ref_codons else ""
-                alt_codons = alt_codons.split(",") if alt_codons else ""
-            aa_nums = [int(e) for e in aa_nums]
-            aa_num_to_ref_aa = dict(zip(aa_nums, ref_aas))
-            aa_num_to_alt_aa = dict(zip(aa_nums, alt_aas))
-            derived_ref_codons = [ORF_info[e][0] for e in aa_nums]
-            ref_codons = derived_ref_codons
+                ref_codons = ref_codons.split(",") if ref_codons else []
+                alt_codons = alt_codons.split(",") if alt_codons else []
 
-            aa_num_to_ref_codon = dict(zip(aa_nums, ref_codons))
+            aa_nums = [int(e) for e in aa_nums]
+            aa_num_to_alt_aa = dict(zip(aa_nums, alt_aas))
             aa_num_to_alt_codon = dict(zip(aa_nums, alt_codons)) if alt_codons else {}
 
-            ref_aas_temp, alt_aas_temp, aa_nums_temp, alt_codons_temp = [], [], [], []
-            aa_num_range = range(min(aa_nums), max(aa_nums) + 1)
-            for aa_num in aa_num_range:
-                ORF_derived_ref_aa = ORF_info[aa_num][2]
-                ORF_derived_ref_codon = ORF_info[aa_num][0]
-                aa_nums_temp.append(aa_num)
-                ref_aas_temp.append(ORF_derived_ref_aa)
-                alt_aas_temp.append(aa_num_to_alt_aa.get(aa_num, ORF_derived_ref_aa))
-                if alt_codons and aa_num in aa_nums:
-                    alt_codons_temp.append(aa_num_to_alt_codon[aa_num])
+            # Fill in the full contiguous range of aa_nums and derive alt codons
+            ref_aas_out, alt_aas_out, aa_nums_out, alt_codons_out = [], [], [], []
+            for aa_num in range(min(aa_nums), max(aa_nums) + 1):
+                ref_codon = ORF_info[aa_num][0]
+                ref_aa = ORF_info[aa_num][2]
+                alt_aa = aa_num_to_alt_aa.get(aa_num, ref_aa)
+                aa_nums_out.append(aa_num)
+                ref_aas_out.append(ref_aa)
+                alt_aas_out.append(alt_aa)
+                if alt_codons and aa_num in aa_num_to_alt_codon:
+                    alt_codons_out.append(aa_num_to_alt_codon[aa_num])
                 else:
-                    possible_codons = subopt_aa_to_codon[alt_aas_temp[-1]]
-                    alt_codon = get_seq_with_largest_hamming_dist(
-                        ORF_derived_ref_codon, possible_codons
-                    )
-                    alt_codons_temp.append(alt_codon)
-            ref_aas, alt_aas, aa_nums, alt_codons = (
-                ref_aas_temp,
-                alt_aas_temp,
-                aa_nums_temp,
-                alt_codons_temp,
-            )
+                    possible = subopt_aa_to_codon[alt_aa]
+                    alt_codons_out.append(get_seq_with_largest_hamming_dist(ref_codon, possible))
+            ref_codons_out = [ORF_info[n][0] for n in aa_nums_out]
 
             ORFs_to_codons_to_mutate.setdefault(systematic_ORF_name, []).append(
-                (aa_nums, ref_aas, alt_aas, ref_codons, alt_codons)
+                (aa_nums_out, ref_aas_out, alt_aas_out, ref_codons_out, alt_codons_out)
             )
 
-    # Output files
-    with open(untargetable_outfilename, "w") as untargetable_out, open(
-        oligo_pool_outfilename, "w"
-    ) as oligo_pool_out, open(outfilename, "w") as out:
+    # --- Write outputs ---
+    info_path = out_dir / f"{OUTPUT_PREFIX}_info.tsv"
+    oligo_pool_path = out_dir / f"{OUTPUT_PREFIX}_oligo_pool.tsv"
+    untargetable_path = out_dir / f"{OUTPUT_PREFIX}_untargetable.tsv"
 
+    with (
+        open(untargetable_path, "w") as untargetable_out,
+        open(oligo_pool_path, "w") as oligo_pool_out,
+        open(info_path, "w") as info_out,
+    ):
         untargetable_out.write(
-            "\t".join(
-                [
-                    "systematic_ORF_name",
-                    "common_ORF_name",
-                    "aa_nums",
-                    "ref_aas",
-                    "alt_aas",
-                    "ref_codons",
-                    "alt_codons",
-                    "ORF_strand",
-                    "chrom",
-                    "reasons_not_targetable",
-                ]
-            )
-            + "\n"
+            "\t".join([
+                "systematic_ORF_name", "common_ORF_name",
+                "aa_nums", "ref_aas", "alt_aas", "ref_codons", "alt_codons",
+                "ORF_strand", "chrom", "reasons_not_targetable",
+            ]) + "\n"
         )
-        oligo_pool_out.write("\t".join(["oligo_name", "oligo_seq"]) + "\n")
-        out.write(
-            "\t".join(
-                [
-                    "oligo_name",
-                    "oligo_sequence",
-                    "subpool_ID",
-                    "subpool_number",
-                    "common_ORF_name",
-                    "systematic_ORF_name",
-                    "aa_nums_str",
-                    "ref_aas_str",
-                    "alt_aas_str",
-                    "ref_codons_str",
-                    "alt_codons_str",
-                    "num_US_syn_changes",
-                    "US_syn_codons",
-                    "num_DS_syn_changes",
-                    "DS_syn_codons",
-                    "ORF_strand",
-                    "chrom",
-                    "PAM_strand",
-                    "PAM_coord",
-                    "PAM",
-                    "PAM_proximal_seed_region_to_codon_changes_midpoint",
-                    "leftmost_codon_coord",
-                    "rightmost_codon_coord",
-                    "FWD_PRIMING_SITE",
-                    "guide",
-                    "INTERNAL_CLONING_SITE",
-                    "donor",
-                    "extended_donor",
-                    "REV_PRIMING_SITE",
-                    "donor_changed",
-                    "donor_changes",
-                    "junction_changes",
-                ]
-            )
-            + "\n"
+        oligo_pool_out.write("oligo_name\toligo_seq\n")
+        info_out.write(
+            "\t".join([
+                "oligo_name", "oligo_sequence",
+                "subpool_ID", "subpool_number",
+                "common_ORF_name", "systematic_ORF_name",
+                "aa_nums_str", "ref_aas_str", "alt_aas_str",
+                "ref_codons_str", "alt_codons_str",
+                "num_US_syn_changes", "US_syn_codons",
+                "num_DS_syn_changes", "DS_syn_codons",
+                "ORF_strand", "chrom",
+                "PAM_strand", "PAM_coord", "PAM",
+                "PAM_proximal_seed_region_to_codon_changes_midpoint",
+                "leftmost_codon_coord", "rightmost_codon_coord",
+                "FWD_PRIMING_SITE", "guide", "INTERNAL_CLONING_SITE",
+                "donor", "extended_donor", "REV_PRIMING_SITE",
+                "donor_changed", "donor_changes", "junction_changes",
+            ]) + "\n"
         )
 
-        guide_donors_created = set()
+        guide_donors_created: set = set()
+
         for systematic_ORF_name, mutations in ORFs_to_codons_to_mutate.items():
             common_ORF_name = systematic_to_common_gene_name.get(
                 systematic_ORF_name, systematic_ORF_name
@@ -269,15 +292,15 @@ for project_name in project_names:
             chrom, strand, exons, seq = get_ORF_seq_and_CDS_coords(
                 systematic_ORF_name, genome_seq, ORF_dict
             )
-            ORF_info, aa_num_to_exon = get_aa_num_to_codon_coords_aa(
-                chrom, strand, exons, seq, codon_to_aa
-            )
+            ORF_info, _ = get_aa_num_to_codon_coords_aa(chrom, strand, exons, seq, codon_to_aa)
+
             for aa_nums, ref_aas, alt_aas, ref_codons, alt_codons in mutations:
                 variant_targetable = False
-                reasons_not_targetable = []
+                reasons_not_targetable: list = []
                 first_aa, last_aa = aa_nums[0], aa_nums[-1]
                 first_codon_coord = ORF_info[first_aa][1][0]
                 last_codon_coord = ORF_info[last_aa][1][2]
+
                 if (abs(first_codon_coord - last_codon_coord) + 1) // 3 != len(aa_nums):
                     reasons_not_targetable.append(
                         "aa codons to mutate span an intron, donor cannot be made"
@@ -289,242 +312,139 @@ for project_name in project_names:
                         else (last_codon_coord, first_codon_coord)
                     )
                     codon_mid = (first_codon_coord + last_codon_coord) // 2
+
                     potential_PAMs = []
                     for PAM_strand in "+-":
                         for PAM_coord in range(
                             leftmost - GUIDE_LENGTH * 6, rightmost + GUIDE_LENGTH * 6
                         ):
-                            PAM_seed = (
-                                PAM_coord - 3 if PAM_strand == "+" else PAM_coord + 3
-                            )
+                            PAM_seed = PAM_coord - 3 if PAM_strand == "+" else PAM_coord + 3
                             dist_to_mid = codon_mid - PAM_seed
                             if strand == "-":
                                 dist_to_mid = -dist_to_mid
-                            if (chrom, PAM_coord, PAM_strand) in coords_to_guides:
-                                guide, PAM = coords_to_guides[
-                                    (chrom, PAM_coord, PAM_strand)
-                                ]
-                                if (
-                                    guide in guide_sequences_to_exclude
-                                    or (chrom, PAM_coord, PAM_strand)
-                                    in coords_to_guides_disallowed
-                                    or restriction_site_in_seq(guide, RESTRICTION_SITES)
-                                    or "T" * (NUM_CONSEC_T_ALLOWED + 1) in guide
-                                ):
-                                    continue
-                                potential_PAMs.append(
-                                    (
-                                        abs(dist_to_mid),
-                                        dist_to_mid,
-                                        chrom,
-                                        PAM_coord,
-                                        PAM_strand,
-                                        guide,
-                                        PAM,
-                                    )
-                                )
+                            if (chrom, PAM_coord, PAM_strand) not in coords_to_guides:
+                                continue
+                            guide, PAM = coords_to_guides[(chrom, PAM_coord, PAM_strand)]
+                            if (
+                                guide in guide_sequences_to_exclude
+                                or (chrom, PAM_coord, PAM_strand) in coords_to_guides_disallowed
+                                or restriction_site_in_seq(guide, RESTRICTION_SITES)
+                                or "T" * (NUM_CONSEC_T_ALLOWED + 1) in guide
+                            ):
+                                continue
+                            potential_PAMs.append(
+                                (abs(dist_to_mid), dist_to_mid, chrom, PAM_coord, PAM_strand, guide, PAM)
+                            )
+
                     if not potential_PAMs:
                         reasons_not_targetable.append("no acceptable guides found")
                     else:
-                        for (
-                            _,
-                            dist_to_mid,
-                            chrom,
-                            PAM_coord,
-                            PAM_strand,
-                            guide,
-                            PAM,
-                        ) in sorted(potential_PAMs):
-                            if GUIDE_UPSTREAM_PAM:
-                                syn_left, syn_right = assign_num_syn_changes_for_Cas9(
-                                    leftmost, rightmost, PAM_coord, PAM_strand
-                                )
-                            else:
-                                syn_left, syn_right = assign_num_syn_changes_for_Cas12a(
-                                    leftmost, rightmost, PAM_coord, PAM_strand
-                                )
-                            donor_info = assemble_donor(
-                                systematic_ORF_name,
-                                ORF_info,
-                                chrom,
-                                strand,
-                                aa_nums,
-                                ref_aas,
-                                alt_aas,
-                                ref_codons,
-                                alt_codons,
-                                syn_left,
-                                syn_right,
-                                OLIGO_LENGTH
-                                - len(FWD_PRIMING_SITE)
-                                - GUIDE_LENGTH
-                                - len(INTERNAL_CLONING_SITE)
-                                - len(REV_PRIMING_SEQUENCES[SUBPOOL_IDX]),
-                                MIN_HOMOLOGY,
-                                codon_to_aa,
-                                subopt_aa_to_codon,
-                                genome_seq,
-                                PRINT=False,
-                                seqs_to_avoid=RESTRICTION_SITES,
+                        for _, dist_to_mid, chrom, PAM_coord, PAM_strand, guide, PAM in sorted(potential_PAMs):
+                            syn_left, syn_right = assign_num_syn_changes_for_Cas9(
+                                leftmost, rightmost, PAM_coord, PAM_strand
                             )
-                            if donor_info[0] is None:
-                                reasons_not_targetable.append(donor_info)
-                            else:
-                                (
-                                    extended_donor,
-                                    donor,
-                                    donor_changed,
-                                    donor_changes,
-                                    aa_nums,
-                                    ref_aas,
-                                    alt_aas,
-                                    ref_codons,
-                                    alt_codons,
-                                    num_US_syn_changes,
-                                    US_syn_codons,
-                                    num_DS_syn_changes,
-                                    DS_syn_codons,
-                                ) = donor_info
-                                REV_PRIMING_SITE = REV_PRIMING_SEQUENCES[SUBPOOL_IDX]
-                                donor, junction_changes = (
-                                    remove_BspQI_sites_from_donor_in_final_oligo(
-                                        FWD_PRIMING_SITE,
-                                        guide,
-                                        INTERNAL_CLONING_SITE,
-                                        donor,
-                                        REV_PRIMING_SITE,
-                                        donor_info,
-                                    )
+                            donor_result = assemble_donor(
+                                systematic_ORF_name, ORF_info, chrom, strand,
+                                aa_nums, ref_aas, alt_aas, ref_codons, alt_codons,
+                                syn_left, syn_right,
+                                OLIGO_LENGTH
+                                    - len(FWD_PRIMING_SITE)
+                                    - GUIDE_LENGTH
+                                    - len(INTERNAL_CLONING_SITE)
+                                    - len(REV_PRIMING_SITE),
+                                MIN_HOMOLOGY, codon_to_aa, subopt_aa_to_codon,
+                                genome_seq, PRINT=False, seqs_to_avoid=RESTRICTION_SITES,
+                            )
+
+                            if donor_result[0] is None:
+                                reasons_not_targetable.append(donor_result)
+                                continue
+
+                            (
+                                extended_donor, donor, donor_changed, donor_changes,
+                                aa_nums, ref_aas, alt_aas, ref_codons, alt_codons,
+                                num_US_syn_changes, US_syn_codons,
+                                num_DS_syn_changes, DS_syn_codons,
+                            ) = donor_result
+
+                            donor, junction_changes = remove_BspQI_sites_from_donor_in_final_oligo(
+                                FWD_PRIMING_SITE, guide, INTERNAL_CLONING_SITE,
+                                donor, REV_PRIMING_SITE, donor_result,
+                            )
+
+                            if donor is None:
+                                reasons_not_targetable.append(
+                                    "donor could not be assembled into oligo due to unresolvable restriction sites"
                                 )
-                                oligo_sequence = (
-                                    FWD_PRIMING_SITE
-                                    + guide
-                                    + INTERNAL_CLONING_SITE
-                                    + donor
-                                    + REV_PRIMING_SITE
-                                )
-                                if donor is None:
-                                    reasons_not_targetable.append(
-                                        "donor could not be assembled into oligo due to unresolvable restriction sites"
-                                    )
-                                elif not guide_disruption(
-                                    guide,
-                                    DEGENERATE_PAM,
-                                    extended_donor,
-                                    GUIDE_UPSTREAM_PAM,
-                                    PRINT=False,
-                                ):
-                                    reasons_not_targetable.append(
-                                        "guide not disrupted by donor"
-                                    )
-                                else:
-                                    guide_donor = (guide, donor)
-                                    if guide_donor in guide_donors_created:
-                                        continue
-                                    guide_donors_created.add(guide_donor)
-                                    variant_targetable = True
-                                    aa_nums_str = ",".join(map(str, aa_nums))
-                                    ref_aas_str = ",".join(ref_aas)
-                                    alt_aas_str = ",".join(alt_aas)
-                                    ref_codons_str = ",".join(ref_codons)
-                                    alt_codons_str = ",".join(alt_codons)
-                                    oligo_name = "_".join(
-                                        map(
-                                            str,
-                                            [
-                                                NUCLEASE,
-                                                systematic_ORF_name,
-                                                common_ORF_name,
-                                                aa_nums_str,
-                                                ref_aas_str,
-                                                alt_aas_str,
-                                                ref_codons_str,
-                                                alt_codons_str,
-                                                num_US_syn_changes,
-                                                "US_syn_changes",
-                                                num_DS_syn_changes,
-                                                "DS_syn_changes",
-                                                strand,
-                                                chrom,
-                                                PAM_strand,
-                                                PAM_coord,
-                                                PAM,
-                                                dist_to_mid,
-                                                leftmost,
-                                                rightmost,
-                                            ],
-                                        )
-                                    )
-                                    subpool_ID = NUCLEASE + "_codon_changes"
-                                    subpool_number = f"subpool_{SUBPOOL_IDX + 1}"
-                                    out.write(
-                                        "\t".join(
-                                            map(
-                                                str,
-                                                [
-                                                    oligo_name,
-                                                    oligo_sequence,
-                                                    subpool_ID,
-                                                    subpool_number,
-                                                    common_ORF_name,
-                                                    systematic_ORF_name,
-                                                    aa_nums_str,
-                                                    ref_aas_str,
-                                                    alt_aas_str,
-                                                    ref_codons_str,
-                                                    alt_codons_str,
-                                                    num_US_syn_changes,
-                                                    US_syn_codons,
-                                                    num_DS_syn_changes,
-                                                    DS_syn_codons,
-                                                    strand,
-                                                    chrom,
-                                                    PAM_strand,
-                                                    PAM_coord,
-                                                    PAM,
-                                                    dist_to_mid,
-                                                    leftmost,
-                                                    rightmost,
-                                                    FWD_PRIMING_SITE,
-                                                    guide,
-                                                    INTERNAL_CLONING_SITE,
-                                                    donor,
-                                                    extended_donor,
-                                                    REV_PRIMING_SITE,
-                                                    donor_changed,
-                                                    donor_changes,
-                                                    junction_changes,
-                                                ],
-                                            )
-                                        )
-                                        + "\n"
-                                    )
-                                    oligo_pool_out.write(
-                                        f"{oligo_name}\t{oligo_sequence}\n"
-                                    )
-                                    if (
-                                        len(guide_donors_created)
-                                        >= MAX_GUIDE_DONORS_PER_EDIT
-                                    ):
-                                        break
+                                continue
+
+                            oligo_sequence = (
+                                FWD_PRIMING_SITE + guide + INTERNAL_CLONING_SITE
+                                + donor + REV_PRIMING_SITE
+                            )
+
+                            if not guide_disruption(
+                                guide, DEGENERATE_PAM, extended_donor, GUIDE_UPSTREAM_PAM, PRINT=False
+                            ):
+                                reasons_not_targetable.append("guide not disrupted by donor")
+                                continue
+
+                            guide_donor = (guide, donor)
+                            if guide_donor in guide_donors_created:
+                                continue
+                            guide_donors_created.add(guide_donor)
+                            variant_targetable = True
+
+                            aa_nums_str = ",".join(map(str, aa_nums))
+                            ref_aas_str = ",".join(ref_aas)
+                            alt_aas_str = ",".join(alt_aas)
+                            ref_codons_str = ",".join(ref_codons)
+                            alt_codons_str = ",".join(alt_codons)
+
+                            oligo_name = "_".join(map(str, [
+                                NUCLEASE, systematic_ORF_name, common_ORF_name,
+                                aa_nums_str, ref_aas_str, alt_aas_str,
+                                ref_codons_str, alt_codons_str,
+                                num_US_syn_changes, "US_syn_changes",
+                                num_DS_syn_changes, "DS_syn_changes",
+                                strand, chrom, PAM_strand, PAM_coord, PAM, dist_to_mid,
+                                leftmost, rightmost,
+                            ]))
+
+                            info_out.write(
+                                "\t".join(map(str, [
+                                    oligo_name, oligo_sequence,
+                                    NUCLEASE + "_codon_changes",
+                                    f"subpool_{SUBPOOL_IDX + 1}",
+                                    common_ORF_name, systematic_ORF_name,
+                                    aa_nums_str, ref_aas_str, alt_aas_str,
+                                    ref_codons_str, alt_codons_str,
+                                    num_US_syn_changes, US_syn_codons,
+                                    num_DS_syn_changes, DS_syn_codons,
+                                    strand, chrom,
+                                    PAM_strand, PAM_coord, PAM, dist_to_mid,
+                                    leftmost, rightmost,
+                                    FWD_PRIMING_SITE, guide, INTERNAL_CLONING_SITE,
+                                    donor, extended_donor, REV_PRIMING_SITE,
+                                    donor_changed, donor_changes, junction_changes,
+                                ])) + "\n"
+                            )
+                            oligo_pool_out.write(f"{oligo_name}\t{oligo_sequence}\n")
+
+                            if len(guide_donors_created) >= MAX_GUIDE_DONORS_PER_EDIT:
+                                break
+
                 if not variant_targetable:
                     untargetable_out.write(
-                        "\t".join(
-                            map(
-                                str,
-                                [
-                                    systematic_ORF_name,
-                                    common_ORF_name,
-                                    aa_nums,
-                                    ref_aas,
-                                    alt_aas,
-                                    ref_codons,
-                                    alt_codons,
-                                    strand,
-                                    chrom,
-                                    reasons_not_targetable,
-                                ],
-                            )
-                        )
-                        + "\n"
+                        "\t".join(map(str, [
+                            systematic_ORF_name, common_ORF_name,
+                            aa_nums, ref_aas, alt_aas, ref_codons, alt_codons,
+                            strand, chrom, reasons_not_targetable,
+                        ])) + "\n"
                     )
+
+    logger.info("Done. Outputs written to %s", out_dir)
+
+
+if __name__ == "__main__":
+    main()
