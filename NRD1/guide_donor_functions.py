@@ -109,7 +109,8 @@ def load_guides_from_fasta(
                     if GUIDE_UPSTREAM_PAM
                     else extended_seq[idx + PAM_LENGTH : idx + PAM_LENGTH + GUIDE_LENGTH]
                 )
-                guide_sequences_to_exclude.add(guide)
+                if "N" not in guide:
+                    guide_sequences_to_exclude.add(guide)
             PAM_to_check_rc = rev_comp(extended_seq[idx - PAM_LENGTH : idx])
             if PAM_to_check_rc in ALL_PAMS:
                 guide = (
@@ -119,7 +120,8 @@ def load_guides_from_fasta(
                         extended_seq[idx - PAM_LENGTH - GUIDE_LENGTH : idx - PAM_LENGTH]
                     )
                 )
-                guide_sequences_to_exclude.add(guide)
+                if "N" not in guide:
+                    guide_sequences_to_exclude.add(guide)
     return guide_sequences_to_exclude
 
 
