@@ -11,9 +11,11 @@ import pandas as pd
 import timeit
 import os
 
-PROCESSED_DATA_DIR = '/path/to/processed_data/by_project/NNS/20240411_Twist_200mer_subpool_1-16_step_1_libraries/'
+BASE_DIR = '/path/to'
+PROJECT_DIR = BASE_DIR + '/projects/NNS/20250628_repeat_step_1_library_cloning'
+PROCESSED_DATA_DIR = PROJECT_DIR + '/processed_data/'
 COUNTS_DIR = PROCESSED_DATA_DIR + 'guide_donor_bc0/'
-KEYFILE_DIR = '/path/to/scripts_and_keyfiles/by_project/NNS/bc1_donor_bc0/keyfiles/'
+KEYFILE_DIR = PROJECT_DIR + '/keyfiles/'
 sample_keyfile = KEYFILE_DIR + 'step_1_sample_key.tsv'
 oligo_pool_filename = KEYFILE_DIR + '20240411_Twist_200mer_oligo_array_order.tsv'
 
@@ -68,7 +70,7 @@ with open(sample_keyfile) as infile:
 
 library_ID = 'V536'
 
-NRD1_oligo_info_file = KEYFILE_DIR + '20240409_NRD1_mut_SpCas9_NGG_codon_change_guide_donor_200_bp_oligos_info.txt'
+NRD1_oligo_info_file = BASE_DIR + '/software/MAGESTIC/NRD1/NRD1_SpCas9_NGG_guide_donor_200bp_info.tsv'
 for library_ID in 'V536',: # library_ID_to_sample_info: #  
     expected_SPS = library_ID_to_expected_SPS[library_ID]
     bc0_seq_matched_oligo_infilename = COUNTS_DIR + library_ID + '_matched_guide_donor_bc0_counts.tsv'

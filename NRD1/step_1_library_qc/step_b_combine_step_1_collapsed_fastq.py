@@ -49,9 +49,10 @@ from tqdm import tqdm
 def rev_comp(seq):
     return seq.translate(str.maketrans('ACGTacgtRYMKrymkVBHDvbhdNn ', 'TGCAtgcaYRKMyrkmBVDHbvdhNn '))[::-1]
 
-PROJECT_PATH = 'by_project/NNS/202250628_repeat_step_1_library_cloning/'
+BASE_DIR = '/path/to'
+PROJECT_DIR = BASE_DIR + '/projects/NNS/20250628_repeat_step_1_library_cloning'
 
-PROCESSED_DATA_DIR = '/path/to/processed_data/' + PROJECT_PATH
+PROCESSED_DATA_DIR = PROJECT_DIR + '/processed_data/'
 os.chdir(PROCESSED_DATA_DIR)
 COLLAPSED_FASTQ_DIR = PROCESSED_DATA_DIR + 'collapsed_fastq/'
 COUNTS_DIR = PROCESSED_DATA_DIR + 'guide_donor_bc0/'
@@ -59,7 +60,7 @@ for SUB_DIR in 'guide_donor_bc0/', 'log/':
     if not os.path.exists(PROCESSED_DATA_DIR + SUB_DIR):
         os.mkdir(PROCESSED_DATA_DIR + SUB_DIR)
 
-KEYFILE_DIR = '/path/to/scripts_and_keyfiles/' + PROJECT_PATH + 'keyfiles/'
+KEYFILE_DIR = PROJECT_DIR + '/keyfiles/'
 sample_keyfile = KEYFILE_DIR + 'step_1_sample_key.tsv'
 
 max_reads_per_sample = 10000000000000000000

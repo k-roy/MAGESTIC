@@ -8,11 +8,10 @@ import seaborn as sns
 import pandas as pd
 import matplotlib.pyplot as plt
 
-PROCESSED_DATA_DIR = (
-    "/path/to/processed_data/by_project/"
-)
-DIR = PROCESSED_DATA_DIR + "NNS/20250628_repeat_step_1_library_cloning/"
-PLOTS_DIR = DIR + "plots/"
+BASE_DIR = "/path/to"
+PROJECT_DIR = BASE_DIR + "/projects/NNS/20250628_repeat_step_1_library_cloning"
+DIR = PROJECT_DIR + "/processed_data/"
+PLOTS_DIR = PROJECT_DIR + "/plots/"
 
 nrd1_df = pd.read_csv(DIR + "NRD1_libraries_step_1_oligo_counts.tsv", sep="\t")
 

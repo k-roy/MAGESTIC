@@ -10,14 +10,11 @@ import seaborn as sns
 import pandas as pd
 import matplotlib.pyplot as plt
 
-PROCESSED_DATA_DIR = (
-    "/path/to/processed_data/by_project/"
-)
-PROJECT_PATH = (
-    "NNS/202250628_repeat_step_1_library_cloning/guide_donor_bc0_purity_filtered/"
-)
-DIR = PROCESSED_DATA_DIR + PROJECT_PATH
-OUT_DIR = PROCESSED_DATA_DIR + "NNS/202250628_repeat_step_1_library_cloning/"
+BASE_DIR = "/path/to"
+PROJECT_DIR = BASE_DIR + "/projects/NNS/20250628_repeat_step_1_library_cloning"
+PROCESSED_DATA_DIR = PROJECT_DIR + "/processed_data/"
+DIR = PROCESSED_DATA_DIR + "guide_donor_bc0_purity_filtered/"
+OUT_DIR = PROCESSED_DATA_DIR
 suffix = "_guide_donor_bc0_purity_filtered.tsv"
 
 # Find all files in the directory that end with the suffix and read them into a single DataFrame.
@@ -86,8 +83,7 @@ if not non_string_donors.empty:
 non_string_donors.to_csv(OUT_DIR + "non_string_donors.tsv", sep="\t", index=False)
 
 # Read in the designed oligos.
-# /path/to/scripts_and_keyfiles/by_project/NNS/20240411_Twist_200mer_subpool_1-16_and_42-65_step_1_libraries_guide_donor_bc0/keyfiles
-KEYFILE_DIR = "/path/to/scripts_and_keyfiles/by_project/NNS/20240411_Twist_200mer_subpool_1-16_and_42-65_step_1_libraries_guide_donor_bc0/keyfiles/"
+KEYFILE_DIR = PROJECT_DIR + "/keyfiles/"
 designed_oligos_filename = KEYFILE_DIR + "20240411_Twist_200mer_oligo_array_order.tsv"
 designed_oligos = pd.read_csv(designed_oligos_filename, sep="\t")
 
