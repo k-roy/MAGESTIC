@@ -39,6 +39,20 @@ NRD1/
 │   ├── pF834_pF835.gb
 │   └── yT177_pF835_post_integration.gb
 │
+├── # ── Step 1 Library QC (guide-donor-bc0) ─────────────
+├── step_1_library_qc/
+│   ├── step_a_trim_merge_collapse.sh
+│   ├── step_b_combine_step_1_collapsed_fastq.py
+│   ├── step_b_combine_step_1_collapsed_fastq.sh
+│   ├── step_c_map_guide_donor_bc0_to_designed_oligos.py
+│   ├── step_c_map_guide_donor_bc0_to_designed_oligos.sh
+│   ├── step_d_calculate_bc0_purity.py
+│   ├── step_d_calculate_bc0_purity.sh
+│   ├── step_e_assess_plasmid_library_representation.py
+│   ├── step_f_plot_NRD1_plasmid_library_representation.py
+│   ├── analyze_guide_donor_bc0.R
+│   └── analyze_guide_donor_bc0_against_designed_oligos.py
+│
 ├── # ── Barcode Linking (bc1-donor-bc0) ─────────────────
 ├── bc1_donor_bc0_linking/
 │   ├── step_a_trim_bc1_donor_bc0.sh
@@ -74,11 +88,15 @@ NRD1/
     ├── depletion_log2FC.csv                              [446 KB]
     ├── barcode_support_flags.csv                         [644 KB]
     ├── hit_barcode_support_summary.csv                   [38 KB]
-    └── # Lightweight counts — input to figure_s1_screen_qc.py replicate panels
-        NRD1_bc1_counts_YPD_filtered.csv                 [9 MB]
-        # (YPD + YPD+IAA conditions only; barcodes with mean YPD G0 ≥ 5 CPM; 14,967 barcodes)
-        # Threshold on YPD G0 only — lethal/fitness-defective barcodes that deplete at later
-        # timepoints are retained because they have normal counts at G0.
+    ├── # Lightweight counts — input to figure_s1_screen_qc.py replicate panels
+    ├── NRD1_bc1_counts_YPD_filtered.csv                 [9 MB]
+    │   # (YPD + YPD+IAA conditions only; barcodes with mean YPD G0 ≥ 5 CPM; 14,967 barcodes)
+    │   # Threshold on YPD G0 only — lethal/fitness-defective barcodes that deplete at later
+    │   # timepoints are retained because they have normal counts at G0.
+    └── # Step 1 library QC — input to step_1_library_qc/ scripts
+        V625_oligo_name_filtered.tsv                     [1.9 MB]
+        # (V625 plasmid library guide-donor-bc0 read counts mapped to designed oligos;
+        #  2,299 rows, one per unique guide-donor-bc0 sequence)
 ```
 
 ### Large files (Zenodo, DOI: TBD)
