@@ -379,7 +379,9 @@ editing outside of SpCas9 guide regions for full saturation mutagenesis.
 
 ## Citation
 
-> Roy KR, Aiello U, et al. (2026). Dissecting NRD1 function by saturation genome editing with MAGESTIC 3.0. *Molecular Cell* (submitted).
+If you use this code or data, please cite:
+
+> Aiello U, Roy KR, Steinmetz LM. (2025). Mutational scanning by multiplexed genome editing of the essential transcription termination factor Nrd1. *bioRxiv* 2025.09.09.675026. https://doi.org/10.1101/2025.09.09.675026
 
 For the MAGESTIC framework:
 
