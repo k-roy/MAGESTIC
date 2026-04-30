@@ -10,7 +10,7 @@
 BASE_DIR="/path/to"
 PROJECT_DIR="${BASE_DIR}/projects/NNS/20250628_repeat_step_1_library_cloning"
 PYTHON="/path/to/anaconda3/bin/python"
-SCRIPT="${BASE_DIR}/software/MAGESTIC/NRD1/step_1_library_qc/step_d_calculate_bc0_purity.py"
+SCRIPT="${BASE_DIR}/software/MAGESTIC/NRD1/guide_donor_bc0_linking/step_d_calculate_bc0_purity.py"
 
 PROCESSED_DATA_DIR="${PROJECT_DIR}/processed_data"
 GUIDE_DONOR_BC0_DIR="${PROCESSED_DATA_DIR}/guide_donor_bc0"

@@ -39,8 +39,8 @@ NRD1/
 │   ├── pF834_pF835.gb
 │   └── yT177_pF835_post_integration.gb
 │
-├── # ── Step 1 Library QC (guide-donor-bc0) ─────────────
-├── step_1_library_qc/
+├── # ── Barcode Linking (bc1-donor-bc0) ─────────────────
+├── guide_donor_bc0_linking/       ← Stage 2a: guide → bc0 mapping (V625 plasmid pool)
 │   ├── step_a_trim_merge_collapse.sh
 │   ├── step_b_combine_step_1_collapsed_fastq.py
 │   ├── step_b_combine_step_1_collapsed_fastq.sh
@@ -53,8 +53,7 @@ NRD1/
 │   ├── analyze_guide_donor_bc0.R
 │   └── analyze_guide_donor_bc0_against_designed_oligos.py
 │
-├── # ── Barcode Linking (bc1-donor-bc0) ─────────────────
-├── bc1_donor_bc0_linking/
+├── bc1_donor_bc0_linking/         ← Stage 2b: bc1 → bc0 → donor mapping (yeast gDNA)
 │   ├── step_a_trim_bc1_donor_bc0.sh
 │   ├── step_b_process_bc1_donor_bc0_trimmed_R1_R2_fastq.py
 │   ├── step_b_process_bc1_donor_bc0_trimmed_R1_R2_fastq.sh
@@ -119,9 +118,10 @@ These files exceed GitHub's size limits and are deposited on Zenodo:
 The analysis proceeds in four stages:
 
 ```
-1. Library Design          2. Barcode Linking         3. Screen Counting        4. Fitness Calling
-   (oligo pool)     →      (bc1 ↔ mutation)    →     (bc1 counts/sample)  →   (slopes & hits)
-                            amplicon-seq                amplicon-seq             computational
+1. Library Design    2a. guide→bc0 linking    2b. bc1→bc0 linking    3. Screen Counting    4. Fitness Calling
+   (oligo pool)  →   (V625 plasmid pool)  →   (yeast gDNA)       →  (bc1 counts/sample) → (slopes & hits)
+                      guide_donor_bc0_         bc1_donor_bc0_         amplicon-seq           computational
+                      linking/                 linking/
 ```
 
 ### Stage 1: Library Design
@@ -135,13 +135,34 @@ See [Library Design Details](#library-design-details) below.
 
 ### Stage 2: Barcode Linking (bc1-donor-bc0)
 
-After MAGESTIC editing, each yeast clone carries a unique genomic barcode (bc1) at YBR209W that must be linked to the designed mutation it received. This is done by amplicon sequencing of a ~510 bp fragment spanning bc1, the donor region, and the donor barcode (bc0).
+Linking proceeds in two sub-stages:
 
-**Amplicons sequenced**:
+1. **Stage 2a — guide → bc0 mapping** (`guide_donor_bc0_linking/`): The V625 plasmid pool is sequenced to establish which bc0 barcode corresponds to which guide-donor sequence. Two amplicons are sequenced (guide-bc0 with KR1952+KR1590; donor with KR1884+KR1953) and reads are mapped to the designed oligo library.
+
+2. **Stage 2b — bc1 → bc0 → donor mapping** (`bc1_donor_bc0_linking/`): After MAGESTIC editing, each yeast clone carries a unique genomic barcode (bc1) at YBR209W. Amplicon sequencing of a ~510 bp fragment spanning bc1, the donor region, and bc0 links each bc1 to its intended mutation.
+
+Together these two sub-stages produce the final bc1 reference table: **guide → bc0 → bc1 → designed mutation**.
+
+#### Stage 2a: guide_donor_bc0_linking (V625 plasmid pool)
+
+**Amplicons sequenced** (SRA: V625 library runs):
+- guide-bc0 (~213 bp; primers KR1952 + KR1590)
+- donor (~213 bp; primers KR1884 + KR1953)
+
+| Step | Script | Description |
+|------|--------|-------------|
+| a | `step_a_trim_merge_collapse.sh` | Trim adapters, merge paired-end reads, collapse identical sequences |
+| b | `step_b_combine_step_1_collapsed_fastq.py` | Combine collapsed reads across PCR replicates; orient KR1884-KR1953 reads to match KR1952-KR1590 |
+| c | `step_c_map_guide_donor_bc0_to_designed_oligos.py` | Map guide-donor-bc0 reads to the designed oligo library |
+| d | `step_d_calculate_bc0_purity.py` | Filter by bc0 purity (top guide-bc0 combination per guide) |
+| e | `step_e_assess_plasmid_library_representation.py` | Assess representation of designed oligos in the pool |
+| f | `step_f_plot_NRD1_plasmid_library_representation.py` | Plot library representation and GC content |
+
+#### Stage 2b: bc1_donor_bc0_linking (yeast gDNA)
+
+**Amplicons sequenced** (SRA: linking runs):
 - bc1-donor-bc0 (510 bp; primers KR1967 + KR1590)
 - donor-bc0 (359 bp; primers KR1882 + KR1883)
-
-**Processing pipeline** (`bc1_donor_bc0_linking/`):
 
 | Step | Script | Description |
 |------|--------|-------------|
