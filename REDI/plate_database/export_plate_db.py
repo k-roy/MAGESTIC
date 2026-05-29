@@ -37,7 +37,7 @@ DEFAULT_XLSX = (
 # variants; match by case-insensitive substring against the SHEET name.
 SHEET_FRAGMENTS: dict[str, list[str]] = {
     "Source": ["source"],
-    "Target": ["target 2000", "target_2000"],
+    "Target": ["target_plates_2000", "target_plates 2000", "target 2000", "target_2000"],
     "REDI_mating": ["redi_mating", "redi mating"],
     "Misc": ["misc"],
     "Rearray_Target": ["rearray_target", "rearray target", "rearray"],
@@ -77,6 +77,11 @@ def export(xlsx_path: Path, out_dir: Path) -> dict[str, Path]:
         df = pd.read_excel(xl, sheet_name=sheet)
         df["__stage"] = stage
         df["__source_sheet"] = sheet
+        # Coerce object columns to string to avoid pyarrow mixed-type errors
+        # (lab xlsx has columns like 'dilution or cells/uL' mixing int + str).
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str)
         parquet_path = parquet_dir / f"{stage}.parquet"
         df.to_parquet(parquet_path, index=False)
         written[stage] = parquet_path

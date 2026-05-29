@@ -42,6 +42,6 @@ array_pairs:
     name_b: yT182
     purpose_a: "SHA345 REDI"
 
-bc1_reference_table: /path/to/processed_data/by_project/NNS/20240619_MAGESTIC_NNS_screen_reps_1-3/bc1_counts/20240619_MAGESTIC_NNS_screen_reps_1-3_combined_bc1_reference_table.tsv
+bc1_reference_table: /path/to/projects/NNS/20240619_MAGESTIC_NNS_screen_reps_1-3/processed_data/bc1_counts/20240619_MAGESTIC_NNS_screen_reps_1-3_combined_bc1_reference_table.tsv
 
 wgs_outcome_table: /path/to/projects/WGS_MAGESTIC_QTL_bc_calling/output3/summaries/wgs_outcome_full_table.v0.tsv
