@@ -1,0 +1,72 @@
+# Snakemake workflow for the REDI pipeline (per-plate fan-out).
+#
+# Invocation:
+#   snakemake --snakefile $(python -c "import magestic.pipelines.redi.snakemake as m; print(m.__path__[0])")/Snakefile \
+#             --config config=/path/to/screen.yaml
+#
+# The per-sample step_a expands across the configured sample_key. step_b–h
+# run once per screen on the combined outputs.
+
+import yaml
+from pathlib import Path
+
+CONFIG_PATH = Path(config["config"])
+with CONFIG_PATH.open() as fh:
+    CFG = yaml.safe_load(fh)
+
+PATHS = CFG["paths"]
+KEYFILES = Path(PATHS["keyfiles"])
+COUNTS = Path(PATHS["processed"]) / "read_pair_counts_tables"
+COMBINED = Path(PATHS["processed"]) / "combined_data_tables"
+
+# Expand sample list from sample_key.tsv
+import pandas as pd
+sample_key = pd.read_csv(KEYFILES / CFG.get("sample_key", "sample_key.tsv"), sep="\t")
+SAMPLES = sample_key["sample_name"].tolist() if "sample_name" in sample_key.columns else []
+
+
+rule all:
+    input:
+        COMBINED / "annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv",
+
+
+rule step_a_one_sample:
+    output:
+        COUNTS / "{sample}_R1_R2_counts.tsv",
+    shell:
+        "magestic-redi-trim --config {CONFIG_PATH} --sample {wildcards.sample}"
+
+
+rule step_b_combine_keys:
+    output:
+        KEYFILES / "combined_key.tsv",
+    shell:
+        "magestic-redi-combine-keys --config {CONFIG_PATH}"
+
+
+rule step_c_extract_bc:
+    input:
+        expand(str(COUNTS / "{sample}_R1_R2_counts.tsv"), sample=SAMPLES),
+        KEYFILES / "combined_key.tsv",
+    output:
+        COMBINED / "combined_REDI_bc_MAGESTIC_bc_merged_df.tsv",
+    shell:
+        "magestic-redi-extract-bc --config {CONFIG_PATH}"
+
+
+rule step_d_purity:
+    input:
+        COMBINED / "combined_REDI_bc_MAGESTIC_bc_merged_df.tsv",
+    output:
+        COMBINED / "top_REDI_bc_MAGESTIC_bc1_df.tsv",
+    shell:
+        "magestic-redi-purity --config {CONFIG_PATH}"
+
+
+rule step_e_annotate:
+    input:
+        COMBINED / "top_REDI_bc_MAGESTIC_bc1_df.tsv",
+    output:
+        COMBINED / "annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv",
+    shell:
+        "magestic-redi-annotate --config {CONFIG_PATH}"

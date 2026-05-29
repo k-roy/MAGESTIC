@@ -1,0 +1,47 @@
+# REDI config — 20250312 NNS complex saturation mutagenesis screen.
+#
+# Reproduces the legacy run at
+#   /oak/.../projects/REDI/20250312_NNS_complex_saturation_mutagenesis/
+# via `magestic-redi --config configs/20250312_NNS_complex_satmut.yaml`.
+
+screen_name: 20250312_NNS_complex_saturation_mutagenesis
+sequencing_date: "20250328"
+
+paths:
+  project_root: /path/to/raw_data/by_project/REDI/20250312_NNS_complex_saturation_mutagenesis/
+  raw_fastq:    /path/to/raw_data/by_project/REDI/20250312_NNS_complex_saturation_mutagenesis/fastq/
+  intermediate: /path/to/intermediate_data/by_project/REDI/20250312_NNS_complex_saturation_mutagenesis/
+  processed:    /path/to/processed_data/by_project/REDI/20250312_NNS_complex_saturation_mutagenesis/
+  keyfiles:     /path/to/scripts_and_keyfiles/by_project/REDI/20250312_NNS_complex_saturation_mutagenesis/keyfiles/
+
+barcode:
+  bc1_length: 20
+  fwd_bc1_prefix: CAGGTCATGCTC
+  fwd_bc1_suffix: CCCTAGGATACG
+  fallback_prefix_length: 16
+
+purity:
+  top_n_for_purity: 4
+  edit_distance_drop: [1, 2]
+  min_counts: 10
+
+primer_rules:
+  KR1965: R2
+  KR1967: R1
+
+sample_key: sample_key.tsv
+gdna_plate_key: gDNA_plate_key.tsv
+redi_plate_barcode_key: REDI_plate_barcode_key.tsv
+
+redi_bc_keys:
+  - 20230513_updated_REDI_bc_V5_key.tsv
+  - 20250615_yT182_yT183_keyfile.tsv
+
+array_pairs:
+  - name_a: SHA345
+    name_b: yT182
+    purpose_a: "SHA345 REDI"
+
+bc1_reference_table: /path/to/processed_data/by_project/NNS/20240619_MAGESTIC_NNS_screen_reps_1-3/bc1_counts/20240619_MAGESTIC_NNS_screen_reps_1-3_combined_bc1_reference_table.tsv
+
+wgs_outcome_table: /path/to/projects/WGS_MAGESTIC_QTL_bc_calling/output3/summaries/wgs_outcome_full_table.v0.tsv

@@ -1,0 +1,130 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magestic"
+dynamic = ["version"]
+description = "Multiplexed CRISPR library design and analysis for functional genomics (MAGESTIC 3.0)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Kevin R. Roy", email = "kevinrjroy@gmail.com"},
+]
+keywords = ["CRISPR", "functional-genomics", "yeast", "guide-RNA", "donor-DNA", "barcode", "MAGESTIC"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "biopython>=1.79",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "statsmodels>=0.14",
+]
+
+[project.optional-dependencies]
+# Sequence alignment — needed for guide_donor_bc0 and bc1_donor_bc0 pipelines
+align = [
+    "rapidfuzz>=3.0",
+    "python-levenshtein>=0.21",
+    "pysam>=0.21",
+]
+# Screen analysis — needed for bc1_from_screen pipeline
+screen = [
+    "pydeseq2>=0.4.0",
+    "joblib>=1.3",
+    "openpyxl>=3.1",
+]
+# IHW multiple testing correction — requires R; pipeline degrades to BH without it
+ihw = [
+    "rpy2>=3.5",
+]
+# Snakemake workflow management
+snakemake = [
+    "snakemake>=7.32",
+]
+# REDI submodule — needs openpyxl for plate-DB xlsx snapshot and pyarrow for parquet
+redi = [
+    "openpyxl>=3.1",
+    "pyarrow>=14",
+    "python-levenshtein>=0.21",
+]
+# Full install: all pipelines + snakemake (excludes ihw which requires R)
+full = [
+    "magestic[align,screen,snakemake,redi]",
+]
+# Development and testing
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "black>=23.0",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+
+[project.scripts]
+magestic-pam-search        = "magestic.design._cli:pam_search_main"
+magestic-guide-selection   = "magestic.design._cli:guide_selection_main"
+magestic-vcf-process       = "magestic.design._cli:design_vcf_preprocess_main"
+magestic-design-vcf        = "magestic.design._cli:design_vcf_main"
+magestic-design-saturation = "magestic.design._cli:design_saturation_main"
+magestic-gdb-pipeline      = "magestic.pipelines.guide_donor_bc0._cli:main"
+magestic-bc1-link          = "magestic.pipelines.bc1_donor_bc0._cli:main"
+magestic-screen-analysis   = "magestic.pipelines.bc1_from_screen._cli:main"
+# REDI submodule (Phase J §9d) — umbrella + per-step CLIs
+magestic-redi              = "magestic.pipelines.redi._cli:umbrella_main"
+magestic-redi-trim         = "magestic.pipelines.redi._cli:trim_main"
+magestic-redi-combine-keys = "magestic.pipelines.redi._cli:combine_keys_main"
+magestic-redi-extract-bc   = "magestic.pipelines.redi._cli:extract_bc_main"
+magestic-redi-purity       = "magestic.pipelines.redi._cli:purity_main"
+magestic-redi-annotate     = "magestic.pipelines.redi._cli:annotate_main"
+magestic-redi-cross-array  = "magestic.pipelines.redi._cli:cross_array_main"
+magestic-redi-wgs-check    = "magestic.pipelines.redi._cli:wgs_check_main"
+magestic-redi-rearray      = "magestic.pipelines.redi._cli:rearray_main"
+
+[project.urls]
+Homepage = "https://github.com/kevinroy-lab/magestic"
+Repository = "https://github.com/kevinroy-lab/magestic"
+"Bug Tracker" = "https://github.com/kevinroy-lab/magestic/issues"
+
+[tool.hatch.version]
+path = "src/magestic/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magestic"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m not slow')",
+    "integration: marks integration tests requiring real data paths on Oak/Sherlock",
+    "unit: pure unit tests with no I/O",
+]
+
+[tool.ruff]
+src = ["src"]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["magestic"]
+ignore_missing_imports = true  # pysam stubs incomplete

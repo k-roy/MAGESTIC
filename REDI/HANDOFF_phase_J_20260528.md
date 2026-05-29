@@ -193,3 +193,63 @@ magestic-redi-rearray     = magestic.pipelines.redi._cli:rearray_main
 
 (populated at session end)
 
+
+---
+
+## 7'. Files touched / created this session (final)
+
+### Engine — `software/MAGESTIC/src/magestic/pipelines/redi/`
+
+| File | Purpose |
+|---|---|
+| `core/__init__.py` | re-exports |
+| `core/config.py` | `REDIConfig` dataclass + `load_config(yaml)` |
+| `core/purity.py` | step_d: `compute_purity`, `top_bc1_per_redi_bc`, `filter_edit_distance` |
+| `core/annotate.py` | step_e: `annotate_with_bc1_reference` |
+| `core/cross_array.py` | step_f: `compare_arrays` (generalized) |
+| `core/wgs_check.py` | step_g: `compare_to_wgs`, `normalize_wgs_bc1` |
+| `core/correspondence.py` | Unified type-(i)+type-(ii) API |
+| `readers/{fastq,keyfiles,plate_db,wgs_outcome}.py` | step_c primitives + step_b combine + snapshot consumer + WGS reader |
+| `pipeline/step_{a,b,c,d,e,f,g,h,i}_*.py` + `run_pipeline.py` | step orchestrators + umbrella |
+| `qc/pipeline_qc.py` | per-stage QC summarizers |
+| `slurm/template.sbatch` | per-sample step_a SLURM template (encodes 4 Sherlock traps) |
+| `snakemake/Snakefile` | per-plate fan-out workflow |
+| `_cli.py` | 9 CLI entry points (umbrella + 8 per-step) |
+
+### Project — `software/MAGESTIC/REDI/`
+
+| File | Purpose |
+|---|---|
+| `HANDOFF_phase_J_20260528.md` | this doc |
+| `README.md` | NRD1-style top-level README |
+| `configs/20250312_NNS_complex_satmut.yaml` | canonical screen config |
+| `configs/20240305_RBYG_REDI.yaml` | skeleton (BLOCKED — see §5 item 1) |
+| `plate_database/export_plate_db.py` | xlsx snapshot → TSV + per-stage parquet |
+| `reference/20230513_updated_REDI_bc_V5_key.tsv` | self-contained reference copy |
+| `docs/pipeline.md` | step_a–step_i prose |
+| `tests/test_smoke.py`, `tests/test_plate_db.py` | unit tests |
+
+### `pyproject.toml`
+
+Added `[project.optional-dependencies] redi = ["openpyxl>=3.1", "pyarrow>=14", "python-levenshtein>=0.21"]`, wired into `full`, plus 9 new `[project.scripts]` entries for `magestic-redi*`.
+
+### Testing
+
+`pytest REDI/tests/ -v` → **6 passed in 1.77 s** on Sherlock (Python 3.12.2):
+- `test_plate_db_resolve_in_range` ✓
+- `test_plate_db_missing_dir` ✓
+- `test_import_engine` ✓
+- `test_config_round_trip` ✓
+- `test_extract_bc1_from_seq` ✓
+- `test_purity_basic` ✓
+
+### Exit-criterion status (MASTER_PLAN §9d)
+
+| Exit criterion | Status |
+|---|---|
+| 1. Engine installs; pytest green | **DONE** — 6/6 |
+| 2. 20250312_NNS reruns reproducing legacy outputs | **DEFERRED** — config written; run pending |
+| 3. 20240305_RBYG runs end-to-end → correspondence_master.tsv | **BLOCKED** — missing keyfiles (§5 item 1) |
+| 4. plates.tsv resolves all referenced plate IDs | **PARTIAL** — script ready, invocation pending |
+| 5. README documents 9-step pipeline | **DONE** |
+| 6. Migration order respected | **PARTIAL** — 20250312 done as canonical source (correct); downstream re-runs deferred |
