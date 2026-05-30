@@ -55,16 +55,29 @@ def test_config_round_trip(tmp_path: Path):
 
 
 def test_extract_bc1_from_seq():
-    from magestic.pipelines.redi.readers.fastq import extract_bc1_from_seq
+    from magestic.pipelines.redi.readers.fastq import extract_bc1_from_seq, _rc
 
-    # 20 bp prefix-anchored bc1
+    # 20 bp prefix-anchored bc1 (default args, no suffix)
     bc1 = "A" * 20
     seq = "GGGG" + "CAGGTCATGCTC" + bc1 + "CCCTAGGATACG" + "TTTT"
     assert extract_bc1_from_seq(seq) == bc1
+    # With suffix passed, exact suffix match at expected length
+    assert extract_bc1_from_seq(seq, fwd_bc1_suffix="CCCTAGGATACG") == bc1
+    # 19 bp bc1 with length_tolerance=1
+    bc1_19 = "C" * 19
+    seq_19 = "GGGG" + "CAGGTCATGCTC" + bc1_19 + "CCCTAGGATACG" + "TTTT"
+    assert extract_bc1_from_seq(seq_19, fwd_bc1_suffix="CCCTAGGATACG") == bc1_19
+    # 21 bp bc1 with length_tolerance=1
+    bc1_21 = "G" * 21
+    seq_21 = "GGGG" + "CAGGTCATGCTC" + bc1_21 + "CCCTAGGATACG" + "TTTT"
+    assert extract_bc1_from_seq(seq_21, fwd_bc1_suffix="CCCTAGGATACG") == bc1_21
+    # Reverse orientation: same construct read from the other strand
+    bc1_fwd = "ACGTACGTACGTACGTACGT"
+    fwd = "GGGG" + "CAGGTCATGCTC" + bc1_fwd + "CCCTAGGATACG" + "TTTT"
+    assert extract_bc1_from_seq(_rc(fwd), fwd_bc1_suffix="CCCTAGGATACG") == bc1_fwd
     # Missing prefix → fallback slice
     short_seq = "X" * 16 + "Y" * 20
-    out = extract_bc1_from_seq(short_seq)
-    assert out == "Y" * 20
+    assert extract_bc1_from_seq(short_seq) == "Y" * 20
     # None / NaN passthrough
     assert extract_bc1_from_seq(None) is None
 

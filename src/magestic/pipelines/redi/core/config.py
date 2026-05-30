@@ -66,6 +66,8 @@ class REDIBarcodeSchema:
     # When the prefix can't be found, fall back to a fixed offset that works
     # for KR1965/KR1967 primer sets (20-bp trim + 'TCGACAGGTCATGCTC').
     fallback_prefix_length: int = 16  # len('TCGACAGGTCATGCTC')
+    # Synthesis/sequencing-error tolerance on bc1 length (matches bc1_from_screen).
+    bc1_length_tolerance: int = 1
 
 
 @dataclass

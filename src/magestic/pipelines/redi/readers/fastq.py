@@ -15,25 +15,72 @@ import numpy as np
 import pandas as pd
 
 
+_COMPLEMENT = {"A": "T", "T": "A", "G": "C", "C": "G", "N": "N"}
+
+
+def _rc(seq: str) -> str:
+    return "".join(_COMPLEMENT.get(b, "N") for b in reversed(seq.upper()))
+
+
 def extract_bc1_from_seq(
     seq: str | float | None,
     fwd_bc1_prefix: str = "CAGGTCATGCTC",
     bc1_length: int = 20,
     fallback_prefix_length: int = 16,
+    fwd_bc1_suffix: str | None = None,
+    length_tolerance: int = 1,
 ) -> str | None:
     """Extract a bc1 from a single trimmed merged read.
 
-    Search for `fwd_bc1_prefix`; if found, take the next `bc1_length` bp.
-    Otherwise fall back to a fixed slice (legacy step_c behavior for KR1965/
-    KR1967 reads that present `TCGACAGGTCATGCTC` after 20 bp trimming).
+    Matches the `bc1_from_screen.snakemake.02_parse_bc1_reads` convention:
+    forward orientation searches for `fwd_bc1_prefix`, then tries lengths in
+    ``[bc1_length - length_tolerance, bc1_length + length_tolerance]``,
+    preferring a length whose post-bc1 region equals `fwd_bc1_suffix` exactly;
+    falls back to the expected length without suffix validation. Reverse
+    orientation searches against ``rc(suffix)`` as the prefix-equivalent and
+    returns the bc1 reverse-complemented back to forward orientation
+    (skipped when `fwd_bc1_suffix` is None — there's no RC anchor to use).
+    Legacy positional fallback when neither anchor is found (KR1965/KR1967
+    reads with a 20 bp leading trim).
     """
     if seq is None or (isinstance(seq, float) and np.isnan(seq)):
         return None
-    idx = seq.find(fwd_bc1_prefix)
-    if idx != -1:
-        bc1_start = idx + len(fwd_bc1_prefix)
-        return seq[bc1_start : bc1_start + bc1_length]
-    return seq[fallback_prefix_length : fallback_prefix_length + bc1_length]
+
+    s = seq.upper()
+    prefix = fwd_bc1_prefix.upper()
+    suffix = fwd_bc1_suffix.upper() if fwd_bc1_suffix else None
+    min_len = max(1, bc1_length - length_tolerance)
+    max_len = bc1_length + length_tolerance
+
+    # Forward orientation
+    pidx = s.find(prefix)
+    if pidx >= 0:
+        start = pidx + len(prefix)
+        if suffix:
+            for try_len in range(min_len, max_len + 1):
+                end = start + try_len
+                if end + len(suffix) <= len(s) and s[end:end + len(suffix)] == suffix:
+                    return s[start:end]
+        end = start + bc1_length
+        if end <= len(s):
+            return s[start:end]
+
+    # Reverse orientation (requires a suffix to derive the RC anchor)
+    if suffix:
+        rc_prefix = _rc(suffix)
+        rc_suffix = _rc(prefix)
+        pidx = s.find(rc_prefix)
+        if pidx >= 0:
+            start = pidx + len(rc_prefix)
+            for try_len in range(min_len, max_len + 1):
+                end = start + try_len
+                if end + len(rc_suffix) <= len(s) and s[end:end + len(rc_suffix)] == rc_suffix:
+                    return _rc(s[start:end])
+            end = start + bc1_length
+            if end <= len(s):
+                return _rc(s[start:end])
+
+    return s[fallback_prefix_length : fallback_prefix_length + bc1_length]
 
 
 def extract_redi_bc_vectorized(

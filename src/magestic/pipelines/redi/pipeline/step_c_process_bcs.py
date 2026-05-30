@@ -64,6 +64,8 @@ def run_step_c(
             fwd_bc1_prefix=bc.fwd_bc1_prefix,
             bc1_length=bc.bc1_length,
             fallback_prefix_length=bc.fallback_prefix_length,
+            fwd_bc1_suffix=bc.fwd_bc1_suffix,
+            length_tolerance=bc.bc1_length_tolerance,
         )
     )
     counts["bc1_R2"] = counts["R2_seq"].apply(
@@ -72,6 +74,8 @@ def run_step_c(
             fwd_bc1_prefix=bc.fwd_bc1_prefix,
             bc1_length=bc.bc1_length,
             fallback_prefix_length=bc.fallback_prefix_length,
+            fwd_bc1_suffix=bc.fwd_bc1_suffix,
+            length_tolerance=bc.bc1_length_tolerance,
         )
     )
 
