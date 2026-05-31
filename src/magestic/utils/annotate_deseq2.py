@@ -47,8 +47,15 @@ def annotate_one(
         logger.info("SKIP (exists): %s", out_tsv.name)
         return {"file": in_tsv.name, "skipped": True}
 
-    df = pd.read_csv(in_tsv, sep="\t")
+    try:
+        df = pd.read_csv(in_tsv, sep="\t")
+    except (pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        logger.warning("  %s: unreadable (%s); skipping", in_tsv.name, exc)
+        return {"file": in_tsv.name, "error": str(exc), "skipped": True}
     n_in = len(df)
+    if n_in == 0:
+        logger.warning("  %s: 0 rows; skipping", in_tsv.name)
+        return {"file": in_tsv.name, "rows": 0, "skipped": True}
     if oligo_col not in df.columns:
         logger.warning("  %s: no \"%s\" column; copying unchanged", in_tsv.name, oligo_col)
         df.to_csv(out_tsv, sep="\t", index=False)
