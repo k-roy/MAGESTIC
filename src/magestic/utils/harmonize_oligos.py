@@ -1438,9 +1438,10 @@ def _cli():
     parser = argparse.ArgumentParser(
         description=(
             "Harmonize per-nuclease oligo info files into a single annotated TSV. "
-            "Inputs/outputs are resolved from BASE_DIR (env var OAK or --oak), see "
-            "module-top PATHS definition. Run with --gsheet-sync to push the result "
-            "directory to the lab Google Drive via rclone."
+            "Inputs/outputs are resolved from BASE_DIR at module import time "
+            "(env var OAK, default /path/to). See module-top "
+            "PATHS definition. Run with --gsheet-sync to push the result directory "
+            "to the lab Google Drive via rclone."
         )
     )
     parser.add_argument(
