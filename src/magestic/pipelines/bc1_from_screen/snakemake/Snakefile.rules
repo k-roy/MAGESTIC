@@ -1,0 +1,400 @@
+"""
+Snakemake Rules: BC1-From-Screen Pipeline
+==========================================
+
+Reusable rules for processing BC1 barcode counts from CRISPR screens with
+library-specific tiered analysis.
+
+Pipeline Steps:
+    01: Validate collapsed FASTQ files
+    02: Parse BC1 from collapsed FASTQ
+    03: Sample QC
+    04: Combine counts
+    05: Error detection
+    06: Absorb error counts
+    07: Tier classification (per library)
+    08: Create DESeq2 count matrix
+    09: Combine technical replicates
+    10: Split by comparison
+    11: DESeq2 single comparison
+    12: Slope fitness (timecourse)
+    13: Annotate results
+    14: Hit calling
+    15: Aggregate hits
+    16: Rarefaction analysis
+    17: DESeq2 rarefaction
+    18: Validate sublibrary composition
+
+To use in a project Snakefile:
+    1. Define required variables (see REQUIRED VARIABLES below)
+    2. Include this file: include: "/path/to/common/scripts/bc1_from_screen_pipeline/snakemake/Snakefile.rules"
+
+REQUIRED VARIABLES (must be defined before include):
+    - COMMON_SCRIPTS_DIR: Path to common/scripts/bc1_from_screen_pipeline/snakemake/
+    - PYTHON: Path to Python interpreter (with bc1_from_screen env activated)
+    - COLLAPSED_FASTQ_DIR: Input directory with collapsed FASTQ files
+    - BC1_COUNTS_DIR: Output directory for BC1 counts
+    - DESEQ2_DIR: Output directory for DESeq2 results
+    - HIT_CALLING_DIR: Output directory for hit calling results
+    - KEYFILE_DIR: Project keyfiles directory
+    - LOGS_DIR: Output directory for logs
+    - LIBRARIES: List of library names (e.g., ["yL437", "yL442"])
+
+REQUIRED CONFIG KEYS:
+    config["tier_thresholds"]: Tier classification parameters
+    config["deseq2"]: DESeq2 parameters
+    config["hit_calling"]: Hit calling parameters
+    config["resources"]: Resource specifications for each step
+
+Author: Kevin R. Roy
+"""
+
+from pathlib import Path
+
+# =============================================================================
+# Step 02: Parse BC1 from Collapsed FASTQ
+# =============================================================================
+rule parse_02_bc1:
+    """Extract BC1 barcodes from collapsed FASTQ files"""
+    input:
+        collapsed_fastq = COLLAPSED_FASTQ_DIR / "{sample}_collapsed.fastq.gz"
+    output:
+        bc1_counts = BC1_COUNTS_DIR / "parsed" / "{sample}_bc1_counts.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "02_parse_bc1_reads.py",
+        bc1_length = config.get("sequence_parsing", {}).get("bc1_length", 20),
+        bc1_prefix = config.get("sequence_parsing", {}).get("bc1_prefix", "CATGCTC"),
+        bc1_suffix = config.get("sequence_parsing", {}).get("bc1_suffix", "CCCTAGG"),
+        min_counts = config.get("sequence_parsing", {}).get("min_counts", 1)
+    log:
+        LOGS_DIR / "02_parse_{sample}.log"
+    threads: config.get("resources", {}).get("step_02", {}).get("cpus", 4)
+    resources:
+        mem_mb = config.get("resources", {}).get("step_02", {}).get("mem_mb", 16000),
+        time = config.get("resources", {}).get("step_02", {}).get("time", "2:00:00")
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input {input.collapsed_fastq} \\
+            --output {output.bc1_counts} \\
+            --bc1-length {params.bc1_length} \\
+            --bc1-prefix {params.bc1_prefix} \\
+            --bc1-suffix {params.bc1_suffix} \\
+            --min-counts {params.min_counts} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 03: Sample QC
+# =============================================================================
+rule qc_03_sample:
+    """Generate QC metrics for parsed BC1 counts"""
+    input:
+        bc1_counts = expand(BC1_COUNTS_DIR / "parsed" / "{sample}_bc1_counts.tsv",
+                           sample=SAMPLES)
+    output:
+        qc_summary = BC1_COUNTS_DIR / "qc" / "sample_qc_summary.tsv",
+        qc_plot = BC1_COUNTS_DIR / "qc" / "sample_qc_plot.png"
+    params:
+        script = COMMON_SCRIPTS_DIR / "03_sample_qc.py",
+        input_dir = BC1_COUNTS_DIR / "parsed"
+    log:
+        LOGS_DIR / "03_qc.log"
+    threads: 1
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input-dir {params.input_dir} \\
+            --output-summary {output.qc_summary} \\
+            --output-plot {output.qc_plot} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 07: Tier Classification
+# =============================================================================
+rule tier_07_classification:
+    """Classify BC1s into tiers based on t0 counts (per library)"""
+    input:
+        bc1_counts = BC1_COUNTS_DIR / "{screen}_bc1_counts_long_format.tsv",
+        ref_table = KEYFILE_DIR / "bc1_reference_table.tsv"
+    output:
+        tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv",
+        tier_stats = BC1_COUNTS_DIR / "{screen}_tier_stats_{library}.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "07_tier_classification.py",
+        tier_1_min = config.get("tier_thresholds", {}).get("tier_1_min_reads", 100),
+        tier_2_min = config.get("tier_thresholds", {}).get("tier_2_min_reads", 20)
+    log:
+        LOGS_DIR / "07_tier_{screen}_{library}.log"
+    threads: config.get("resources", {}).get("step_07", {}).get("cpus", 4)
+    resources:
+        mem_mb = config.get("resources", {}).get("step_07", {}).get("mem_mb", 32000)
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --bc1-counts {input.bc1_counts} \\
+            --ref-table {input.ref_table} \\
+            --library {wildcards.library} \\
+            --output-tier-mapping {output.tier_mapping} \\
+            --output-stats {output.tier_stats} \\
+            --tier-1-min {params.tier_1_min} \\
+            --tier-2-min {params.tier_2_min} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 08: Create DESeq2 Count Matrix
+# =============================================================================
+rule matrix_08_create:
+    """Create wide-format count matrix with consolidated t0 (per library)"""
+    input:
+        bc1_counts = BC1_COUNTS_DIR / "{screen}_bc1_counts_long_format.tsv",
+        tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv",
+        sample_key = KEYFILE_DIR / "sample_key.tsv"
+    output:
+        count_matrix = BC1_COUNTS_DIR / "{screen}_bc1_counts_wide_{library}_combined_tiers.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "08_create_count_matrix.py",
+        consolidate_t0 = config.get("deseq2", {}).get("consolidate_t0", True),
+        t0_groups = config.get("deseq2", {}).get("t0_consolidation_groups", 4)
+    log:
+        LOGS_DIR / "08_matrix_{screen}_{library}.log"
+    threads: config.get("resources", {}).get("step_08", {}).get("cpus", 4)
+    resources:
+        mem_mb = config.get("resources", {}).get("step_08", {}).get("mem_mb", 64000)
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --bc1-counts {input.bc1_counts} \\
+            --tier-mapping {input.tier_mapping} \\
+            --sample-key {input.sample_key} \\
+            --library {wildcards.library} \\
+            --output {output.count_matrix} \\
+            --consolidate-t0 {params.consolidate_t0} \\
+            --t0-groups {params.t0_groups} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 10: Split Count Tables by Comparison
+# =============================================================================
+rule split_10_comparisons:
+    """Split count matrix into per-comparison tables"""
+    input:
+        count_matrix = BC1_COUNTS_DIR / "{screen}_bc1_counts_wide_{library}_combined_tiers.tsv",
+        sample_key = KEYFILE_DIR / "sample_key.tsv"
+    output:
+        manifest = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "comparison_manifest.tsv",
+        reference_dir = directory(BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "reference"),
+        treatment_dir = directory(BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "treatment")
+    params:
+        script = COMMON_SCRIPTS_DIR / "10_split_comparisons.py",
+        output_dir = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}"
+    log:
+        LOGS_DIR / "10_split_{library}.log"
+    threads: 1
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --count-matrix {input.count_matrix} \\
+            --sample-key {input.sample_key} \\
+            --library {wildcards.library} \\
+            --output-dir {params.output_dir} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 11: DESeq2 Single Comparison
+# =============================================================================
+rule deseq2_11_single:
+    """Run DESeq2 for a single comparison"""
+    input:
+        reference = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "reference" / "{comparison}_reference.tsv",
+        treatment = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "treatment" / "{comparison}_treatment.tsv"
+    output:
+        results = DESEQ2_DIR / "{library}" / "{comparison}_DESeq2_results.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "11_deseq2_single.py",
+        min_basemean = config.get("deseq2", {}).get("min_basemean", 0)
+    log:
+        LOGS_DIR / "11_deseq2_{library}_{comparison}.log"
+    threads: config.get("resources", {}).get("step_11", {}).get("cpus", 4)
+    resources:
+        mem_mb = config.get("resources", {}).get("step_11", {}).get("mem_mb", 32000),
+        time = config.get("resources", {}).get("step_11", {}).get("time", "2:00:00")
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --reference {input.reference} \\
+            --treatment {input.treatment} \\
+            --output {output.results} \\
+            --comparison {wildcards.comparison} \\
+            --library {wildcards.library} \\
+            --min-basemean {params.min_basemean} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 12: Slope Fitness (Timecourse Analysis)
+# =============================================================================
+rule slope_12_fitness:
+    """Calculate fitness slopes for timecourse experiments"""
+    input:
+        deseq2_results = lambda wildcards: expand(
+            DESEQ2_DIR / "{library}" / "{comparison}_DESeq2_results.tsv",
+            library=wildcards.library,
+            comparison=get_timecourse_comparisons(wildcards.library)
+        )
+    output:
+        slopes = DESEQ2_DIR / "{library}" / "timecourse_slopes.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "12_slope_fitness.py",
+        input_dir = DESEQ2_DIR / "{library}"
+    log:
+        LOGS_DIR / "12_slope_{library}.log"
+    threads: 1
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input-dir {params.input_dir} \\
+            --output {output.slopes} \\
+            --library {wildcards.library} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 13: Annotate DESeq2 Results
+# =============================================================================
+rule annotate_13_results:
+    """Merge DESeq2 results with variant annotations"""
+    input:
+        deseq2_results = DESEQ2_DIR / "{library}" / "{comparison}_DESeq2_results.tsv",
+        ref_table = KEYFILE_DIR / "bc1_reference_table.tsv",
+        tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv",
+        oligo_design = KEYFILE_DIR / "oligo_design.tsv"
+    output:
+        annotated = DESEQ2_DIR / "per_comparison" / "{library}" / "{comparison}_annotated.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "13_annotate_results.py"
+    log:
+        LOGS_DIR / "13_annotate_{library}_{comparison}.log"
+    threads: 1
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --deseq2-results {input.deseq2_results} \\
+            --ref-table {input.ref_table} \\
+            --tier-mapping {input.tier_mapping} \\
+            --oligo-design {input.oligo_design} \\
+            --output {output.annotated} \\
+            --library {wildcards.library} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 14: Hit Calling Single Comparison
+# =============================================================================
+rule hit_14_calling:
+    """Tier-aware hit calling for a single comparison"""
+    input:
+        annotated = DESEQ2_DIR / "per_comparison" / "{library}" / "{comparison}_annotated.tsv"
+    output:
+        hits = HIT_CALLING_DIR / "{library}" / "{comparison}_hits.tsv",
+        stats = HIT_CALLING_DIR / "{library}" / "{comparison}_stats.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "14_hit_calling.py",
+        tier_1_z = config.get("hit_calling", {}).get("tier_1_z_threshold", 3.0),
+        tier_1_conc = config.get("hit_calling", {}).get("tier_1_concordance", 0.75),
+        tier_2_z = config.get("hit_calling", {}).get("tier_2_z_threshold", 3.75),
+        tier_2_conc = config.get("hit_calling", {}).get("tier_2_concordance", 0.85),
+        use_synonymous_null = config.get("hit_calling", {}).get("use_synonymous_null", True)
+    log:
+        LOGS_DIR / "14_hit_{library}_{comparison}.log"
+    threads: 1
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input {input.annotated} \\
+            --output-hits {output.hits} \\
+            --output-stats {output.stats} \\
+            --library {wildcards.library} \\
+            --comparison {wildcards.comparison} \\
+            --tier-1-z {params.tier_1_z} \\
+            --tier-1-concordance {params.tier_1_conc} \\
+            --tier-2-z {params.tier_2_z} \\
+            --tier-2-concordance {params.tier_2_conc} \\
+            --use-synonymous-null {params.use_synonymous_null} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 15: Aggregate Hit Calls
+# =============================================================================
+rule aggregate_15_hits:
+    """Aggregate hits across comparisons with time series analysis"""
+    input:
+        hits = lambda wildcards: expand(
+            HIT_CALLING_DIR / "{library}" / "{comparison}_hits.tsv",
+            library=wildcards.library,
+            comparison=get_comparisons_for_library(wildcards.library)
+        )
+    output:
+        aggregated = HIT_CALLING_DIR / "{library}" / "aggregated_hits.tsv",
+        time_series = HIT_CALLING_DIR / "{library}" / "time_series_analysis.tsv",
+        summary = HIT_CALLING_DIR / "{library}" / "hits_summary_by_tier.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "15_aggregate_hits.py",
+        input_dir = HIT_CALLING_DIR / "{library}"
+    log:
+        LOGS_DIR / "15_aggregate_{library}.log"
+    threads: 1
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input-dir {params.input_dir} \\
+            --output-aggregated {output.aggregated} \\
+            --output-time-series {output.time_series} \\
+            --output-summary {output.summary} \\
+            --library {wildcards.library} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 16: Rarefaction Analysis
+# =============================================================================
+rule rarefaction_16:
+    """Rarefaction analysis for power assessment"""
+    input:
+        bc1_counts = BC1_COUNTS_DIR / "{screen}_bc1_counts_long_format.tsv",
+        tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv"
+    output:
+        rarefaction = BC1_COUNTS_DIR / "qc" / "{screen}_{library}_rarefaction.tsv",
+        rarefaction_plot = BC1_COUNTS_DIR / "qc" / "{screen}_{library}_rarefaction.png"
+    params:
+        script = COMMON_SCRIPTS_DIR / "16_rarefaction.py"
+    log:
+        LOGS_DIR / "16_rarefaction_{screen}_{library}.log"
+    threads: config.get("resources", {}).get("step_16", {}).get("cpus", 4)
+    resources:
+        mem_mb = config.get("resources", {}).get("step_16", {}).get("mem_mb", 32000)
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --bc1-counts {input.bc1_counts} \\
+            --tier-mapping {input.tier_mapping} \\
+            --library {wildcards.library} \\
+            --output {output.rarefaction} \\
+            --output-plot {output.rarefaction_plot} \\
+            2>&1 | tee {log}
+        """

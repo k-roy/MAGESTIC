@@ -1,0 +1,254 @@
+"""
+Snakemake Rules: BC1-Donor-BC0 Pipeline
+=======================================
+
+Reusable rules for processing MAGESTIC bc1-donor-bc0 amplicon data.
+
+Pipeline Steps:
+    01a: Parse 2x150 paired FASTQ files
+    01b: Parse 2x300 collapsed FASTQ files
+    02:  Combine and collapse across samples
+    03:  Link guide-donor-bc0 data (adds guide info from sequencing)
+    04:  Map to designed oligos
+    05:  Assign BC1 to sub-libraries
+
+To use in a project Snakefile:
+    1. Define required variables (see REQUIRED VARIABLES below)
+    2. Include this file: include: "/path/to/common/scripts/bc1_donor_bc0_pipeline/snakemake/Snakefile.rules"
+
+REQUIRED VARIABLES (must be defined before include):
+    - COMMON_SCRIPTS_DIR: Path to common/scripts/bc1_donor_bc0_pipeline/snakemake/
+    - PYTHON: Path to Python interpreter
+    - KEYFILE_DIR: Project keyfiles directory
+    - PARSED_DIR: Output directory for parsed data
+    - COMBINED_DIR: Output directory for combined data
+    - DATA_TABLES_DIR: Output directory for final tables
+    - LOGS_DIR: Output directory for logs
+
+REQUIRED CONFIG KEYS:
+    config["sequence_parsing"]: Parsing parameters
+    config["collapsing"]: Collapsing parameters
+    config["oligo_mapping"]: Oligo mapping parameters
+    config["oligo_pools"]: List of oligo pool filenames
+    config["resources"]: Resource specifications for each step
+    config["guide_donor_bc0_dir"]: Path to guide-donor-bc0 purity filtered data (or null to skip)
+
+Author: Kevin R. Roy
+"""
+
+# =============================================================================
+# Step 01b: Parse 2x300 Collapsed FASTQ
+# =============================================================================
+rule parse_01b_2x300:
+    """Parse bc1-donor-bc0 from 2x300 collapsed FASTQ files"""
+    input:
+        collapsed = "{collapsed_dir}/{prefix}_collapsed.fastq.gz"
+    output:
+        parsed = "{parsed_dir}/{prefix}_parsed.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "01b_parse_2x300_collapsed_fastq.py",
+        bc1_prefix = config["sequence_parsing"]["bc1_prefix"],
+        bc1_suffix = config["sequence_parsing"]["bc1_suffix"],
+        bc1_length = config["sequence_parsing"]["bc1_length"],
+        re_site_seq = config["sequence_parsing"]["re_site_seq"],
+        msd_seq = config["sequence_parsing"]["msd_seq"],
+        sps_length = config["sequence_parsing"]["sps_length"],
+        bc0_length = config["sequence_parsing"]["bc0_length"]
+    log:
+        "{logs_dir}/01b_parse_{prefix}.log"
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input {input.collapsed} \\
+            --output {output.parsed} \\
+            --bc1-prefix {params.bc1_prefix} \\
+            --bc1-suffix {params.bc1_suffix} \\
+            --bc1-length {params.bc1_length} \\
+            --re-site-seq {params.re_site_seq} \\
+            --msd-seq {params.msd_seq} \\
+            --sps-length {params.sps_length} \\
+            --bc0-length {params.bc0_length} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 01a: Parse 2x150 Paired FASTQ
+# =============================================================================
+rule parse_01a_2x150:
+    """Parse bc1-donor-bc0 from 2x150 paired FASTQ files"""
+    input:
+        r1 = "{fastq_dir}/{prefix}_R1.fastq.gz",
+        r2 = "{fastq_dir}/{prefix}_R2.fastq.gz"
+    output:
+        parsed = "{parsed_dir}/{prefix}_parsed_2x150.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "01a_parse_2x150_paired_fastq.py",
+        r1_bc1_prefix = config["sequence_parsing"]["r1_bc1_prefix"],
+        bc1_length = config["sequence_parsing"]["bc1_length"],
+        r2_donor_fragment_start = config["sequence_parsing"]["r2_donor_fragment_start"],
+        r2_sps_range = config["sequence_parsing"]["r2_sps_range"],
+        r2_bc0_range = config["sequence_parsing"]["r2_bc0_range"]
+    log:
+        "{logs_dir}/01a_parse_2x150_{prefix}.log"
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --r1 {input.r1} \\
+            --r2 {input.r2} \\
+            --output {output.parsed} \\
+            --r1-bc1-prefix {params.r1_bc1_prefix} \\
+            --bc1-length {params.bc1_length} \\
+            --r2-donor-fragment-start {params.r2_donor_fragment_start} \\
+            --r2-sps-range {params.r2_sps_range[0]} {params.r2_sps_range[1]} \\
+            --r2-bc0-range {params.r2_bc0_range[0]} {params.r2_bc0_range[1]} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 02: Combine and Collapse
+# =============================================================================
+rule combine_02_collapse:
+    """Combine parsed data across samples and collapse similar sequences"""
+    input:
+        parsed_files = lambda wildcards: expand(
+            PARSED_DIR / "{prefix}_parsed.tsv",
+            prefix=get_sample_prefixes(wildcards.run_date)
+        ),
+        sample_key = KEYFILE_DIR / "{run_date}" / config["keyfiles"]["sample_key"],
+        plate_key = KEYFILE_DIR / "{run_date}" / config["keyfiles"]["plate_key"]
+    output:
+        collapsed = COMBINED_DIR / "{run_date}_bc1_donor_bc0_collapsed.tsv",
+        purity = COMBINED_DIR / "{run_date}_bc1_purity.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "02_combine_and_collapse.py",
+        parsed_dir = PARSED_DIR,
+        donor_edit_distance = config["collapsing"]["donor_edit_distance"],
+        bc1_edit_distance = config["collapsing"]["bc1_edit_distance"],
+        min_pcr_replicates = config["collapsing"]["min_pcr_replicates"]
+    log:
+        LOGS_DIR / "02_combine_{run_date}.log"
+    threads: config["resources"]["step_02_combine"]["cpus"]
+    resources:
+        mem_mb = config["resources"]["step_02_combine"]["mem_mb"],
+        time = config["resources"]["step_02_combine"]["time"]
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --parsed-dir {params.parsed_dir} \\
+            --sample-key {input.sample_key} \\
+            --plate-key {input.plate_key} \\
+            --run-date {wildcards.run_date} \\
+            --output-collapsed {output.collapsed} \\
+            --output-purity {output.purity} \\
+            --donor-edit-distance {params.donor_edit_distance} \\
+            --bc1-edit-distance {params.bc1_edit_distance} \\
+            --min-pcr-replicates {params.min_pcr_replicates} \\
+            --n-jobs {threads} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 03: Link Guide-Donor-BC0 Data
+# =============================================================================
+rule link_03_guide_donor_bc0:
+    """Link BC1s to guide sequences from guide-donor-bc0 sequencing data"""
+    input:
+        collapsed = COMBINED_DIR / "{run_date}_bc1_donor_bc0_collapsed.tsv"
+    output:
+        linked = DATA_TABLES_DIR / "{run_date}_bc1_with_guide.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "03_link_guide_donor_bc0.py",
+        guide_donor_bc0_dir = config.get("guide_donor_bc0_dir", None)
+    log:
+        LOGS_DIR / "03_link_{run_date}.log"
+    threads: config["resources"].get("step_03_link", {}).get("cpus", 1)
+    resources:
+        mem_mb = config["resources"].get("step_03_link", {}).get("mem_mb", 16000),
+        time = config["resources"].get("step_03_link", {}).get("time", "01:00:00")
+    run:
+        if params.guide_donor_bc0_dir:
+            shell("""
+                {PYTHON} {params.script} \\
+                    --input {input.collapsed} \\
+                    --guide-donor-bc0-dir {params.guide_donor_bc0_dir} \\
+                    --output {output.linked} \\
+                    2>&1 | tee {log}
+            """)
+        else:
+            # If no guide data, just copy the collapsed file with renamed columns
+            shell("""
+                cp {input.collapsed} {output.linked}
+                echo "No guide_donor_bc0_dir configured, skipping guide linking" | tee {log}
+            """)
+
+
+# =============================================================================
+# Step 04: Map to Designed Oligos
+# =============================================================================
+rule map_04_oligos:
+    """Map donors to designed oligo pool"""
+    input:
+        bc1_data = expand(DATA_TABLES_DIR / "{run_date}_bc1_with_guide.tsv",
+                         run_date=ACTIVE_RUNS),
+        oligo_pools = expand(KEYFILE_DIR / "{pool}", pool=config["oligo_pools"])
+    output:
+        mapped = DATA_TABLES_DIR / "bc1_donor_bc0_mapped_to_oligos.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "04_map_to_oligos.py",
+        guide_start = config["oligo_mapping"]["guide_start"],
+        guide_end = config["oligo_mapping"]["guide_end"],
+        donor_start = config["oligo_mapping"]["donor_start"],
+        donor_end = config["oligo_mapping"]["donor_end"],
+        lbcas12a_donor_start = config["oligo_mapping"].get("lbcas12a_donor_start", 63)
+    log:
+        LOGS_DIR / "04_map.log"
+    threads: config["resources"]["step_04_map"]["cpus"]
+    resources:
+        mem_mb = config["resources"]["step_04_map"]["mem_mb"],
+        time = config["resources"]["step_04_map"]["time"]
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input {input.bc1_data} \\
+            --oligo-pools {input.oligo_pools} \\
+            --output {output.mapped} \\
+            --guide-start {params.guide_start} \\
+            --guide-end {params.guide_end} \\
+            --donor-start {params.donor_start} \\
+            --donor-end {params.donor_end} \\
+            --lbcas12a-donor-start {params.lbcas12a_donor_start} \\
+            2>&1 | tee {log}
+        """
+
+
+# =============================================================================
+# Step 05: Assign BC1 to Sub-libraries
+# =============================================================================
+rule assign_05_sublibrary:
+    """Assign bc1 to sub-libraries based on SPS"""
+    input:
+        mapped = DATA_TABLES_DIR / "bc1_donor_bc0_mapped_to_oligos.tsv",
+        sps_mapping = KEYFILE_DIR / "sps_library_mapping.tsv"
+    output:
+        reference = DATA_TABLES_DIR / "bc1_reference_table.tsv",
+        purity_summary = DATA_TABLES_DIR / "bc1_purity_summary.tsv"
+    params:
+        script = COMMON_SCRIPTS_DIR / "05_assign_sublibrary.py"
+    log:
+        LOGS_DIR / "05_assign.log"
+    threads: config["resources"]["step_05_assign"]["cpus"]
+    resources:
+        mem_mb = config["resources"]["step_05_assign"]["mem_mb"],
+        time = config["resources"]["step_05_assign"]["time"]
+    shell:
+        """
+        {PYTHON} {params.script} \\
+            --input {input.mapped} \\
+            --sps-mapping {input.sps_mapping} \\
+            --output-reference {output.reference} \\
+            --output-summary {output.purity_summary} \\
+            2>&1 | tee {log}
+        """
