@@ -97,6 +97,7 @@ magestic-redi-rearray      = "magestic.pipelines.redi._cli:rearray_main"
 
 # Annotation utilities
 magestic-harmonize-oligos  = "magestic.utils.harmonize_oligos:_cli"
+magestic-annotate-deseq2  = "magestic.utils.annotate_deseq2:_cli"
 
 [project.urls]
 Homepage = "https://github.com/kevinroy-lab/magestic"
