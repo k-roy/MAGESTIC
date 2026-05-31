@@ -222,29 +222,64 @@ def aggregate_and_filter(
     # columns (counts_2x300 / counts_2x150) into a unified 'counts' column when the
     # merge produced data-source-suffixed names. Without this, 2x300-only screens
     # (yL406, yL437, yL442) crash with `KeyError: 'counts'` at the groupby below.
+    # Prefer the upstream `total_counts` field when present (BC1Record already
+    # summed 2x150 + 2x300) rather than re-summing the per-source columns; falls
+    # back to the per-source coalesce if `total_counts` is absent.
     if 'counts' not in df.columns:
-        if 'counts_2x300' in df.columns and 'counts_2x150' in df.columns:
-            df = df.copy()
+        df = df.copy()
+        if 'total_counts' in df.columns:
+            df['counts'] = df['total_counts']
+        elif 'counts_2x300' in df.columns and 'counts_2x150' in df.columns:
             df['counts'] = df['counts_2x300'].fillna(0) + df['counts_2x150'].fillna(0)
         elif 'counts_2x300' in df.columns:
-            df = df.copy()
             df['counts'] = df['counts_2x300']
         elif 'counts_2x150' in df.columns:
-            df = df.copy()
             df['counts'] = df['counts_2x150']
         else:
             raise KeyError(
-                "aggregate_and_filter: no 'counts', 'counts_2x300', or 'counts_2x150' "
-                "column found in DataFrame. Upstream merge step is broken."
+                "aggregate_and_filter: no 'counts', 'total_counts', 'counts_2x300', "
+                "or 'counts_2x150' column found in DataFrame. Upstream merge step "
+                "is broken."
             )
+
+    # 2026-05-30 fix (user-confirmed criterion): a bc1 must be observed in
+    # >= 2 distinct samples to be called to a true donor-bc0 association.
+    # BC1Record.to_dict exposes this as `total_pcr_replicates` (sum of
+    # pcr_replicates_2x150 + pcr_replicates_2x300, where each per-source value
+    # is the distinct-sample count). The prior code looked for a `sample_number`
+    # column that `merge_data_sources` does not produce, leaving the
+    # `min_pcr_replicates` filter below as a silent no-op. After this coalesce,
+    # the existing filter actually fires on the n-distinct-samples criterion.
+    if 'num_PCR_replicates' not in df.columns:
+        if 'total_pcr_replicates' in df.columns:
+            df['num_PCR_replicates'] = df['total_pcr_replicates']
+        elif 'pcr_replicates_2x300' in df.columns and 'pcr_replicates_2x150' in df.columns:
+            df['num_PCR_replicates'] = (
+                df['pcr_replicates_2x300'].fillna(0)
+                + df['pcr_replicates_2x150'].fillna(0)
+            )
+        elif 'pcr_replicates_2x300' in df.columns:
+            df['num_PCR_replicates'] = df['pcr_replicates_2x300']
+        elif 'pcr_replicates_2x150' in df.columns:
+            df['num_PCR_replicates'] = df['pcr_replicates_2x150']
+        # If none of the above are present (legacy parse outputs predating
+        # BC1Record), leave num_PCR_replicates absent — the filter below is a
+        # documented no-op in that case and will warn at the surface.
 
     # Aggregate by bc1, donor, bc0
     agg_cols = {
         'counts': 'sum',
     }
 
-    # Track PCR replicates and data sources
-    if 'sample_number' in df.columns:
+    # Track PCR replicates and data sources. `merge_data_sources` outputs one row
+    # per (bc1, bc0) record (BC1Record-based), so the (bc1, donor, bc0) groupby
+    # below is typically a no-op for these fields — 'max' preserves the per-record
+    # value. Legacy upstream may produce multiple rows per group with a
+    # `sample_number` column distinguishing samples; in that case we count
+    # distinct sample_numbers instead.
+    if 'num_PCR_replicates' in df.columns:
+        agg_cols['num_PCR_replicates'] = 'max'
+    elif 'sample_number' in df.columns:
         agg_cols['sample_number'] = lambda x: len(set(x))
 
     if 'data_source' in df.columns:
@@ -258,6 +293,8 @@ def aggregate_and_filter(
 
     agg_df = df.groupby(group_cols).agg(agg_cols).reset_index()
 
+    # Rename legacy `sample_number` (post-aggregation) to the canonical name so
+    # the filter below works uniformly.
     if 'sample_number' in agg_df.columns:
         agg_df.rename(columns={'sample_number': 'num_PCR_replicates'}, inplace=True)
 
