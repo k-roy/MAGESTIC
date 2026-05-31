@@ -95,6 +95,9 @@ magestic-redi-cross-array  = "magestic.pipelines.redi._cli:cross_array_main"
 magestic-redi-wgs-check    = "magestic.pipelines.redi._cli:wgs_check_main"
 magestic-redi-rearray      = "magestic.pipelines.redi._cli:rearray_main"
 
+# Annotation utilities
+magestic-harmonize-oligos  = "magestic.utils.harmonize_oligos:_cli"
+
 [project.urls]
 Homepage = "https://github.com/kevinroy-lab/magestic"
 Repository = "https://github.com/kevinroy-lab/magestic"
