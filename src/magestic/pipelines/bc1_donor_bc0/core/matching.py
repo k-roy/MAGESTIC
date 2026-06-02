@@ -19,7 +19,7 @@ need for runtime extraction from oligo_seq.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 from pathlib import Path
 import pandas as pd
 import logging
@@ -44,13 +44,26 @@ logger = logging.getLogger(__name__)
 # Default window size for middle donor matching
 DEFAULT_WINDOW_SIZE = 60
 
-# Anchor used to pre-trim observed bc1_donor_bc0 reads down to the variable
+# Anchors used to pre-trim observed bc1_donor_bc0 reads down to the variable
 # donor region. The observed donor extracted at the parse step carries a
-# constant 5' flank (SaCas9/SceI fragment + scaffold leader) terminating in the
-# SpCas9 cloning site `GTTTGAAGAGC`; everything AFTER that anchor is the
-# designed donor (~129bp / ~117bp). Trimming up to and including this anchor
-# lets the perfect-donor lookup fire and removes the flanking-driven ambiguity.
+# constant 5' flank (SaCas9/SceI fragment + scaffold leader) terminating in a
+# cloning-enzyme site; everything AFTER that anchor is the designed donor
+# (~129bp / ~117bp). Trimming up to and including this anchor lets the
+# perfect-donor lookup fire.
+#
+# Two anchor systems are in use across the MAGESTIC plasmid generations:
+#   GTTTGAAGAGC -- SpCas9 / SpG / SaCas9 (MAGESTIC 1.0 SpCas9, 2.5 SpCas9, 3.0 SpG)
+#   TTTCGAAGAGC -- LbCas12a / impLbCas12a (MAGESTIC 1.0/2.5 LbCas12a libraries:
+#                  V450, V454, V455; legacy 20210822 / 20220607 / 20211206 screens)
+# Without the second anchor every V450/V454/V455 read returns an untrimmed
+# 238-bp donor that the perfect lookup cannot hit -- they fall through to the
+# 60-bp sliding-window fallback instead. Forward-ported from the standalone
+# `04_map_to_oligos.py` script (HANDOFF_20260527).
 DONOR_VARIABLE_REGION_ANCHOR = "GTTTGAAGAGC"
+DONOR_VARIABLE_REGION_ANCHORS = [
+    "GTTTGAAGAGC",  # SpCas9, SpG, SaCas9
+    "TTTCGAAGAGC",  # LbCas12a, impLbCas12a
+]
 
 # Canonical position of the anchor in the parsed donor field for current
 # MAGESTIC 3.0 amplicons. 88% of well-formed reads place it at exactly 98;
@@ -103,53 +116,67 @@ def _find_anchor_tolerant(
 
 def trim_to_variable_region(
     donor: Optional[str],
-    anchor: str = DONOR_VARIABLE_REGION_ANCHOR,
+    anchors: Sequence[str] = DONOR_VARIABLE_REGION_ANCHORS,
     expected_pos: int = DEFAULT_ANCHOR_POS,
     pos_slack: int = DEFAULT_ANCHOR_POS_SLACK,
     max_mismatch: int = DEFAULT_ANCHOR_MAX_MISMATCH,
+    anchor: Optional[str] = None,
 ) -> Optional[str]:
     """
     Trim an observed donor down to the variable region following the anchor.
 
-    Tolerant + anchor-conditional + idempotent:
+    Tries each anchor in `anchors` in order. The SpCas9/SpG anchor
+    (GTTTGAAGAGC) hits in ~88% of MAGESTIC 3.0 reads; the LbCas12a anchor
+    (TTTCGAAGAGC) is needed for V450/V454/V455 reads in the legacy MAGESTIC
+    1.0 / 2.5 screens. Anchor-conditional + idempotent:
+
     1. None/NaN: returned unchanged.
-    2. Exact match anywhere in the donor: trim at first occurrence (fast path,
-       covers ~88% of yL406-like reads).
-    3. No exact match: search a Hamming-up-to-`max_mismatch` window in
-       [expected_pos - pos_slack, expected_pos + pos_slack]. This rescues the
-       ~12% of reads where a single-base sequencer Q-drop (most commonly
-       N at idx 0 or idx 10) destroyed the exact match. Ties broken by
-       closeness to `expected_pos`.
-    4. Still no match: return donor unchanged (already-trimmed donors, clean
-       gdb donors, reads with corrupted flank all flow to sliding-window
-       fallback).
+    2. For each anchor in `anchors`, in order:
+       a. Exact match anywhere in the donor: trim at first occurrence (fast
+          path, ~88% of yL406-like reads on the first anchor).
+       b. No exact match: search a Hamming-up-to-`max_mismatch` window in
+          [expected_pos - pos_slack, expected_pos + pos_slack]. This rescues
+          the ~12% of reads where a single-base sequencer Q-drop destroyed
+          the exact match. Ties broken by closeness to `expected_pos`.
+    3. No anchor in `anchors` matched: return donor unchanged (already-
+       trimmed donors, clean gdb donors, reads with corrupted flank all
+       flow to sliding-window fallback).
 
     Args:
         donor: Observed donor sequence (may be None).
-        anchor: Constant 3' boundary of the flank (default SpCas9 cloning site).
+        anchors: Anchors to try, in order. Default is the SpCas9/SpG +
+            LbCas12a pair covering all MAGESTIC plasmid generations.
         expected_pos: Canonical 0-indexed start of the anchor in the donor
             field (98 for MAGESTIC 3.0 bc1_donor_bc0 amplicons).
         pos_slack: How far either side of expected_pos to scan for the
             tolerant match.
         max_mismatch: Hamming budget for the tolerant search. Set to 0 to
-            disable the tolerant path entirely and reproduce the prior
-            exact-only behavior.
+            disable the tolerant path entirely and reproduce exact-only
+            behavior.
+        anchor: Back-compat singular parameter. If provided, overrides
+            `anchors` with a single-element list. Preserves the previous API
+            for callers passing one anchor by keyword.
 
     Returns:
         The trimmed donor, or the original donor if no anchor is found.
     """
     if not donor:
         return donor
-    L = len(anchor)
-    idx = donor.find(anchor)
-    if idx >= 0:
-        return donor[idx + L:]
+    if anchor is not None:
+        anchors = (anchor,)
+    # 1) Exact-match pass across all anchors (fastest).
+    for a in anchors:
+        idx = donor.find(a)
+        if idx >= 0:
+            return donor[idx + len(a):]
     if max_mismatch <= 0:
         return donor
-    pos = _find_anchor_tolerant(donor, anchor, expected_pos, pos_slack, max_mismatch)
-    if pos < 0:
-        return donor
-    return donor[pos + L:]
+    # 2) Tolerant pass across all anchors; first hit wins.
+    for a in anchors:
+        pos = _find_anchor_tolerant(donor, a, expected_pos, pos_slack, max_mismatch)
+        if pos >= 0:
+            return donor[pos + len(a):]
+    return donor
 
 
 @dataclass
