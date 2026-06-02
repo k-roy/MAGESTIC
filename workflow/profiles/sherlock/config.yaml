@@ -1,0 +1,28 @@
+# Snakemake profile for Sherlock (mylab) — snakemake 9.x + executor-plugin-slurm 2.x.
+# Encodes the lab cluster traps (see SGTC CLAUDE.md "Cluster traps that apply").
+#
+# Use:  snakemake --snakefile Snakefile --configfile config/screens/<screen>.yaml \
+#                 --workflow-profile profiles/sherlock
+executor: slurm
+jobs: 100                       # max concurrent SLURM jobs
+
+default-resources:
+  slurm_account: "mylab"
+  slurm_partition: "mylab,owners"
+  runtime: 60                   # MINUTES — keep tasks short; the owners queue preempts,
+                                #   so multi-hour work must be chunked into <=60min idempotent tasks
+  mem_mb: 16000
+  cpus_per_task: 4
+  # AVX-512 SIGILL (exit 132) guard: numpy/MKL-heavy envs crash on AMD Milan/Rome +
+  # Intel Broadwell. MKL_DEBUG_CPU_TYPE=5 does NOT fix it. Pure-stdlib scripts are immune.
+  slurm_extra: "--constraint=CPU_GEN:SIE|CPU_GEN:GEN|CPU_GEN:BGM|CPU_GEN:SKX"
+
+restart-times: 2                # owners-queue preemption resilience
+rerun-incomplete: true
+printshellcmds: true
+
+# CAVEAT (reconcile on first real submission): the canonical Snakefile.rules currently
+# expresses walltime as `time: "HH:MM:SS"` and CPUs via `threads:`, while the slurm plugin
+# expects `runtime` (minutes) and `cpus_per_task`. Either (a) map them in the rules, or
+# (b) drive per-rule resources from the screen config's `resources:` block via set-resources.
+# Smoke-test one short rule before a full screen run.
