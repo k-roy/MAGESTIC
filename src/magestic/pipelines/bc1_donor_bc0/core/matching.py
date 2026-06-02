@@ -44,6 +44,46 @@ logger = logging.getLogger(__name__)
 # Default window size for middle donor matching
 DEFAULT_WINDOW_SIZE = 60
 
+# Anchor used to pre-trim observed bc1_donor_bc0 reads down to the variable
+# donor region. The observed donor extracted at the parse step carries a
+# constant 5' flank (SaCas9/SceI fragment + scaffold leader) terminating in the
+# SpCas9 cloning site `GTTTGAAGAGC`; everything AFTER that anchor is the
+# designed donor (~129bp / ~117bp). Trimming up to and including this anchor
+# lets the perfect-donor lookup fire and removes the flanking-driven ambiguity.
+# Trim is anchor-conditional: if the anchor is absent (clean gdb donors, or the
+# ~2% of bc1 reads with a corrupted flank) the donor is left untouched.
+DONOR_VARIABLE_REGION_ANCHOR = "GTTTGAAGAGC"
+
+
+def trim_to_variable_region(
+    donor: Optional[str],
+    anchor: str = DONOR_VARIABLE_REGION_ANCHOR,
+) -> Optional[str]:
+    """
+    Trim an observed donor down to the variable region following the anchor.
+
+    Anchor-conditional and idempotent:
+    - If `donor` is None/NaN it is returned unchanged.
+    - If the anchor is not present (already-trimmed donors, clean gdb donors,
+      or reads whose flank was corrupted) the donor is returned unchanged, so
+      it still flows to the sliding-window fallback.
+    - If the anchor occurs, everything up to and including the anchor is
+      stripped, leaving the designed-donor variable region.
+
+    Args:
+        donor: Observed donor sequence (may be None).
+        anchor: Constant 3' boundary of the flank (default SpCas9 cloning site).
+
+    Returns:
+        The trimmed donor, or the original donor if no anchor is found.
+    """
+    if not donor:
+        return donor
+    idx = donor.find(anchor)
+    if idx < 0:
+        return donor
+    return donor[idx + len(anchor):]
+
 
 @dataclass
 class OligoMatch:
@@ -56,8 +96,18 @@ class OligoMatch:
     guide_match: bool = False
 
     # Confidence
+    #
+    # `is_unambiguous` is VARIANT-level, not oligo_name-level. Many designed
+    # oligos share an identical donor (the HDR repair template) but differ in
+    # which guide cuts -- they install the SAME edit. Collapsing candidate
+    # oligos to their `donor_changes` (the installed variant) shows a single
+    # variant in ~100% of perfect-donor matches even though the oligo count is
+    # 4-6. A match is therefore "unambiguous" when all candidate oligos agree
+    # on the installed variant, regardless of how many redundant guides exist.
     is_unambiguous: bool = False
-    num_candidate_oligos: int = 0
+    num_candidate_oligos: int = 0     # distinct candidate oligo_names
+    num_candidate_variants: int = 0   # distinct installed variants among candidates
+    variant: Optional[str] = None     # donor_changes (installed edit) when unambiguous
 
     # Details
     match_method: str = "none"  # "perfect", "middle_region", "guide_only", "none"
@@ -82,6 +132,11 @@ class OligoLookupTables:
 
     # Sliding window matches (key = 60bp window)
     window_to_oligos: Dict[str, List[str]] = field(default_factory=dict)
+
+    # oligo_name -> installed variant (donor_changes). Lets the matcher collapse
+    # candidate oligos that share a donor to the single edit they all install,
+    # so variant-level unambiguity can be assessed in every match branch.
+    oligo_to_variant: Dict[str, str] = field(default_factory=dict)
 
     # Metadata
     window_size: int = DEFAULT_WINDOW_SIZE
@@ -191,9 +246,27 @@ def load_oligos_from_harmonized_table(
     return df
 
 
+# Column used as the "installed variant" identity for collapsing guide-redundant
+# candidate oligos. This MUST be the canonical per-edit identifier:
+#   individual_variants = "<pos>_<ref>_<alt>_<SNP|INDEL>" (e.g. "25340_A_C_SNP")
+#   26,126 distinct values, 87.4% populated, exactly 1.00 per donor, and it
+#   correctly MERGES the ~2.67 distinct donor encodings (synonymous / strand /
+#   shift variants) that install the same edit.
+#
+# NOT donor_changes: that column (242 distinct, 28.3% populated, mostly "[]") is
+# donor-CONSTRUCTION metadata ("restriction site GCTCTTC ... removed with
+# synonymous codons"), shared by up to 37,400 distinct donors -- collapsing by
+# it conflates thousands of different edits and badly inflates is_unambiguous.
+# NOT the raw donor sequence: 69,799 distinct, it over-splits each edit into
+# ~2.67 encodings, deflating is_unambiguous. donor-seq is only the per-row
+# FALLBACK below for the ~12.6% (controls / unannotated) with no variant id.
+VARIANT_COLUMN = "individual_variants"
+
+
 def build_lookup_tables(
     oligo_df: pd.DataFrame,
-    window_size: int = DEFAULT_WINDOW_SIZE
+    window_size: int = DEFAULT_WINDOW_SIZE,
+    variant_col: str = VARIANT_COLUMN,
 ) -> OligoLookupTables:
     """
     Build lookup tables from oligo design DataFrame.
@@ -268,6 +341,36 @@ def build_lookup_tables(
     # Convert sets to lists
     tables.window_to_oligos = {k: list(v) for k, v in window_accumulator.items()}
 
+    # 5. oligo_name -> installed variant (individual_variants). PER-ROW fallback
+    # to the donor sequence where the variant id is missing -- the variant
+    # column is only ~87% populated, and a plain .astype(str) would map every
+    # NaN to the single string "nan", collapsing genuinely-distinct unannotated
+    # edits into one fake variant (inflating is_unambiguous in the sliding-
+    # window branch). Two oligos sharing a donor install the same edit, so the
+    # donor sequence is the correct conservative identity when the explicit
+    # annotation is absent. If the whole column is missing (legacy design
+    # files), fall back to donor sequence for every row.
+    if variant_col in valid_df.columns:
+        variant_series = (
+            valid_df[variant_col]
+            .where(valid_df[variant_col].notna(), valid_df['donor'])
+            .astype(str)
+        )
+        n_fallback = valid_df[variant_col].isna().sum()
+        if n_fallback:
+            logger.info(
+                f"  Variant id '{variant_col}' missing for {n_fallback:,} "
+                f"({n_fallback/len(valid_df):.1%}) oligos; using donor sequence "
+                f"as the per-row fallback identity for those."
+            )
+    else:
+        logger.info(
+            f"  Variant column '{variant_col}' not found; using donor sequence "
+            f"as the variant identity for unambiguity assessment."
+        )
+        variant_series = valid_df['donor']
+    tables.oligo_to_variant = dict(zip(valid_df['oligo_name'], variant_series))
+
     stats = tables.get_stats()
     logger.info(f"  Built lookup tables:")
     logger.info(f"    Unique donors: {stats['num_unique_donors']}")
@@ -313,10 +416,50 @@ def match_donor_sliding_window(
     return matches
 
 
+def _variant_set(oligos, tables: OligoLookupTables) -> Set[str]:
+    """Collapse a collection of candidate oligo_names to their installed variants."""
+    if not tables.oligo_to_variant:
+        # No variant table -> treat each oligo as its own variant (legacy).
+        return set(oligos)
+    return {tables.oligo_to_variant.get(o, o) for o in oligos}
+
+
+def _resolve_candidates(
+    result: OligoMatch,
+    candidates,
+    tables: OligoLookupTables,
+    method_unique: str,
+    method_ambiguous: str,
+) -> None:
+    """
+    Populate `result` from a candidate oligo set using VARIANT-level unambiguity.
+
+    Candidate oligos that share the same installed variant (donor_changes) are
+    redundant guides for one edit; a match is unambiguous when they all agree on
+    the variant, even if >1 oligo_name is present. The reported `oligo_name` is
+    chosen deterministically (sorted-first) among the candidates so reruns are
+    reproducible.
+    """
+    candidates = sorted(set(candidates))
+    variants = _variant_set(candidates, tables)
+    result.candidate_oligos = candidates
+    result.num_candidate_oligos = len(candidates)
+    result.num_candidate_variants = len(variants)
+    result.oligo_name = candidates[0]
+
+    if len(variants) == 1:
+        result.is_unambiguous = True
+        result.variant = next(iter(variants))
+        result.match_method = method_unique
+    else:
+        result.match_method = method_ambiguous
+
+
 def match_sequence(
     donor: Optional[str],
     guide: Optional[str],
-    tables: OligoLookupTables
+    tables: OligoLookupTables,
+    pre_trim: bool = True,
 ) -> OligoMatch:
     """
     Match a donor (and optionally guide) to designed oligos.
@@ -326,13 +469,19 @@ def match_sequence(
     2. Sliding window match on donor
     3. Guide-only match (if donor fails but guide is available)
 
-    When multiple oligos match via sliding window, uses guide to disambiguate
-    if available.
+    Unambiguity is assessed at the VARIANT level (installed edit / donor_changes)
+    rather than oligo_name: oligos that share a donor install the same edit and
+    differ only by which guide cut, so they are collapsed. Guide, when present,
+    is still used to narrow candidates before the variant collapse.
 
     Args:
         donor: The observed donor sequence (can be None)
         guide: The guide sequence if available (can be None)
         tables: Precomputed lookup tables
+        pre_trim: If True (default), anchor-trim the observed donor down to the
+            variable region before lookup. Anchor-conditional and idempotent:
+            already-trimmed / anchorless donors pass through untouched, so the
+            gdb path is unaffected.
 
     Returns:
         OligoMatch with results and confidence indicators
@@ -345,6 +494,8 @@ def match_sequence(
     # Normalize to uppercase
     if donor:
         donor = donor.upper()
+        if pre_trim:
+            donor = trim_to_variable_region(donor)
     if guide:
         guide = guide.upper()
 
@@ -353,32 +504,19 @@ def match_sequence(
         candidates = tables.perfect_donor_to_oligos[donor]
         result.perfect_donor = True
         result.perfect_middle_region = True
-        result.candidate_oligos = candidates
-        result.num_candidate_oligos = len(candidates)
 
-        if len(candidates) == 1:
-            result.oligo_name = candidates[0]
-            result.is_unambiguous = True
-            result.match_method = "perfect"
-        elif guide and guide in tables.guide_to_oligos:
-            # Disambiguate using guide
-            guide_oligos = set(tables.guide_to_oligos[guide])
-            overlap = set(candidates) & guide_oligos
-            if len(overlap) == 1:
-                result.oligo_name = overlap.pop()
-                result.is_unambiguous = True
+        # Narrow by guide first if it disambiguates further (rarely available).
+        if guide and guide in tables.guide_to_oligos:
+            overlap = set(candidates) & set(tables.guide_to_oligos[guide])
+            if overlap:
                 result.guide_match = True
-                result.match_method = "perfect+guide"
-            elif len(overlap) > 1:
-                result.oligo_name = list(overlap)[0]
-                result.match_method = "perfect+guide_ambiguous"
-            else:
-                result.oligo_name = candidates[0]
-                result.match_method = "perfect"
-        else:
-            result.oligo_name = candidates[0]
-            result.match_method = "perfect_ambiguous"
+                candidates = list(overlap)
 
+        _resolve_candidates(
+            result, candidates, tables,
+            method_unique="perfect",
+            method_ambiguous="perfect_ambiguous",
+        )
         return result
 
     # 2. Try sliding window match on donor
@@ -387,50 +525,29 @@ def match_sequence(
 
         if window_matches:
             result.perfect_middle_region = True
-            result.candidate_oligos = list(window_matches)
-            result.num_candidate_oligos = len(window_matches)
 
-            if len(window_matches) == 1:
-                result.oligo_name = list(window_matches)[0]
-                result.is_unambiguous = True
-                result.match_method = "sliding_window"
-            elif guide and guide in tables.guide_to_oligos:
-                # Disambiguate using guide
-                guide_oligos = set(tables.guide_to_oligos[guide])
-                overlap = window_matches & guide_oligos
-                if len(overlap) == 1:
-                    result.oligo_name = overlap.pop()
-                    result.is_unambiguous = True
+            if guide and guide in tables.guide_to_oligos:
+                overlap = window_matches & set(tables.guide_to_oligos[guide])
+                if overlap:
                     result.guide_match = True
-                    result.match_method = "sliding_window+guide"
-                elif len(overlap) > 1:
-                    result.oligo_name = list(overlap)[0]
-                    result.guide_match = True
-                    result.match_method = "sliding_window+guide_ambiguous"
-                else:
-                    result.oligo_name = list(window_matches)[0]
-                    result.match_method = "sliding_window_ambiguous"
-            else:
-                result.oligo_name = list(window_matches)[0]
-                result.match_method = "sliding_window_ambiguous"
+                    window_matches = overlap
 
+            _resolve_candidates(
+                result, window_matches, tables,
+                method_unique="sliding_window",
+                method_ambiguous="sliding_window_ambiguous",
+            )
             return result
 
     # 3. Guide-only match (fallback)
     if guide and guide in tables.guide_to_oligos:
         candidates = tables.guide_to_oligos[guide]
         result.guide_match = True
-        result.candidate_oligos = candidates
-        result.num_candidate_oligos = len(candidates)
-
-        if len(candidates) == 1:
-            result.oligo_name = candidates[0]
-            result.is_unambiguous = True
-            result.match_method = "guide_only"
-        else:
-            result.oligo_name = candidates[0]
-            result.match_method = "guide_only_ambiguous"
-
+        _resolve_candidates(
+            result, candidates, tables,
+            method_unique="guide_only",
+            method_ambiguous="guide_only_ambiguous",
+        )
         return result
 
     return result
@@ -452,6 +569,7 @@ def match_dataframe(
     prefix: str = "",
     n_jobs: int = 1,
     chunk_size: int = 10000,
+    pre_trim: bool = True,
 ) -> pd.DataFrame:
     """
     Match all rows in a DataFrame to designed oligos.
@@ -493,6 +611,8 @@ def match_dataframe(
     df[f'{prefix}is_unambiguous'] = False
     df[f'{prefix}match_method'] = "none"
     df[f'{prefix}num_candidates'] = 0
+    df[f'{prefix}num_candidate_variants'] = 0
+    df[f'{prefix}variant'] = None
 
     # Check if guide column exists
     has_guide = guide_col in df.columns
@@ -519,14 +639,15 @@ def match_dataframe(
             with ThreadPoolExecutor(max_workers=n_jobs) as executor:
                 chunk_results = list(executor.map(
                     lambda args: match_sequence(
-                        args[0], args[1] if pd.notna(args[1]) else None, tables
+                        args[0], args[1] if pd.notna(args[1]) else None, tables,
+                        pre_trim=pre_trim,
                     ) if pd.notna(args[0]) else None,
                     zip(chunk_donors, chunk_guides)
                 ))
         else:
             # Sequential processing
             chunk_results = [
-                match_sequence(d, g if pd.notna(g) else None, tables)
+                match_sequence(d, g if pd.notna(g) else None, tables, pre_trim=pre_trim)
                 if pd.notna(d) else None
                 for d, g in zip(chunk_donors, chunk_guides)
             ]
@@ -545,6 +666,8 @@ def match_dataframe(
         df.iloc[idx, df.columns.get_loc(f'{prefix}is_unambiguous')] = result.is_unambiguous
         df.iloc[idx, df.columns.get_loc(f'{prefix}match_method')] = result.match_method
         df.iloc[idx, df.columns.get_loc(f'{prefix}num_candidates')] = result.num_candidate_oligos
+        df.iloc[idx, df.columns.get_loc(f'{prefix}num_candidate_variants')] = result.num_candidate_variants
+        df.iloc[idx, df.columns.get_loc(f'{prefix}variant')] = result.variant
 
         # Count match types
         if result.perfect_donor:
