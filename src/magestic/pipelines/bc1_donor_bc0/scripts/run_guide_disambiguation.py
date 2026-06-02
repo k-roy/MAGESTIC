@@ -17,11 +17,11 @@ import logging
 from pathlib import Path
 from datetime import datetime
 
-# Add common scripts to path
 BASE_DIR = Path("/path/to")
-sys.path.insert(0, str(BASE_DIR / "common/scripts"))
 
-from bc1_donor_bc0_pipeline.core.guide_disambiguation import (
+# Repointed 2026-06-02 off the common/scripts/bc1_donor_bc0_pipeline fork to the
+# canonical magestic package (the fork is a Phase-4 delete candidate).
+from magestic.pipelines.bc1_donor_bc0.core.guide_disambiguation import (
     run_guide_disambiguation,
     load_oligo_designs_for_disambiguation,
     reassign_oligos_by_guide,

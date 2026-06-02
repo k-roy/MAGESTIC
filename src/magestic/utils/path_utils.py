@@ -212,7 +212,10 @@ HARMONIZED_VARIANTS_FILE = get_annotation_file(
 
 # Common oligo design files
 SPG_OLIGO_DESIGN = get_oligo_design_file("20240411_Twist_200mer_oligo_array_order.tsv")
-SPCAS9_OLIGO_DESIGN = get_oligo_design_file("20210422_Twist_200mer.tsv")
+# 2021 SpCas9/LbCas12a pool: canonical AS-SUBMITTED (md5 79f34c86, 48000 rows).
+# Repointed 2026-06-02 off 20210422_Twist_200mer.tsv (md5 048501cc, 48012 rows,
+# +12 MIP1 over-rep pre-trim snapshot). See common/oligo_designs/OLIGO_POOLS_PROVENANCE.md.
+SPCAS9_OLIGO_DESIGN = get_oligo_design_file("20210422_Twist_200mer_as_submitted.tsv")
 
 # Reference genome
 MAGESTIC_REFERENCE_GENOME = get_reference_genome("MAGESTIC_background_strain.fasta")
