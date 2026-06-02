@@ -50,39 +50,106 @@ DEFAULT_WINDOW_SIZE = 60
 # SpCas9 cloning site `GTTTGAAGAGC`; everything AFTER that anchor is the
 # designed donor (~129bp / ~117bp). Trimming up to and including this anchor
 # lets the perfect-donor lookup fire and removes the flanking-driven ambiguity.
-# Trim is anchor-conditional: if the anchor is absent (clean gdb donors, or the
-# ~2% of bc1 reads with a corrupted flank) the donor is left untouched.
 DONOR_VARIABLE_REGION_ANCHOR = "GTTTGAAGAGC"
+
+# Canonical position of the anchor in the parsed donor field for current
+# MAGESTIC 3.0 amplicons. 88% of well-formed reads place it at exactly 98;
+# Q-drop / single-base sequencing errors in the 11-bp anchor account for
+# another ~10.5% (12% of all reads lose the exact-match anchor, of which
+# ~89% rescue with Hamming-1 at the canonical position).
+DEFAULT_ANCHOR_POS = 98
+DEFAULT_ANCHOR_POS_SLACK = 10
+DEFAULT_ANCHOR_MAX_MISMATCH = 1
+
+
+def _hamming(a: str, b: str) -> int:
+    """Count mismatches between two equal-length strings. N counts as mismatch."""
+    return sum(x != y for x, y in zip(a, b))
+
+
+def _find_anchor_tolerant(
+    donor: str,
+    anchor: str,
+    expected_pos: int,
+    slack: int,
+    max_mismatch: int,
+) -> int:
+    """
+    Return position of the best-matching anchor window in [expected_pos-slack,
+    expected_pos+slack], allowing up to max_mismatch substitutions. -1 if no
+    window meets the threshold. Ties broken by closeness to expected_pos.
+    """
+    L = len(anchor)
+    if len(donor) < L:
+        return -1
+    start = max(0, expected_pos - slack)
+    end = min(len(donor) - L + 1, expected_pos + slack + 1)
+    best_pos = -1
+    best_mm = max_mismatch + 1
+    best_dist = None
+    for i in range(start, end):
+        mm = _hamming(donor[i:i + L], anchor)
+        if mm > max_mismatch:
+            continue
+        dist = abs(i - expected_pos)
+        if mm < best_mm or (mm == best_mm and (best_dist is None or dist < best_dist)):
+            best_mm = mm
+            best_pos = i
+            best_dist = dist
+            if mm == 0 and dist == 0:
+                return i
+    return best_pos
 
 
 def trim_to_variable_region(
     donor: Optional[str],
     anchor: str = DONOR_VARIABLE_REGION_ANCHOR,
+    expected_pos: int = DEFAULT_ANCHOR_POS,
+    pos_slack: int = DEFAULT_ANCHOR_POS_SLACK,
+    max_mismatch: int = DEFAULT_ANCHOR_MAX_MISMATCH,
 ) -> Optional[str]:
     """
     Trim an observed donor down to the variable region following the anchor.
 
-    Anchor-conditional and idempotent:
-    - If `donor` is None/NaN it is returned unchanged.
-    - If the anchor is not present (already-trimmed donors, clean gdb donors,
-      or reads whose flank was corrupted) the donor is returned unchanged, so
-      it still flows to the sliding-window fallback.
-    - If the anchor occurs, everything up to and including the anchor is
-      stripped, leaving the designed-donor variable region.
+    Tolerant + anchor-conditional + idempotent:
+    1. None/NaN: returned unchanged.
+    2. Exact match anywhere in the donor: trim at first occurrence (fast path,
+       covers ~88% of yL406-like reads).
+    3. No exact match: search a Hamming-up-to-`max_mismatch` window in
+       [expected_pos - pos_slack, expected_pos + pos_slack]. This rescues the
+       ~12% of reads where a single-base sequencer Q-drop (most commonly
+       N at idx 0 or idx 10) destroyed the exact match. Ties broken by
+       closeness to `expected_pos`.
+    4. Still no match: return donor unchanged (already-trimmed donors, clean
+       gdb donors, reads with corrupted flank all flow to sliding-window
+       fallback).
 
     Args:
         donor: Observed donor sequence (may be None).
         anchor: Constant 3' boundary of the flank (default SpCas9 cloning site).
+        expected_pos: Canonical 0-indexed start of the anchor in the donor
+            field (98 for MAGESTIC 3.0 bc1_donor_bc0 amplicons).
+        pos_slack: How far either side of expected_pos to scan for the
+            tolerant match.
+        max_mismatch: Hamming budget for the tolerant search. Set to 0 to
+            disable the tolerant path entirely and reproduce the prior
+            exact-only behavior.
 
     Returns:
         The trimmed donor, or the original donor if no anchor is found.
     """
     if not donor:
         return donor
+    L = len(anchor)
     idx = donor.find(anchor)
-    if idx < 0:
+    if idx >= 0:
+        return donor[idx + L:]
+    if max_mismatch <= 0:
         return donor
-    return donor[idx + len(anchor):]
+    pos = _find_anchor_tolerant(donor, anchor, expected_pos, pos_slack, max_mismatch)
+    if pos < 0:
+        return donor
+    return donor[pos + L:]
 
 
 @dataclass
