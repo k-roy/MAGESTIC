@@ -1,0 +1,91 @@
+# =============================================================================
+# MAGESTIC bc1_donor_bc0 — per-screen config (UNIFIED workflow)
+# =============================================================================
+# Worked example: 20250912 yL437/yL442 SpG QTL screen.
+# To add a screen: copy this file to config/screens/<screen>.yaml and edit the
+# per-screen sections (paths, sequencing_runs, active_runs, libraries, keyfiles).
+# The workflow logic (workflow/Snakefile) is identical for every screen.
+#
+# Leaner than the legacy per-screen config: the canonical parser
+# (01_parse_bc1_donor_bc0.py) AUTO-DETECTS read length, primer orientation, and
+# bc1 prefix, so the old `trim_merge` block and most of `sequence_parsing` are
+# gone. (A trimmed `expected:` block is kept below for the Phase-3 auto-detect
+# cross-check — detected-vs-expected, flag on mismatch.)
+# =============================================================================
+
+# --- Paths -------------------------------------------------------------------
+project_dir: "/path/to/projects/QTL/20250912_SpG_QTL_screen"
+subproject: "bc1_donor_bc0"
+# python: "/path/to/anaconda3/bin/python"   # optional override
+
+# --- Sequencing runs ---------------------------------------------------------
+sequencing_runs:
+  "20251125":
+    read_type: "2x150"
+    description: "2x150 bp AVITI run - partial donor"
+    has_donor_bc0_amplicon: true
+  "20251212":
+    read_type: "2x300"
+    description: "2x300 bp AVITI run - full donor"
+    has_donor_bc0_amplicon: false
+
+active_runs:
+  - "20251212"
+  # - "20251125"
+integrate_runs: false
+
+# --- Libraries (SPS -> subpool; for reference/QC) ----------------------------
+libraries:
+  V629: { sps: "CTTGACTCGACAGTGAGAGC", oligo_pool: "2024_twist", description: "NGNG QTL subpool" }
+  V631: { sps: "CGTATGGAGATGACGTCAGG", oligo_pool: "2024_twist", description: "NGNH QTL subpool" }
+  V634: { sps: "CGATAGACGACTGGACAGCA", oligo_pool: "2021_twist", description: "2021 Twist pool" }
+
+# --- Keyfiles (per run, under keyfiles/<subproject>/<run_date>/) --------------
+keyfiles:
+  plate_key: "bc1_donor_bc0_amplicons_plate_key.tsv"
+  sample_key: "bc1_donor_bc0_amplicons_sample_key.tsv"
+  trafo_key: "bc1_donor_bc0_amplicons_trafo_key.tsv"
+
+# --- Oligo pools (under common/oligo_designs/ via keyfiles) -------------------
+# NOTE: 2021 pool repointed to the canonical AS-SUBMITTED version (md5 79f34c86,
+# 48000 rows) per Phase 1; see common/oligo_designs/OLIGO_POOLS_PROVENANCE.md.
+oligo_pools:
+  - "20240411_Twist_200mer_oligo_array_order.tsv"
+  - "20210422_Twist_200mer_as_submitted.tsv"
+
+guide_donor_bc0_dir: "../guide_donor_bc0/processed_data/guide_donor_bc0_purity_filtered"
+
+# --- Collapsing (combine_02) -------------------------------------------------
+collapsing:
+  donor_edit_distance: 5
+  bc1_edit_distance: 1
+  bc0_edit_distance: 1
+  donor_bc0_fragment_edit_distance: 3
+  min_pcr_replicates: 2
+
+# --- Oligo mapping (map_04) --------------------------------------------------
+oligo_mapping:
+  guide_start: 20
+  guide_end: 40
+  donor_start: 51
+  donor_end: 180
+  middle_donor_offset: 30
+  middle_donor_length: 60
+
+# --- Parser auto-detect cross-check (Phase 3 TODO; expected values to flag drift)
+expected:
+  bc1_prefix: "CATGCTC"
+  bc1_length: 20
+  re_site_seq: "GTTTGAAGAGC"
+  read_types_by_run: { "20251125": "2x150", "20251212": "2x300" }
+
+# --- Parallelization ---------------------------------------------------------
+parallel:
+  n_jobs: 24
+
+# --- Cluster resources (Sherlock) --------------------------------------------
+resources:
+  step_02_combine: { mem_mb: 64000, time: "08:00:00", cpus: 24 }
+  step_03_link:    { mem_mb: 32000, time: "04:00:00", cpus: 4 }
+  step_04_map:     { mem_mb: 32000, time: "04:00:00", cpus: 4 }
+  step_05_assign:  { mem_mb: 16000, time: "02:00:00", cpus: 4 }

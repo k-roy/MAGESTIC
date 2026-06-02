@@ -1,0 +1,111 @@
+"""
+MAGESTIC bc1_donor_bc0 — UNIFIED workflow (Phase 1b prototype, 2026-06-02)
+=============================================================================
+ONE packaged workflow, parameterized entirely by a per-screen config.yaml.
+
+This replaces the per-screen `workflow/bc1_donor_bc0/Snakefile` copies — those
+diverged into forks (each carried its own copy of the rules, so a single central
+parser rename silently broke all of them). Here the workflow logic lives once;
+each screen is just a config file.
+
+Run a screen:
+    cd <magestic>/workflow
+    snakemake --snakefile Snakefile \
+              --configfile config/screens/<screen>.yaml \
+              --profile profiles/sherlock
+
+Add a screen (NO Snakefile edits):
+    cp config/config.example.yaml config/screens/<screen>.yaml
+    # edit project_dir / sequencing_runs / active_runs / libraries / keyfiles
+    snakemake --snakefile Snakefile --configfile config/screens/<screen>.yaml ...
+
+Re-run ALL screens (the consolidation goal):
+    for c in config/screens/*.yaml; do
+        snakemake --snakefile Snakefile --configfile "$c" --profile profiles/sherlock
+    done
+
+The rules come from the canonical, consolidated rule library in this same repo
+(src/magestic/pipelines/bc1_donor_bc0/snakemake/Snakefile.rules), resolved
+RELATIVE TO THIS FILE — so no dependency on `magestic` being importable inside
+the snakemake conda env.
+
+PROTOTYPE NOTE: the canonical rules parse RAW R1/R2 via the auto-detecting
+01_parse_bc1_donor_bc0.py (no separate bbmerge/collapse step_00). Cutover of the
+legacy merge-then-parse 2x300 path to this requires the bbmerge-vs-raw-R1/R2
+parity check logged in HANDOFF_MAGESTIC_CONSOLIDATION_20260602.md (§7).
+"""
+from pathlib import Path
+import pandas as pd
+
+# Default config (override on the CLI with --configfile config/screens/<screen>.yaml)
+configfile: "config/config.example.yaml"
+
+# -----------------------------------------------------------------------------
+# Canonical rules — resolved relative to this Snakefile (repo-internal, no import)
+# -----------------------------------------------------------------------------
+WORKFLOW_DIR = Path(workflow.basedir)
+RULES_DIR = WORKFLOW_DIR.parent / "src" / "magestic" / "pipelines" / "bc1_donor_bc0" / "snakemake"
+COMMON_SCRIPTS_DIR = RULES_DIR  # Snakefile.rules references scripts under here
+
+# Python interpreter for the rule shell commands (must have `magestic` installed).
+PYTHON = config.get("python", "/path/to/anaconda3/bin/python")
+
+# -----------------------------------------------------------------------------
+# Per-screen paths (all from config — nothing screen-specific is hard-coded here)
+# -----------------------------------------------------------------------------
+PROJECT_DIR = Path(config["project_dir"])
+SUBPROJECT = config.get("subproject", "bc1_donor_bc0")
+
+RAW_DATA_DIR = PROJECT_DIR / "raw_data" / SUBPROJECT
+PROCESSED_DATA_DIR = PROJECT_DIR / "processed_data" / SUBPROJECT
+KEYFILE_DIR = PROJECT_DIR / "keyfiles" / SUBPROJECT
+LOGS_DIR = PROJECT_DIR / "logs" / SUBPROJECT
+
+# Globals required by Snakefile.rules
+FASTQ_DIR = RAW_DATA_DIR / "fastq"
+PARSED_DIR = PROCESSED_DATA_DIR / "parsed_bc1_donor_bc0"
+COMBINED_DIR = PROCESSED_DATA_DIR / "combined"
+DATA_TABLES_DIR = PROCESSED_DATA_DIR / "data_tables"
+
+SEQUENCING_RUNS = config.get("sequencing_runs", {})
+ACTIVE_RUNS = config["active_runs"]
+
+# -----------------------------------------------------------------------------
+# Sample resolution from per-run keyfiles (the keyfiles ARE the sample sheet)
+# Lifted verbatim-in-spirit from the per-screen Snakefile so behavior is preserved.
+# -----------------------------------------------------------------------------
+def get_samples_for_run(run_date):
+    """Return bc1-donor-bc0 sample prefixes for a run, read from its keyfiles."""
+    plate_key_path = KEYFILE_DIR / run_date / config["keyfiles"]["plate_key"]
+    sample_key_path = KEYFILE_DIR / run_date / config["keyfiles"]["sample_key"]
+    if not plate_key_path.exists() or not sample_key_path.exists():
+        return []
+    plate_key = pd.read_csv(plate_key_path, sep="\t")
+    sample_key = pd.read_csv(sample_key_path, sep="\t")
+    plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
+    prefixes = []
+    for _, plate_row in plate_key.iterrows():
+        for _, sample_row in sample_key.iterrows():
+            prefixes.append(f"{run_date}_{plate_row['outer_primers']}_{sample_row['sample_number']}")
+    return prefixes
+
+
+def get_sample_prefixes(run_date):
+    """Name expected by Snakefile.rules (combine_02_collapse input expand)."""
+    return get_samples_for_run(run_date)
+
+
+# -----------------------------------------------------------------------------
+# Include the canonical, consolidated rules (parse_01 .. assign_05)
+# -----------------------------------------------------------------------------
+include: str(RULES_DIR / "Snakefile.rules")
+
+
+# -----------------------------------------------------------------------------
+# Default target
+# -----------------------------------------------------------------------------
+rule all:
+    """Build the final bc1 reference table + purity summary for this screen."""
+    input:
+        DATA_TABLES_DIR / "bc1_reference_table.tsv",
+        DATA_TABLES_DIR / "bc1_purity_summary.tsv"
