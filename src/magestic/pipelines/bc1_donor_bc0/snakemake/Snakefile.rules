@@ -170,8 +170,11 @@ rule map_04_oligos:
         guide_start = config["oligo_mapping"]["guide_start"],
         guide_end = config["oligo_mapping"]["guide_end"],
         donor_start = config["oligo_mapping"]["donor_start"],
-        donor_end = config["oligo_mapping"]["donor_end"],
-        lbcas12a_donor_start = config["oligo_mapping"].get("lbcas12a_donor_start", 63)
+        donor_end = config["oligo_mapping"]["donor_end"]
+        # NOTE: dropped the dangling --lbcas12a-donor-start flag (2026-06-02) — no
+        # version of 04_map_to_oligos.py accepts it (would SystemExit the rule). The
+        # fixed-offset idea was never implemented; LbCas12a is handled by the
+        # content-based anchor-find (TTTCGAAGAGC) in 04_map_to_oligos / core.matching.
     log:
         LOGS_DIR / "04_map.log"
     threads: config["resources"]["step_04_map"]["cpus"]
@@ -188,7 +191,6 @@ rule map_04_oligos:
             --guide-end {params.guide_end} \\
             --donor-start {params.donor_start} \\
             --donor-end {params.donor_end} \\
-            --lbcas12a-donor-start {params.lbcas12a_donor_start} \\
             2>&1 | tee {log}
         """
 
