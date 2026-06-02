@@ -5,8 +5,8 @@ Snakemake Rules: BC1-Donor-BC0 Pipeline
 Reusable rules for processing MAGESTIC bc1-donor-bc0 amplicon data.
 
 Pipeline Steps:
-    01a: Parse 2x150 paired FASTQ files
-    01b: Parse 2x300 collapsed FASTQ files
+    01:  Parse raw paired FASTQ (read length + orientation auto-detected;
+         handles 2x150, 2x300, and asymmetric runs in one code path)
     02:  Combine and collapse across samples
     03:  Link guide-donor-bc0 data (adds guide info from sequencing)
     04:  Map to designed oligos
@@ -20,6 +20,7 @@ REQUIRED VARIABLES (must be defined before include):
     - COMMON_SCRIPTS_DIR: Path to common/scripts/bc1_donor_bc0_pipeline/snakemake/
     - PYTHON: Path to Python interpreter
     - KEYFILE_DIR: Project keyfiles directory
+    - FASTQ_DIR: Directory of raw {prefix}_R1.fastq.gz / {prefix}_R2.fastq.gz inputs
     - PARSED_DIR: Output directory for parsed data
     - COMBINED_DIR: Output directory for combined data
     - DATA_TABLES_DIR: Output directory for final tables
@@ -37,71 +38,39 @@ Author: Kevin R. Roy
 """
 
 # =============================================================================
-# Step 01b: Parse 2x300 Collapsed FASTQ
+# Step 01: Parse raw paired FASTQ (read length auto-detected)
 # =============================================================================
-rule parse_01b_2x300:
-    """Parse bc1-donor-bc0 from 2x300 collapsed FASTQ files"""
+# The unified parser 01_parse_bc1_donor_bc0.py supersedes the former split
+# 01a_parse_2x150_paired_fastq.py / 01b_parse_2x300_collapsed_fastq.py scripts
+# (consolidated ~2026-03; the old split scripts no longer exist anywhere). It
+# takes raw R1/R2 and AUTO-DETECTS read lengths, primer orientation, and the
+# bc1 prefix from the first ~1000 reads, handling 2x150, 2x300, and asymmetric
+# (e.g. R1=228/R2=90) runs in one code path. No upstream merge/collapse step is
+# required for parsing — it extracts directly from raw R1/R2 and writes the
+# canonical 6-column table (counts, bc1, donor, bc0, SPS, donor_bc0_fragment).
+#
+# TODO (Phase 3, core/parser.py port): per the auto-detection-with-cross-check
+# convention, have the parser compare each auto-detected value (read length,
+# orientation, bc1 prefix) against the expected values in
+# config["sequence_parsing"] and WARN/flag on mismatch rather than proceeding
+# silently. Auto-detection stays primary; the config supplies the expectation.
+rule parse_01_bc1_donor_bc0:
+    """Parse bc1, donor, bc0 from raw paired FASTQ (read length auto-detected)"""
     input:
-        collapsed = "{collapsed_dir}/{prefix}_collapsed.fastq.gz"
+        r1 = FASTQ_DIR / "{prefix}_R1.fastq.gz",
+        r2 = FASTQ_DIR / "{prefix}_R2.fastq.gz"
     output:
-        parsed = "{parsed_dir}/{prefix}_parsed.tsv"
+        parsed = PARSED_DIR / "{prefix}_parsed.tsv"
     params:
-        script = COMMON_SCRIPTS_DIR / "01b_parse_2x300_collapsed_fastq.py",
-        bc1_prefix = config["sequence_parsing"]["bc1_prefix"],
-        bc1_suffix = config["sequence_parsing"]["bc1_suffix"],
-        bc1_length = config["sequence_parsing"]["bc1_length"],
-        re_site_seq = config["sequence_parsing"]["re_site_seq"],
-        msd_seq = config["sequence_parsing"]["msd_seq"],
-        sps_length = config["sequence_parsing"]["sps_length"],
-        bc0_length = config["sequence_parsing"]["bc0_length"]
+        script = COMMON_SCRIPTS_DIR / "01_parse_bc1_donor_bc0.py"
     log:
-        "{logs_dir}/01b_parse_{prefix}.log"
+        LOGS_DIR / "01_parse_{prefix}.log"
     shell:
         """
         {PYTHON} {params.script} \\
-            --input {input.collapsed} \\
-            --output {output.parsed} \\
-            --bc1-prefix {params.bc1_prefix} \\
-            --bc1-suffix {params.bc1_suffix} \\
-            --bc1-length {params.bc1_length} \\
-            --re-site-seq {params.re_site_seq} \\
-            --msd-seq {params.msd_seq} \\
-            --sps-length {params.sps_length} \\
-            --bc0-length {params.bc0_length} \\
-            2>&1 | tee {log}
-        """
-
-
-# =============================================================================
-# Step 01a: Parse 2x150 Paired FASTQ
-# =============================================================================
-rule parse_01a_2x150:
-    """Parse bc1-donor-bc0 from 2x150 paired FASTQ files"""
-    input:
-        r1 = "{fastq_dir}/{prefix}_R1.fastq.gz",
-        r2 = "{fastq_dir}/{prefix}_R2.fastq.gz"
-    output:
-        parsed = "{parsed_dir}/{prefix}_parsed_2x150.tsv"
-    params:
-        script = COMMON_SCRIPTS_DIR / "01a_parse_2x150_paired_fastq.py",
-        r1_bc1_prefix = config["sequence_parsing"]["r1_bc1_prefix"],
-        bc1_length = config["sequence_parsing"]["bc1_length"],
-        r2_donor_fragment_start = config["sequence_parsing"]["r2_donor_fragment_start"],
-        r2_sps_range = config["sequence_parsing"]["r2_sps_range"],
-        r2_bc0_range = config["sequence_parsing"]["r2_bc0_range"]
-    log:
-        "{logs_dir}/01a_parse_2x150_{prefix}.log"
-    shell:
-        """
-        {PYTHON} {params.script} \\
-            --r1 {input.r1} \\
-            --r2 {input.r2} \\
-            --output {output.parsed} \\
-            --r1-bc1-prefix {params.r1_bc1_prefix} \\
-            --bc1-length {params.bc1_length} \\
-            --r2-donor-fragment-start {params.r2_donor_fragment_start} \\
-            --r2-sps-range {params.r2_sps_range[0]} {params.r2_sps_range[1]} \\
-            --r2-bc0-range {params.r2_bc0_range[0]} {params.r2_bc0_range[1]} \\
+            {input.r1} \\
+            {input.r2} \\
+            {output.parsed} \\
             2>&1 | tee {log}
         """
 
