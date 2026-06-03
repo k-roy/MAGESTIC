@@ -98,8 +98,27 @@ RESCUE_DISTANCE_THRESHOLD = 20  # bp from designed edit - beyond this, delta var
 MIN_MAPQ = 20  # Minimum mapping quality
 
 # Parallelization parameters
-DEFAULT_N_WORKERS = 8  # Default number of parallel workers
 DEFAULT_N_CHUNKS = 8   # Default number of file chunks (can be different from workers)
+
+
+def _available_cpus() -> int:
+    """CPUs available to THIS process/allocation.
+
+    Uses os.sched_getaffinity (respects the SLURM cgroup / --cpus-per-task, so we
+    never oversubscribe an N-core allocation on a 64-128 core node); falls back to
+    os.cpu_count() where sched_getaffinity is unavailable (e.g. non-Linux).
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
+
+
+# Default workers: node/allocation-aware, but never more than the number of chunks
+# (workers > chunks just sit idle while each still holds a full lookup copy -> wasted
+# RAM). Output is independent of n_workers (chunks are split contiguously and merged
+# in chunk-index order), so this only affects speed/RAM, not results.
+DEFAULT_N_WORKERS = max(1, min(_available_cpus(), DEFAULT_N_CHUNKS))  # default: min(available CPUs, n_chunks)
 
 # Oligo structure constants
 OLIGO_GUIDE_START = 20
