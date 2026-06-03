@@ -42,65 +42,81 @@ from pathlib import Path
 from tqdm import tqdm
 from Levenshtein import distance
 import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from rapidfuzz.distance import Levenshtein as _rapidfuzz_lev
 
 
-def process_group(args):
-    """
-    Collapse similar sequences within a group by edit distance threshold.
+def _peel_off(seqs, cvs, threshold):
+    """Greedy top-by-count peel-off on plain lists.
+
+    Behavior-preserving reimplementation of the original pandas process_group inner
+    loop: repeatedly pick the highest-total-count surviving sequence, collapse every
+    surviving sequence within `threshold` edit distance of it, aggregate counts, repeat.
+    Uses rapidfuzz `score_cutoff` for early-exit distance. No pandas churn.
 
     Args:
-        args: tuple of (group_df, group_cols, seq_col, count_cols, edit_distance_threshold, preserve_cols)
-
+        seqs: list[str | non-str(NaN)]   sequences in the group (original within-group order)
+        cvs:  list[tuple[int, ...]]      per-row count vector aligned to count cols
+        threshold: int                    max edit distance to collapse
     Returns:
-        list of dicts representing collapsed rows
+        list of (rep_local_idx, summed_count_tuple) — one per output cluster
     """
-    # Unpack args - preserve_cols is optional for backward compatibility
-    if len(args) == 6:
-        group, group_cols, seq_col, count_cols, edit_distance_threshold, preserve_cols = args
-    else:
-        group, group_cols, seq_col, count_cols, edit_distance_threshold = args
-        preserve_cols = []
+    n = len(seqs)
+    alive = [True] * n
+    totals = [sum(cv) for cv in cvs]
+    ncc = len(cvs[0]) if n else 0
+    out = []
+    remaining = n
+    while remaining:
+        # top = FIRST surviving index with the max total (matches pandas idxmax tie-break)
+        top = -1
+        best = None
+        for i in range(n):
+            if alive[i] and (best is None or totals[i] > best):
+                best = totals[i]
+                top = i
+        ts = seqs[top]
+        agg = list(cvs[top])
+        alive[top] = False
+        remaining -= 1
+        ts_ok = isinstance(ts, str)  # NaN top (non-str) collapses only itself, as in the original
+        if ts_ok:
+            for i in range(n):
+                if alive[i]:
+                    si = seqs[i]
+                    if isinstance(si, str) and (
+                        si == ts or _rapidfuzz_lev.distance(si, ts, score_cutoff=threshold) <= threshold
+                    ):
+                        cv = cvs[i]
+                        for k in range(ncc):
+                            agg[k] += cv[k]
+                        alive[i] = False
+                        remaining -= 1
+        out.append((top, tuple(agg)))
+    return out
 
-    group = group.copy()
-    result_rows = []
 
-    while not group.empty:
-        # Find sequence with highest count
-        if isinstance(count_cols, list):
-            top_idx = group[count_cols].sum(axis=1).idxmax()
-        else:
-            top_idx = group[count_cols].idxmax()
+def _collapse_payload(payload, group_cols, seq_col, cc, pcols, threshold):
+    """Worker: collapse one group given plain-python payload (no pandas/DataFrames).
 
-        top_seq = group.loc[top_idx, seq_col]
-
-        # Calculate edit distance to top sequence
-        group["edit_distance"] = group[seq_col].apply(
-            lambda x: distance(x, top_seq) if pd.notna(x) else 999
-        )
-        collapse_mask = group["edit_distance"] <= edit_distance_threshold
-
-        # Aggregate counts for similar sequences
-        if isinstance(count_cols, list):
-            collapsed_counts = {col: group.loc[collapse_mask, col].sum() for col in count_cols}
-        else:
-            collapsed_counts = {count_cols: group.loc[collapse_mask, count_cols].sum()}
-
-        # Preserve additional columns (take from top-count row)
-        preserved = {}
-        for col in preserve_cols:
-            if col in group.columns:
-                preserved[col] = group.loc[top_idx, col]
-
-        result_rows.append({
-            **{col: group.iloc[0][col] for col in group_cols},
-            seq_col: top_seq,
-            **collapsed_counts,
-            **preserved,
-        })
-
-        group = group.loc[~collapse_mask].drop(columns=["edit_distance"])
-
-    return result_rows
+    payload = (gkey_values, seqs_list, count_vectors_list, preserve_values_list|None)
+    Returns a list of result-row dicts identical in shape to the original output.
+    """
+    gkey, seqs, cvs, pres = payload
+    base = {group_cols[k]: gkey[k] for k in range(len(group_cols))}
+    rows = []
+    for rep, agg in _peel_off(seqs, cvs, threshold):
+        row = dict(base)
+        row[seq_col] = seqs[rep]
+        for k in range(len(cc)):
+            row[cc[k]] = agg[k]
+        if pcols and pres is not None:
+            pr = pres[rep]
+            for k in range(len(pcols)):
+                row[pcols[k]] = pr[k]
+        rows.append(row)
+    return rows
 
 
 def collapse_sequences(df, group_cols, seq_col, count_cols, edit_distance_threshold,
@@ -120,36 +136,92 @@ def collapse_sequences(df, group_cols, seq_col, count_cols, edit_distance_thresh
 
     Returns:
         DataFrame with collapsed sequences
+
+    OPTIMIZED 2026-06-02 (behavior-preserving vs the original greedy top-by-count
+    peel-off; validated row/count-equal on real data):
+      - SINGLETON FAST-PATH: size-1 groups (the large majority of bc1/donor groups)
+        skip ALL edit-distance work and dispatch.
+      - PURE-LIST peel-off (_peel_off): no per-iteration pandas .apply/.loc/.drop;
+        rapidfuzz Levenshtein with score_cutoff for early-exit.
+      - BATCHED PLAIN-TUPLE DISPATCH: workers receive small (lists) payloads, never
+        pickled per-group DataFrames (the old defect that pinned the parent on IPC
+        and starved workers, so --n-jobs gave ~no speedup). Workers are numpy/MKL-free
+        (AVX-512 safe); numpy is used only in the parent for factorize/argsort.
     """
     if preserve_cols is None:
         preserve_cols = []
+    cc = count_cols if isinstance(count_cols, list) else [count_cols]
+    pcols = [c for c in preserve_cols if c in df.columns]
+    out_cols = list(group_cols) + [seq_col] + list(cc) + pcols
 
-    grouped = df.groupby(group_cols)
-    n_groups = grouped.ngroups
+    n = len(df)
+    if n == 0:
+        return pd.DataFrame(columns=out_cols)
 
-    if n_jobs > 1:
-        def generate_args():
-            for _, group in grouped:
-                yield (group, group_cols, seq_col, count_cols, edit_distance_threshold, preserve_cols)
-
-        with multiprocessing.Pool(n_jobs) as pool:
-            chunksize = max(1, n_groups // (n_jobs * 4))
-            iterator = pool.imap_unordered(process_group, generate_args(), chunksize=chunksize)
-            if show_progress:
-                iterator = tqdm(iterator, total=n_groups, desc=f"Collapsing {seq_col}")
-            result_rows = [row for group_result in iterator for row in group_result]
+    # Factorize the group key, then stable-sort rows so each group is a contiguous slice
+    # (avoids materializing/pickling one pandas sub-DataFrame per group).
+    if len(group_cols) == 1:
+        codes, _ = pd.factorize(df[group_cols[0]], sort=False)
     else:
-        groups = [group for _, group in grouped]
-        groups_iter = tqdm(groups, desc=f"Collapsing {seq_col}") if show_progress else groups
-        result_rows = [
-            row
-            for group in groups_iter
-            for row in process_group(
-                (group, group_cols, seq_col, count_cols, edit_distance_threshold, preserve_cols)
-            )
-        ]
+        codes, _ = pd.factorize(
+            pd.Series(list(zip(*[df[c].tolist() for c in group_cols])), index=df.index),
+            sort=False,
+        )
+    order = np.argsort(codes, kind="stable")
+    codes_s = codes[order]
+    seqs_all = df[seq_col].to_numpy(dtype=object)[order]
+    counts_all = df[list(cc)].to_numpy()[order]
+    gvals_all = df[list(group_cols)].to_numpy(dtype=object)[order]
+    pres_all = df[pcols].to_numpy(dtype=object)[order] if pcols else None
 
-    return pd.DataFrame(result_rows)
+    bounds = np.flatnonzero(np.diff(codes_s)) + 1
+    starts = np.concatenate(([0], bounds)).tolist()
+    ends = np.concatenate((bounds, [n])).tolist()
+
+    ngc = len(group_cols)
+    ncc = len(cc)
+    npc = len(pcols)
+    singleton_rows = []
+    payloads = []
+    for a, b in zip(starts, ends):
+        if b - a == 1:
+            row = {group_cols[k]: gvals_all[a][k] for k in range(ngc)}
+            row[seq_col] = seqs_all[a]
+            crow = counts_all[a]
+            for k in range(ncc):
+                v = crow[k]
+                row[cc[k]] = v.item() if hasattr(v, "item") else v
+            if npc:
+                pr = pres_all[a]
+                for k in range(npc):
+                    row[pcols[k]] = pr[k]
+            singleton_rows.append(row)
+        else:
+            gkey = [gvals_all[a][k] for k in range(ngc)]
+            seqs = list(seqs_all[a:b])
+            cvs = [tuple(int(counts_all[i][k]) for k in range(ncc)) for i in range(a, b)]
+            pres = ([[pres_all[i][k] for k in range(npc)] for i in range(a, b)] if npc else None)
+            payloads.append((gkey, seqs, cvs, pres))
+
+    worker = partial(_collapse_payload, group_cols=list(group_cols), seq_col=seq_col,
+                     cc=list(cc), pcols=pcols, threshold=edit_distance_threshold)
+    multi_rows = []
+    if payloads:
+        if n_jobs and n_jobs > 1 and len(payloads) > 1:
+            chunksize = max(1, len(payloads) // (n_jobs * 8))
+            with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+                it = ex.map(worker, payloads, chunksize=chunksize)
+                if show_progress:
+                    it = tqdm(it, total=len(payloads), desc=f"Collapsing {seq_col}")
+                for rows in it:
+                    multi_rows.extend(rows)
+        else:
+            it = tqdm(payloads, desc=f"Collapsing {seq_col}") if show_progress else payloads
+            for p in it:
+                multi_rows.extend(worker(p))
+
+    result = pd.DataFrame(singleton_rows + multi_rows)
+    return result[out_cols] if len(result) else pd.DataFrame(columns=out_cols)
 
 
 def main():
@@ -191,6 +263,13 @@ trafo_ID Propagation:
     plate_key = pd.read_csv(args.plate_key, sep="\t")
     sample_key = pd.read_csv(args.sample_key, sep="\t")
 
+    # Filter for bc1-donor-bc0 amplicons + build the combined key BEFORE any
+    # trafo-detection that inspects combined_key (fixes UnboundLocalError where
+    # combined_key was referenced ~25 lines before its assignment).
+    plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
+    combined_key = plate_key.merge(sample_key, how="cross")
+    combined_key["sequencing_date"] = args.run_date
+
     # Check for trafo_ID in various sources:
     # 1. From sample_key (via combined_key merge) - preferred
     # 2. From separate --trafo-key file - for supplementation/override
@@ -214,19 +293,14 @@ trafo_ID Propagation:
             if "trafo_ID" in trafo_key.columns:
                 print(f"  trafo_ID distribution: {trafo_key['trafo_ID'].value_counts().to_dict()}")
 
-    # Filter for bc1-donor-bc0 amplicons
-    plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
-
-    # Create combined key
-    combined_key = plate_key.merge(sample_key, how="cross")
-    combined_key["sequencing_date"] = args.run_date
-
     print(f"Loading data from {len(combined_key)} sample files...")
 
     # Load all parsed files
     dfs = []
     for _, row in tqdm(combined_key.iterrows(), total=len(combined_key), desc="Loading samples"):
-        fname = f"{args.run_date}_{row['outer_primers']}_{row['sample_number']}_parsed_bc1_donor_bc0.tsv"
+        # parse_01 writes <prefix>_parsed.tsv (matches the combine_02 rule input);
+        # was _parsed_bc1_donor_bc0.tsv (legacy per-screen name) -> found zero files.
+        fname = f"{args.run_date}_{row['outer_primers']}_{row['sample_number']}_parsed.tsv"
         filepath = Path(args.parsed_dir) / fname
 
         if filepath.exists():
@@ -262,7 +336,7 @@ trafo_ID Propagation:
     print(f"Loaded {len(combined_df)} total rows")
 
     # Report trafo_ID coverage if applicable
-    if has_trafo and "trafo_ID" in combined_df.columns:
+    if has_trafo_in_sample_key and "trafo_ID" in combined_df.columns:
         trafo_coverage = combined_df["trafo_ID"].notna().sum() / len(combined_df) * 100
         print(f"trafo_ID coverage: {trafo_coverage:.1f}%")
         print(f"trafo_ID distribution: {combined_df['trafo_ID'].value_counts().to_dict()}")
