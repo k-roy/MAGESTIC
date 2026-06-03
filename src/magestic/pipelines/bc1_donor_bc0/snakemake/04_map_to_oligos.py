@@ -1,230 +1,114 @@
 #!/usr/bin/env python3
 """
-Map bc1-donor-bc0 data to designed oligo pools.
+Map bc1-donor-bc0 data to designed oligos via the CANONICAL rich matcher
+(magestic.pipelines.bc1_donor_bc0.core.matching.match_dataframe).
 
-This script matches donor sequences to the designed oligo pool to:
-1. Identify which designed oligo each bc1 is associated with
-2. Extract guide and full donor information
-3. Calculate match quality metrics
+REWIRED 2026-06-02 (user decision: core/matching is the canonical matcher).
+Previously this step did a simple exact pd.merge of a fixed-length RE-site-trimmed
+donor against the raw Twist oligo pools. It now delegates to the rich, vectorized
+match_dataframe (variant-level unambiguity + tolerant Hamming anchoring + dual-anchor
+SpCas9/SpG + LbCas12a trim + middle-region sliding-window rescue), matched against the
+harmonized oligo table. ~12x faster than the old per-row matcher AND semantically
+richer than the old exact merge (which lacked all of the above).
 
-BC1 Donor Structure:
-    The bc1 "donor" column from parsing includes:
-    - ~25bp prefix before RE site
-    - 11bp RE site (GTTTGAAGAGC)
-    - 129bp actual designed donor
-
-    This script extracts the 129bp designed donor portion for matching.
+Output preserves the prior contract columns consumed by assign_05:
+    oligo_name, oligo_guide, oligo_pool, perfect_donor_match
+plus the rich extras: variant, is_unambiguous, perfect_middle_region, match_method,
+num_candidates, num_candidate_variants, guide_match.
 
 Usage:
-    # Using harmonized oligo design (recommended - has pre-extracted donors)
-    python 04_map_to_oligos.py \\
-        --input <linked_tsv> [linked_tsv ...] \\
-        --oligo-pools <harmonized_oligos.tsv> \\
-        --output <output_tsv>
-
-    # Using raw Twist oligo files (will extract donors)
-    python 04_map_to_oligos.py \\
-        --input <linked_tsv> [linked_tsv ...] \\
-        --oligo-pools <2024_twist.tsv> <2021_twist.tsv> \\
-        --output <output_tsv> \\
-        --donor-start 51 --donor-end 180
+    python 04_map_to_oligos.py --input <linked_tsv> [...] --output <out_tsv> \\
+        [--donor-col donor] [--v-libraries V629 V631 ...] [--nuclease SpG_NGNG ...]
 
 Author: Kevin R. Roy
 """
-
 import argparse
+import sys
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
 
-# RE sites used to extract the actual donor from bc1 data
-# HANDOFF_20260527 forward-port: LbCas12a/impLbCas12a donors use a distinct RE site
-# that the SpCas9/SpG-only check missed → all V450/V454 donors returned None.
-RE_SITE_SPCAS9_SPG = "GTTTGAAGAGC"   # SpCas9 / SpG
-RE_SITE_LBCAS12A   = "TTTCGAAGAGC"   # LbCas12a / impLbCas12a
-RE_SITES = [RE_SITE_SPCAS9_SPG, RE_SITE_LBCAS12A]
-DESIGNED_DONOR_LENGTH = 129
-
-
-def extract_actual_donor_from_bc1(donor_seq):
-    """
-    Extract the designed donor portion from bc1 donor sequence.
-
-    The bc1 donor includes prefix + RE_site + designed_donor.
-    Tries SpCas9/SpG RE site first, then LbCas12a RE site.
-    """
-    if pd.isna(donor_seq):
-        return None
-    upper = str(donor_seq).upper()
-    for re_site in RE_SITES:
-        if re_site in upper:
-            pos = upper.find(re_site)
-            actual_donor = upper[pos + len(re_site):]
-            return actual_donor[:DESIGNED_DONOR_LENGTH] if len(actual_donor) >= DESIGNED_DONOR_LENGTH else actual_donor
-    return None
+# Canonical package matcher. Works whether magestic is installed (workflow PYTHON)
+# or this file is run directly by path (fallback adds .../src to sys.path).
+try:
+    from magestic.pipelines.bc1_donor_bc0.core.matching import load_and_build_lookup, match_dataframe
+    from magestic.utils import path_utils
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4]))  # .../src
+    from magestic.pipelines.bc1_donor_bc0.core.matching import load_and_build_lookup, match_dataframe
+    from magestic.utils import path_utils
 
 
-def load_oligo_pools(pool_files, donor_start=51, donor_end=180):
-    """
-    Load and combine oligo pool design files.
-
-    Handles multiple formats:
-    - Harmonized design (has pre-extracted 'donor' column)
-    - Raw Twist files (has 'oligo_seq' or 'oligo_sequence', extracts donor)
-    """
-    pools = []
-    for f in pool_files:
-        print(f"  Loading: {Path(f).name}")
-        df = pd.read_csv(f, sep="\t", low_memory=False)
-        df["pool_file"] = Path(f).name
-
-        # Normalize oligo name column
-        if "oligo_name" in df.columns and "Name" not in df.columns:
-            df["Name"] = df["oligo_name"]
-
-        # Check if donor is already extracted (harmonized format)
-        if "donor" in df.columns:
-            df["designed_donor"] = df["donor"].str.upper()
-            print(f"    Using pre-extracted donor column ({df['designed_donor'].notna().sum()} donors)")
-        else:
-            # Extract donor from oligo sequence
-            seq_col = None
-            for col in ["Sequence", "sequence", "oligo_seq", "oligo_sequence"]:
-                if col in df.columns:
-                    seq_col = col
-                    break
-
-            if seq_col:
-                df["designed_donor"] = df[seq_col].apply(
-                    lambda x: str(x)[donor_start:donor_end].upper() if pd.notna(x) and len(str(x)) >= donor_end else None
-                )
-                print(f"    Extracted donor from {seq_col} positions [{donor_start}:{donor_end}]")
-            else:
-                print(f"    Warning: No sequence column found")
-                df["designed_donor"] = None
-
-        # Extract guide if available
-        if "guide" in df.columns:
-            df["designed_guide"] = df["guide"].str.upper()
-        else:
-            seq_col = None
-            for col in ["Sequence", "sequence", "oligo_seq", "oligo_sequence"]:
-                if col in df.columns:
-                    seq_col = col
-                    break
-            if seq_col:
-                df["designed_guide"] = df[seq_col].apply(
-                    lambda x: str(x)[20:40].upper() if pd.notna(x) and len(str(x)) >= 40 else None
-                )
-
-        pools.append(df)
-
-    combined = pd.concat(pools, ignore_index=True)
-    print(f"Total: {len(combined)} oligos from {len(pool_files)} pool files")
-    return combined
+def _build_oligo_attr_maps():
+    """oligo_name -> guide, oligo_name -> library, from the harmonized oligo table,
+    for the oligo_guide / oligo_pool contract columns consumed downstream."""
+    hp = path_utils.HARMONIZED_VARIANTS_FILE
+    cols = pd.read_csv(hp, sep="\t", nrows=0).columns
+    guide_col = "guide" if "guide" in cols else None
+    lib_col = next((c for c in ("guide_donor_bc0_plasmid_library", "V_library", "twist_pool") if c in cols), None)
+    use = ["oligo_name"] + [c for c in (guide_col, lib_col) if c]
+    h = pd.read_csv(hp, sep="\t", usecols=use).drop_duplicates(subset=["oligo_name"])
+    o2g = dict(zip(h["oligo_name"], h[guide_col])) if guide_col else {}
+    o2l = dict(zip(h["oligo_name"], h[lib_col])) if lib_col else {}
+    return o2g, o2l
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Map donors to designed oligos",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Using harmonized oligo design (recommended)
-    python 04_map_to_oligos.py \\
-        --input bc1_to_guide_donor_bc0.tsv \\
-        --oligo-pools harmonized_oligos.tsv \\
-        --output bc1_mapped_to_oligos.tsv
-        """
-    )
-    parser.add_argument("--input", nargs="+", required=True, help="Input TSV file(s) from Step 03")
-    parser.add_argument("--oligo-pools", nargs="+", required=True, help="Oligo pool design TSV file(s)")
+    parser = argparse.ArgumentParser(description="Map bc1-donor-bc0 to designed oligos (canonical rich matcher)")
+    parser.add_argument("--input", nargs="+", required=True, help="Input TSV file(s) from Step 03 / combine")
     parser.add_argument("--output", required=True, help="Output TSV file")
-    parser.add_argument("--guide-start", type=int, default=20, help="Guide start position in raw oligo")
-    parser.add_argument("--guide-end", type=int, default=40, help="Guide end position in raw oligo")
-    parser.add_argument("--donor-start", type=int, default=51, help="Donor start position in raw oligo")
-    parser.add_argument("--donor-end", type=int, default=180, help="Donor end position in raw oligo")
-
+    parser.add_argument("--donor-col", default=None, help="Donor column (default: auto donor/top_donor)")
+    parser.add_argument("--guide-col", default="guide", help="Guide column if present")
+    parser.add_argument("--v-libraries", nargs="*", default=None, help="Restrict harmonized lookup to these V libraries")
+    parser.add_argument("--nuclease", nargs="*", default=None, help="Restrict harmonized lookup to these nuclease/PAM types")
+    parser.add_argument("--no-pre-trim", action="store_true", help="Disable anchor pre-trim (already-trimmed donors)")
+    # Back-compat (accepted + IGNORED): the old exact-merge args, so existing rule
+    # shells keep working without a rule edit. The harmonized table is used instead.
+    parser.add_argument("--oligo-pools", nargs="*", default=None, help="(ignored; harmonized table used)")
+    parser.add_argument("--guide-start", type=int, default=None, help="(ignored)")
+    parser.add_argument("--guide-end", type=int, default=None, help="(ignored)")
+    parser.add_argument("--donor-start", type=int, default=None, help="(ignored)")
+    parser.add_argument("--donor-end", type=int, default=None, help="(ignored)")
+    parser.add_argument("--lbcas12a-donor-start", type=int, default=None, help="(ignored)")
     args = parser.parse_args()
 
-    # Load input data
     print("Loading bc1-donor-bc0 data...")
-    dfs = [pd.read_csv(f, sep="\t") for f in args.input]
-    bc1_data = pd.concat(dfs, ignore_index=True)
-    print(f"Loaded {len(bc1_data)} rows with {bc1_data['bc1'].nunique()} unique bc1s")
+    bc1_data = pd.concat([pd.read_csv(f, sep="\t") for f in args.input], ignore_index=True)
+    nbc1 = bc1_data["bc1"].nunique() if "bc1" in bc1_data.columns else "NA"
+    print(f"Loaded {len(bc1_data)} rows; unique bc1s: {nbc1}")
 
-    # Load oligo pools
-    print("\nLoading oligo pool designs...")
-    oligo_pool = load_oligo_pools(args.oligo_pools, args.donor_start, args.donor_end)
-
-    # Create donor lookup (uppercase for case-insensitive matching)
-    donor_lookup = oligo_pool[["designed_donor", "designed_guide", "Name", "pool_file"]].dropna(subset=["designed_donor"])
-    donor_lookup = donor_lookup.drop_duplicates(subset=["designed_donor"])
-    print(f"\nCreated donor lookup with {len(donor_lookup)} unique designed donors")
-
-    # Determine which donor column to use in bc1 data
-    if "donor" in bc1_data.columns:
-        donor_col = "donor"
-    elif "top_donor" in bc1_data.columns:
-        donor_col = "top_donor"
-    else:
-        donor_col = None
-        print("Warning: No donor column found. Skipping oligo mapping.")
-
-    if donor_col:
-        print(f"\nExtracting actual donor from bc1 data (after RE site)...")
-        bc1_data["actual_donor"] = bc1_data[donor_col].apply(extract_actual_donor_from_bc1)
-        valid_donors = bc1_data["actual_donor"].notna().sum()
-        print(f"Extracted actual donor for {valid_donors}/{len(bc1_data)} ({100*valid_donors/len(bc1_data):.1f}%) entries")
-
-        print(f"\nMatching to designed oligos...")
-
-        # Merge on actual_donor
-        merged = bc1_data.merge(
-            donor_lookup,
-            left_on="actual_donor",
-            right_on="designed_donor",
-            how="left"
-        )
-
-        matched = merged["designed_donor"].notna().sum()
-        total = len(merged)
-        print(f"Matched {matched}/{total} ({100*matched/total:.1f}%) entries to designed oligos")
-
-        # Rename columns for clarity
-        merged = merged.rename(columns={
-            "Name": "oligo_name",
-            "designed_guide": "oligo_guide",
-            "pool_file": "oligo_pool"
-        })
-
-        # Create matching quality columns
-        merged["perfect_donor_match"] = merged["designed_donor"].notna()
-
-        # Clean up temporary columns
-        merged = merged.drop(columns=["actual_donor", "designed_donor"], errors="ignore")
-
-        # Summary by oligo pool
-        if "oligo_pool" in merged.columns:
-            print("\nMatches by oligo pool:")
-            print(merged["oligo_pool"].value_counts(dropna=False).to_string())
-
-        # Summary by SPS/V_library if available
-        if "SPS" in merged.columns:
-            print("\nMatches by SPS (top 5):")
-            for sps in merged["SPS"].value_counts().head(5).index:
-                sps_df = merged[merged["SPS"] == sps]
-                sps_matched = sps_df["perfect_donor_match"].sum()
-                print(f"  {sps[:20]}: {sps_matched}/{len(sps_df)} ({100*sps_matched/len(sps_df):.1f}%)")
-
-        # Save output
-        merged.to_csv(args.output, sep="\t", index=False)
-        print(f"\nSaved mapped data to: {args.output}")
-        print(f"Output columns: {', '.join(merged.columns[:10])}...")
-    else:
-        # Just pass through the data
+    donor_col = args.donor_col
+    if donor_col is None:
+        donor_col = "donor" if "donor" in bc1_data.columns else ("top_donor" if "top_donor" in bc1_data.columns else None)
+    if donor_col is None:
+        print("Warning: no donor column found; writing input unchanged.")
         bc1_data.to_csv(args.output, sep="\t", index=False)
-        print(f"\nSaved data (without oligo mapping) to: {args.output}")
+        return
+
+    print("Building harmonized oligo lookup (canonical matcher)...")
+    tables = load_and_build_lookup(
+        use_harmonized_table=True,
+        v_libraries=args.v_libraries,
+        nuclease_types=args.nuclease,
+    )
+
+    print(f"Matching donors (col '{donor_col}') via core.matching.match_dataframe...")
+    out = match_dataframe(bc1_data, tables, donor_col=donor_col, guide_col=args.guide_col,
+                          pre_trim=not args.no_pre_trim)
+
+    # Preserve the prior output contract (assign_05 consumes these).
+    out["perfect_donor_match"] = out["perfect_donor"]
+    o2g, o2l = _build_oligo_attr_maps()
+    if o2g:
+        out["oligo_guide"] = out["oligo_name"].map(o2g)
+    if o2l:
+        out["oligo_pool"] = out["oligo_name"].map(o2l)
+
+    n = len(out)
+    m = int(out["oligo_name"].notna().sum())
+    unamb = int(out["is_unambiguous"].sum()) if "is_unambiguous" in out.columns else -1
+    print(f"Matched {m}/{n} ({100*m/max(n,1):.1f}%) to designed oligos; unambiguous={unamb}")
+    out.to_csv(args.output, sep="\t", index=False)
+    print(f"Saved mapped data to: {args.output}")
 
 
 if __name__ == "__main__":
