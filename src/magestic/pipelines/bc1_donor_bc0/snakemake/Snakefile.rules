@@ -170,7 +170,23 @@ rule map_04_oligos:
         guide_start = config["oligo_mapping"]["guide_start"],
         guide_end = config["oligo_mapping"]["guide_end"],
         donor_start = config["oligo_mapping"]["donor_start"],
-        donor_end = config["oligo_mapping"]["donor_end"]
+        donor_end = config["oligo_mapping"]["donor_end"],
+        # Optional harmonized-lookup restriction (speed): pass --v-libraries /
+        # --nuclease ONLY when the per-screen config provides them. When both keys
+        # are absent/empty this renders to "" so the command is byte-identical to
+        # the unrestricted default (04_map_to_oligos.py treats absent flags as None
+        # = no filter). Accepts list or scalar values in config.
+        restrict_args = lambda wildcards: (
+            (lambda om: " ".join(
+                ([] if not om.get("v_libraries") else
+                 ["--v-libraries"] + ([str(om["v_libraries"])] if isinstance(om["v_libraries"], str)
+                                      else [str(x) for x in om["v_libraries"]]))
+                +
+                ([] if not om.get("nuclease") else
+                 ["--nuclease"] + ([str(om["nuclease"])] if isinstance(om["nuclease"], str)
+                                   else [str(x) for x in om["nuclease"]]))
+            ))(config.get("oligo_mapping", {}))
+        )
         # NOTE: dropped the dangling --lbcas12a-donor-start flag (2026-06-02) — no
         # version of 04_map_to_oligos.py accepts it (would SystemExit the rule). The
         # fixed-offset idea was never implemented; LbCas12a is handled by the
@@ -190,7 +206,7 @@ rule map_04_oligos:
             --guide-start {params.guide_start} \\
             --guide-end {params.guide_end} \\
             --donor-start {params.donor_start} \\
-            --donor-end {params.donor_end} \\
+            --donor-end {params.donor_end} {params.restrict_args} \\
             2>&1 | tee {log}
         """
 
