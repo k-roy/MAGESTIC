@@ -655,6 +655,39 @@ def _match_row(args):
     return match_sequence(donor, guide if pd.notna(guide) else None, tables)
 
 
+def _get_perfect_result_map(tables: OligoLookupTables) -> Dict[str, tuple]:
+    """donor -> (oligo_name, is_unambiguous, variant, num_candidate_oligos,
+    num_candidate_variants, match_method) for the perfect-donor, NO-guide case.
+
+    Precomputes _resolve_candidates' variant-level collapse ONCE per `tables`
+    (cached on the object) so match_dataframe's vectorized fast path can .map()
+    it. Encodes exactly match_sequence's perfect-donor branch without guide
+    narrowing (perfect_donor=True, perfect_middle_region=True, guide_match=False).
+    """
+    cached = getattr(tables, "_perfect_result_map", None)
+    if cached is not None:
+        return cached
+    o2v = tables.oligo_to_variant
+    m: Dict[str, tuple] = {}
+    for donor, oligos in tables.perfect_donor_to_oligos.items():
+        cands = sorted(set(oligos))
+        variants = {o2v.get(o, o) for o in cands} if o2v else set(cands)
+        nv = len(variants)
+        m[donor] = (
+            cands[0],
+            nv == 1,
+            (next(iter(variants)) if nv == 1 else None),
+            len(cands),
+            nv,
+            "perfect" if nv == 1 else "perfect_ambiguous",
+        )
+    try:
+        tables._perfect_result_map = m
+    except Exception:
+        pass
+    return m
+
+
 def match_dataframe(
     df: pd.DataFrame,
     tables: OligoLookupTables,
@@ -691,94 +724,100 @@ def match_dataframe(
     Returns:
         DataFrame with added match columns
     """
-    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
     from tqdm import tqdm
+    import numpy as np
 
     logger.info(f"Matching {len(df)} sequences to oligos (n_jobs={n_jobs})...")
 
-    # Initialize result columns
     df = df.copy()
-    df[f'{prefix}oligo_name'] = None
-    df[f'{prefix}perfect_donor'] = False
-    df[f'{prefix}perfect_middle_region'] = False
-    df[f'{prefix}guide_match'] = False
-    df[f'{prefix}is_unambiguous'] = False
-    df[f'{prefix}match_method'] = "none"
-    df[f'{prefix}num_candidates'] = 0
-    df[f'{prefix}num_candidate_variants'] = 0
-    df[f'{prefix}variant'] = None
-
-    # Check if guide column exists
+    n = len(df)
     has_guide = guide_col in df.columns
 
-    # Prepare data for matching
-    donors = df[donor_col].values
-    guides = df[guide_col].values if has_guide else [None] * len(df)
+    # Result-column arrays for a single vectorized writeback at the end
+    # (replaces the old per-row df.iloc x 9 assignment).
+    oligo = [None] * n
+    pdon = [False] * n
+    pmid = [False] * n
+    gmatch = [False] * n
+    unamb = [False] * n
+    method = ["none"] * n
+    ncand = [0] * n
+    ncandv = [0] * n
+    var = [None] * n
 
-    # Match using vectorized approach for lookups where possible
-    match_counts = {"perfect": 0, "sliding_window": 0, "guide_only": 0, "none": 0}
-
-    # Process in chunks to manage memory and show progress
-    results = []
-    total_rows = len(df)
-
-    for start_idx in tqdm(range(0, total_rows, chunk_size), desc="Matching chunks"):
-        end_idx = min(start_idx + chunk_size, total_rows)
-        chunk_donors = donors[start_idx:end_idx]
-        chunk_guides = guides[start_idx:end_idx]
-
-        if n_jobs > 1:
-            # Parallel processing within chunk
-            # Note: ThreadPoolExecutor is better here because tables is shared
-            with ThreadPoolExecutor(max_workers=n_jobs) as executor:
-                chunk_results = list(executor.map(
-                    lambda args: match_sequence(
-                        args[0], args[1] if pd.notna(args[1]) else None, tables,
-                        pre_trim=pre_trim,
-                    ) if pd.notna(args[0]) else None,
-                    zip(chunk_donors, chunk_guides)
-                ))
+    # ---------------------------------------------------------------------
+    # VECTORIZED FAST PATH (2026-06-02) — the perfect-donor majority.
+    # Replicates match_sequence's perfect-donor branch WITHOUT guide-narrowing
+    # (the dominant case: production bc1_donor_bc0 input has no guide column).
+    # Exact-anchor trim is vectorized (str.split == trim_to_variable_region's
+    # exact pass); the precomputed donor->result map encodes _resolve_candidates'
+    # variant-level collapse. EVERY other row (no exact anchor / tolerant-trim /
+    # sliding-window / guide-disambiguating / no perfect hit) falls back to the
+    # UNCHANGED per-row match_sequence below, so output is identical to the
+    # all-per-row path (validated old==new on real data).
+    # ---------------------------------------------------------------------
+    pm = _get_perfect_result_map(tables)
+    fast_mask = np.zeros(n, dtype=bool)
+    mapped_vals = None
+    if pre_trim and n:
+        donor_s = df[donor_col]
+        upu = donor_s.astype(str).str.upper().where(donor_s.notna())
+        a1, a2 = DONOR_VARIABLE_REGION_ANCHORS[0], DONOR_VARIABLE_REGION_ANCHORS[1]
+        t1 = upu.str.split(a1, n=1).str[1]   # part after first anchor1, else NaN
+        t2 = upu.str.split(a2, n=1).str[1]   # part after first anchor2, else NaN
+        trimmed = t1.where(t1.notna(), t2)   # anchor1 priority (matches trim())
+        mapped = trimmed.map(pm)             # result-tuple or NaN
+        if has_guide:
+            guide_s = df[guide_col]
+            g_block = guide_s.astype(str).str.upper().where(guide_s.notna()).map(
+                lambda x: isinstance(x, str) and x in tables.guide_to_oligos
+            ).fillna(False).to_numpy(dtype=bool)
         else:
-            # Sequential processing
-            chunk_results = [
-                match_sequence(d, g if pd.notna(g) else None, tables, pre_trim=pre_trim)
-                if pd.notna(d) else None
-                for d, g in zip(chunk_donors, chunk_guides)
-            ]
+            g_block = np.zeros(n, dtype=bool)
+        fast_mask = mapped.notna().to_numpy(dtype=bool) & (~g_block)
+        mapped_vals = mapped.to_numpy()
+        for i in np.flatnonzero(fast_mask):
+            t = mapped_vals[i]  # (oligo, is_unambiguous, variant, n_oligo, n_var, method)
+            oligo[i] = t[0]; pdon[i] = True; pmid[i] = True
+            unamb[i] = bool(t[1]); var[i] = t[2]
+            ncand[i] = int(t[3]); ncandv[i] = int(t[4]); method[i] = t[5]
 
-        results.extend(chunk_results)
-
-    # Apply results to DataFrame
-    for idx, result in enumerate(results):
-        if result is None:
+    # ---------------------------------------------------------------------
+    # FALLBACK — unchanged per-row match_sequence for every non-fast row.
+    # NaN-donor rows are skipped (None result), matching the original which did
+    # `match_sequence(d, g) if pd.notna(d) else None` (guide-only never fires on
+    # a NaN donor).
+    # ---------------------------------------------------------------------
+    donor_vals = df[donor_col].to_numpy()
+    guide_vals = df[guide_col].to_numpy() if has_guide else None
+    rest = np.flatnonzero(~fast_mask)
+    for i in tqdm(rest, desc="Matching (fallback)", disable=(len(rest) == 0)):
+        d = donor_vals[i]
+        d = d if isinstance(d, str) else None
+        if d is None:
             continue
+        g = guide_vals[i] if has_guide else None
+        g = g if (has_guide and isinstance(g, str)) else None
+        r = match_sequence(d, g, tables, pre_trim=pre_trim)
+        oligo[i] = r.oligo_name; pdon[i] = r.perfect_donor; pmid[i] = r.perfect_middle_region
+        gmatch[i] = r.guide_match; unamb[i] = r.is_unambiguous; method[i] = r.match_method
+        ncand[i] = r.num_candidate_oligos; ncandv[i] = r.num_candidate_variants; var[i] = r.variant
 
-        df.iloc[idx, df.columns.get_loc(f'{prefix}oligo_name')] = result.oligo_name
-        df.iloc[idx, df.columns.get_loc(f'{prefix}perfect_donor')] = result.perfect_donor
-        df.iloc[idx, df.columns.get_loc(f'{prefix}perfect_middle_region')] = result.perfect_middle_region
-        df.iloc[idx, df.columns.get_loc(f'{prefix}guide_match')] = result.guide_match
-        df.iloc[idx, df.columns.get_loc(f'{prefix}is_unambiguous')] = result.is_unambiguous
-        df.iloc[idx, df.columns.get_loc(f'{prefix}match_method')] = result.match_method
-        df.iloc[idx, df.columns.get_loc(f'{prefix}num_candidates')] = result.num_candidate_oligos
-        df.iloc[idx, df.columns.get_loc(f'{prefix}num_candidate_variants')] = result.num_candidate_variants
-        df.iloc[idx, df.columns.get_loc(f'{prefix}variant')] = result.variant
+    # Single vectorized writeback
+    df[f'{prefix}oligo_name'] = oligo
+    df[f'{prefix}perfect_donor'] = pdon
+    df[f'{prefix}perfect_middle_region'] = pmid
+    df[f'{prefix}guide_match'] = gmatch
+    df[f'{prefix}is_unambiguous'] = unamb
+    df[f'{prefix}match_method'] = method
+    df[f'{prefix}num_candidates'] = ncand
+    df[f'{prefix}num_candidate_variants'] = ncandv
+    df[f'{prefix}variant'] = var
 
-        # Count match types
-        if result.perfect_donor:
-            match_counts["perfect"] += 1
-        elif result.perfect_middle_region:
-            match_counts["sliding_window"] += 1
-        elif result.guide_match:
-            match_counts["guide_only"] += 1
-        else:
-            match_counts["none"] += 1
-
-    logger.info(f"  Match results:")
-    logger.info(f"    Perfect donor: {match_counts['perfect']}")
-    logger.info(f"    Sliding window: {match_counts['sliding_window']}")
-    logger.info(f"    Guide only: {match_counts['guide_only']}")
-    logger.info(f"    No match: {match_counts['none']}")
-
+    n_matched = sum(1 for o in oligo if o is not None)
+    n_perfect = sum(1 for x in pdon if x)
+    logger.info(f"  Matched {n_matched}/{n} (perfect_donor={n_perfect}; "
+                f"vectorized fast-path={int(fast_mask.sum())}, fallback={int((~fast_mask).sum())})")
     return df
 
 
