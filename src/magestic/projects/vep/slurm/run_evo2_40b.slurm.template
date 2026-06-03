@@ -1,0 +1,50 @@
+#!/bin/bash
+#SBATCH --job-name=evo2_40b_JOB_NAME
+#SBATCH --output=OUTPUT_DIR/evo2_40b_%j.log
+#SBATCH --error=OUTPUT_DIR/evo2_40b_%j.err
+#SBATCH --partition=gpu
+#SBATCH --constraint="GPU_MEM:80GB"
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
+#SBATCH --time=8:00:00
+#SBATCH --account=mylab
+
+# Evo2-40B batch job template
+# Replace: JOB_NAME, OUTPUT_DIR, FASTA_FILE
+
+echo "=========================================="
+echo "EVO2-40B Prediction"
+echo "=========================================="
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Start time: $(date)"
+nvidia-smi
+
+CONTAINER="/path/to/software/bionemo/bionemo-framework_2.7.1.sif"
+CKPT_DIR="/path/to/software/bionemo/checkpoints/evo2_40b_nemo2"
+FASTA_FILE="FASTA_FILE_PATH"
+OUTPUT_DIR="OUTPUT_DIR_PATH"
+
+mkdir -p "$OUTPUT_DIR"
+
+singularity exec \
+    --nv \
+    --cleanenv \
+    --writable-tmpfs \
+    --bind /oak:/oak \
+    "$CONTAINER" \
+    bash -c 'pip install "huggingface_hub>=0.30.0,<1.0" --quiet && \
+             python -m bionemo.evo2.run.predict \
+                 --fasta "'"$FASTA_FILE"'" \
+                 --ckpt-dir "'"$CKPT_DIR"'" \
+                 --tensor-parallel-size 4 \
+                 --model-size 40b \
+                 --output-dir "'"$OUTPUT_DIR"'" \
+                 --output-log-prob-seqs \
+                 --log-prob-collapse-option mean \
+                 --micro-batch-size 1'
+
+echo ""
+echo "End time: $(date)"
+echo "=========================================="

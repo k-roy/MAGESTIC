@@ -1,0 +1,27 @@
+#!/bin/bash
+#SBATCH --job-name=JOB_NAME
+#SBATCH --output=OUTPUT_DIR/%j.log
+#SBATCH --error=OUTPUT_DIR/%j.err
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=4:00:00
+#SBATCH --account=mylab
+
+# Generic GPU job template
+# Suitable for: ESM1v, Yorzoi, Shorkie
+
+echo "Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURMD_NODENAME"
+echo "Start time: $(date)"
+nvidia-smi
+
+# Set Python path
+PYTHON="/path/to/anaconda3/envs/ENV_NAME/bin/python"
+export PATH="$(dirname $PYTHON):$PATH"
+
+# Run the script
+$PYTHON SCRIPT_PATH
+
+echo "End time: $(date)"

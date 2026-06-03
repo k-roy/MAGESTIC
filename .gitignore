@@ -1,0 +1,15 @@
+# Build artifacts / packaging
+dist/
+build/
+*.egg-info/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Generated pipeline outputs under reproduce/ (large regenerable data,
+# keep only the source config/run scripts/README/checksums)
+reproduce/*/output/

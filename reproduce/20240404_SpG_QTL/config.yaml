@@ -1,0 +1,71 @@
+# MAGESTIC 3.0 — Reproducibility configuration
+# SpG QTL oligo pool (180 k oligos, 2024-04-11 Twist array order)
+#
+# To reproduce the canonical output:
+#   bash reproduce/20240404_SpG_QTL/run_design.sh
+# Then verify:
+#   md5sum -c reproduce/20240404_SpG_QTL/expected_checksums.md5
+
+magestic_version: "3.0.0"
+nuclease: "SpG"
+
+# --- Reference files (relative to project root) ---
+genome: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_background_strain.fasta
+
+haplotype_vcf: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/Bloom_et_al_16_strains_QTL_genes_by_haplotype_block_coord_adjusted.tsv
+
+gene_list: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/Bloom_QTL_gene_level.tsv
+
+allowed_guides: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_allowed_SpG_Cas9_20mer_guides_NGNN.txt
+
+disallowed_guides: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_disallowed_SpG_Cas9_20mer_guides_NGNN.txt
+
+rev_primers: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/rev_subpool_priming_sequences.txt
+
+plus_bedgraph: >-
+  common/reference_genomes/Pelechano_2013_PMID_23615609/plus_strand_coverage_ypd.bedgraph
+
+minus_bedgraph: >-
+  common/reference_genomes/Pelechano_2013_PMID_23615609/minus_strand_coverage_ypd.bedgraph
+
+fasta_exclusion_files:
+  - projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/pS1380.fasta
+  - projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/pS1381.fasta
+  - projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/pF433.fasta
+
+# --- VCF processing parameters ---
+max_bp_between_snvs: 3
+max_bp_between_indels: 10
+exclude_background: true
+exclude_genes:
+  - HO
+
+# --- PAM search parameters ---
+# NOTE: The pre-computed off-target file is checked into the project.
+# Re-generation (~10 min) is only needed if the genome changes.
+pam_off_target_file: >-
+  projects/QTL/20240404_SpG_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_SpG_NGNN_off_target_analysis.txt
+seed_length: 19
+
+# --- Oligo design parameters ---
+oligo_length: 200
+subpool_idx: 10             # subpool 10 = NGNG, 11 = NGNH
+minimum_homology: 30
+max_guides_per_donor: 4
+max_dist_to_pam: 20
+max_variants_per_position: 10
+global_max_poly_t: 8
+pam_preference_order:
+  - "NGNG"   # preferred (higher activity) → subpool 10
+  - "NGNH"   # secondary → subpool 11
+
+# --- Output ---
+output_dir: >-
+  reproduce/20240404_SpG_QTL/output
+output_prefix: "SpG_QTL_2024"

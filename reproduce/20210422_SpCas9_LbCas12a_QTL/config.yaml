@@ -1,0 +1,118 @@
+# MAGESTIC 3.0 — Reproducibility configuration
+# SpCas9 + LbCas12a QTL oligo pool (48 k oligos, 2021-04-22 Twist array order)
+#
+# To reproduce the canonical output:
+#   bash reproduce/20210422_SpCas9_LbCas12a_QTL/run_design.sh
+# Then verify:
+#   md5sum -c reproduce/20210422_SpCas9_LbCas12a_QTL/expected_checksums.md5
+
+magestic_version: "3.0.0"
+
+# NOTE: This pool was originally generated with three separate nuclease configurations
+# run sequentially and combined:
+#   - SpCas9  (NGG,  subpool 0)   → QTL variant editing
+#   - LbCas12a (TTTV, subpool 1)  → QTL variant editing
+#   - impLbCas12a (extended PAMs, subpool 2) → QTL variant editing
+# Plus saturation mutagenesis sub-pools for PDR5 and DHY214.
+# See the legacy final_scripts/ for per-nuclease invocations.
+
+# --- Reference files (relative to project root) ---
+genome: >-
+  projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_background_strain.fasta
+
+haplotype_vcf: >-
+  projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/Bloom_et_al_16_strains_QTL_genes_by_haplotype_block_coord_adjusted.tsv
+
+gene_list: ~   # All QTL genes included; no suppression list for 2021 design
+
+rev_primers: >-
+  projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/rev_subpool_priming_sequences.txt
+
+plus_bedgraph: >-
+  common/reference_genomes/Pelechano_2013_PMID_23615609/plus_strand_coverage_ypd.bedgraph
+
+minus_bedgraph: >-
+  common/reference_genomes/Pelechano_2013_PMID_23615609/minus_strand_coverage_ypd.bedgraph
+
+fasta_exclusion_files:
+  - projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/pS1380.fasta
+  - projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/pS1381.fasta
+  - projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/pF433.fasta
+
+# --- VCF processing parameters ---
+max_bp_between_snvs: 5
+max_bp_between_indels: 5
+exclude_background: true
+exclude_genes:
+  - HO
+
+# --- SpCas9 component (subpool 0) ---
+spcas9:
+  nuclease: "SpCas9"
+  allowed_guides: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_allowed_Cas9_20mer_guides_NGG.txt
+  disallowed_guides: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_disallowed_Cas9_20mer_guides_NGG.txt
+  off_target_file: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_Cas9_NGG_20mer_off_target_analysis_with_1_mismatch_on_the_18mers.txt
+  seed_length: 18                 # 18-mer seeds for SpCas9 (vs 19 for SpG)
+  oligo_length: 200
+  subpool_idx: 0
+  minimum_homology: 30
+  max_guides_per_donor: 2
+  max_dist_to_pam: 17             # PAM is at the 3' end; guide cleavage at -3 bp
+  global_max_poly_t: 8
+  pam_preference_order:
+    - "NGG"                       # all NGG PAMs equal priority; sort by distance
+
+# --- LbCas12a component (subpool 1) ---
+lbcas12a:
+  nuclease: "LbCas12a"
+  allowed_guides: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_allowed_Cas12a_TTTV_20mer_guides.txt
+  disallowed_guides: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_disallowed_Cas12a_TTTV_20mer_guides.txt
+  oligo_length: 200
+  subpool_idx: 1
+  minimum_homology: 30
+  max_guides_per_donor: 2
+  max_dist_to_pam: 20             # PAM is upstream of guide for Cas12a
+  global_max_poly_t: 8
+  pam_preference_order:
+    - "TTTA"                      # preferred
+    - ["TTTG", "TTTC"]            # secondary
+
+# --- impLbCas12a component (subpool 2) ---
+# Uses extended PAM compatibility: TNTN, TACV, TTCV, TCCV, CTCV, CCCV, VTTV
+# These variants were NOT covered by LbCas12a TTTV; only sites not in subpool 1 included.
+implbcas12a:
+  nuclease: "impLbCas12a"
+  allowed_guides: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_allowed_impLbCas12a_TNTN_TACV_TTCV_TCCV_CTCV_CCCV_VTTV_20mer_guides.txt
+  disallowed_guides: >-
+    projects/QTL/20210422_SpCas9_LbCas12a_QTL_guide_donor_libraries/final_reference_files/MAGESTIC_base_strain_disallowed_impLbCas12a_TNTN_TACV_TTCV_TCCV_CTCV_CCCV_VTTV_20mer_guides.txt
+  oligo_length: 200
+  subpool_idx: 2
+  minimum_homology: 30
+  max_guides_per_donor: 2
+  max_dist_to_pam: 14             # shorter max distance for weaker PAMs
+  global_max_poly_t: 8
+  pam_preference_order:
+    - ["TTTA", "TTTG", "TTTC"]   # TTTV (same as LbCas12a, preferred)
+    - ["TTTT", "TATA", "TATG", "TCTA", "TGTA", "TGTC", "TTCC", "CTCC", "TACC",
+       "ATTA", "GTTA"]            # secondary PAMs
+
+# --- Saturation mutagenesis sub-pools ---
+# Designed separately with generate_guide_donors_for_aa_mutations_Cas9_and_Cas12a.py
+# and appended to the combined pool before Twist submission.
+# Targets: PDR5 (all 20 AA substitutions at each position, subpools 3–4)
+#          DHY214 (aa mutation controls, subpools 3–4)
+# See: final_oligo_pools/Bloom_et_al_16_strains_QTL_genes_SpCas9_NGG_codon_change_guide_donor_200_bp_oligo_pool.txt
+#      final_oligo_pools/Bloom_et_al_16_strains_QTL_genes_LbCas12a_TTTV_codon_change_guide_donor_200_bp_oligo_pool.txt
+#      final_oligo_pools/PDR5_aa_mutation_controls_*.txt
+#      final_oligo_pools/DHY214_aa_mutation_controls_*.txt
+
+# --- Output ---
+output_dir: >-
+  reproduce/20210422_SpCas9_LbCas12a_QTL/output
+output_prefix: "SpCas9_LbCas12a_QTL_2021"

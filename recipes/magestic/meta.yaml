@@ -1,0 +1,72 @@
+{% set name = "magestic" %}
+{% set version = "2.0.0" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  sha256: a6930c98b8ebe16cc0511c45cf9de53ae001e5fdba827bac0bca2eb9e3281bf9
+
+build:
+  noarch: python
+  number: 0
+  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -q
+  entry_points:
+    - magestic-design-vcf        = magestic.design._cli:design_vcf_main
+    - magestic-design-saturation = magestic.design._cli:design_saturation_main
+    - magestic-gdb-pipeline      = magestic.pipelines.guide_donor_bc0._cli:main
+    - magestic-bc1-link          = magestic.pipelines.bc1_donor_bc0._cli:main
+    - magestic-screen-analysis   = magestic.pipelines.bc1_from_screen._cli:main
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+    - hatchling >=1.21
+  run:
+    - python >=3.10
+    - numpy >=1.24
+    - pandas >=2.0
+    - scipy >=1.10
+    - biopython >=1.79
+    - pyyaml >=6.0
+    - tqdm >=4.65
+    - matplotlib-base >=3.7
+    - seaborn >=0.12
+    - statsmodels >=0.14
+    # Heavy optional deps (GPU models, alignment) are NOT included here.
+    # Install from bioconda separately: pysam
+    # Install from conda-forge: pydeseq2, joblib, openpyxl, snakemake
+
+test:
+  imports:
+    - magestic
+    - magestic.genomics
+    - magestic.utils
+    - magestic.design
+    - magestic.pipelines
+    - magestic.plotting
+    - magestic.projects.nrd1
+    - magestic.projects.vep
+  commands:
+    - magestic-design-vcf --help
+    - magestic-screen-analysis --help
+    - python -c "from magestic.projects.nrd1 import get_nrd1_data_path; assert get_nrd1_data_path('DNA_codon_to_AA.txt').exists()"
+
+about:
+  home: https://github.com/kevinrjroy/MAGESTIC
+  license: MIT
+  summary: Multiplexed CRISPR library design and analysis for functional genomics
+  description: |
+    MAGESTIC (Multiplexed Accurate Genome Editing with Short, Trackable, Integrated
+    Cellular barcodes) is a framework for designing and analyzing CRISPR libraries
+    in yeast. It provides tools for guide/donor oligo design, barcode-linking
+    pipelines, fitness screen analysis, and variant effect prediction.
+  doc_url: https://github.com/kevinrjroy/MAGESTIC
+  dev_url: https://github.com/kevinrjroy/MAGESTIC
+
+extra:
+  recipe-maintainers:
+    - kevinrjroy
