@@ -34,6 +34,14 @@ PROTOTYPE NOTE: the canonical rules parse RAW R1/R2 via the auto-detecting
 legacy merge-then-parse 2x300 path to this requires the bbmerge-vs-raw-R1/R2
 parity check logged in HANDOFF_MAGESTIC_CONSOLIDATION_20260602.md (§7).
 """
+import os
+# PERF (2026-06-02): force C-backed rapidfuzz/Levenshtein. A pure-Python rapidfuzz
+# in ~/.local/lib shadows anaconda's compiled extension; since Levenshtein is built
+# on rapidfuzz's backend, BOTH fall back to pure Python (~35x slower edit distance,
+# which dominated the collapse). Excluding user-site makes anaconda's
+# rapidfuzz.distance.metrics_cpp_avx2 load. Inherited by all rule subprocesses.
+# (Root-cause fix: reinstall the ~/.local rapidfuzz binary wheel — see HANDOFF.)
+os.environ.setdefault("PYTHONNOUSERSITE", "1")
 from pathlib import Path
 import pandas as pd
 
