@@ -116,11 +116,23 @@ def run_combine_fastq(config: GuideDonorBC0Config) -> bool:
 
 
 def run_oligo_matching(config: GuideDonorBC0Config) -> bool:
-    """Run Step 03: Map sequences to designed oligos."""
+    """Run Step 03: Map sequences to designed oligos.
+
+    Two oligo-design sources:
+      * raw 200mer order (default): guide/donor sliced at fixed SpCas9/SpG offsets
+        (config.guide_slice / donor_slice). Preserved for bit-for-bit reproduction of
+        legacy outputs; the fixed slice mis-extracts LbCas12a guide/donor.
+      * harmonized table (config.use_harmonized_table): guide/donor already extracted
+        per nuclease -- required for LbCas12a, recommended for the dense 2024 SpG design.
+        Optional per-library scoping (config.library_scope) restricts each library's
+        lookup to its nuclease/sublibrary, cutting cross-sublibrary ambiguity in the
+        uniqueness-based rescue tiers.
+    """
     logger.info("Step 03: Mapping to designed oligos...")
 
     from ..core.oligo_matching import (
         load_oligo_pool,
+        load_oligo_pool_harmonized,
         build_lookup_dictionaries,
         process_counts_file,
     )
@@ -129,31 +141,49 @@ def run_oligo_matching(config: GuideDonorBC0Config) -> bool:
     working_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"  Counts directory: {working_dir}")
 
-    # Load oligo design
-    if not config.oligo_design_file or not config.oligo_design_file.exists():
-        logger.error("  No oligo design file configured or file not found.")
-        return False
+    def _build_lookups(v_libraries, nuclease_types):
+        if config.use_harmonized_table:
+            df = load_oligo_pool_harmonized(
+                v_libraries=v_libraries,
+                nuclease_types=nuclease_types,
+            )
+        else:
+            df = load_oligo_pool(
+                config.oligo_design_file,
+                guide_slice=config.guide_slice,
+                donor_slice=config.donor_slice,
+            )
+        lk = build_lookup_dictionaries(df)
+        logger.info(
+            f"    {len(df):,} oligos | exact guide+donor: {len(lk['guide_donor_to_oligo']):,}  "
+            f"guides: {len(lk['guide_to_oligos']):,}  donors: {len(lk['perfect_donor_to_oligos']):,}  "
+            f"partial: {len(lk['partial_donor_to_oligos']):,}"
+        )
+        return lk
 
-    logger.info(f"  Loading oligo design: {config.oligo_design_file.name}")
-    oligo_df = load_oligo_pool(
-        config.oligo_design_file,
-        guide_slice=config.guide_slice,
-        donor_slice=config.donor_slice,
-    )
-    logger.info(f"  Loaded {len(oligo_df):,} oligos")
+    if config.use_harmonized_table:
+        logger.info("  Oligo source: harmonized QTL table (per-nuclease guide/donor)")
+    else:
+        if not config.oligo_design_file or not config.oligo_design_file.exists():
+            logger.error("  No oligo design file configured or file not found.")
+            return False
+        logger.info(f"  Oligo source: raw 200mer design {config.oligo_design_file.name}")
 
-    logger.info("  Building lookup dictionaries...")
-    lookups = build_lookup_dictionaries(oligo_df)
-    logger.info(
-        f"    Exact guide+donor: {len(lookups['guide_donor_to_oligo']):,}  "
-        f"Guides: {len(lookups['guide_to_oligos']):,}  "
-        f"Donors: {len(lookups['perfect_donor_to_oligos']):,}  "
-        f"Partial donors: {len(lookups['partial_donor_to_oligos']):,}"
-    )
+    # Raw path: one global lookup. Harmonized path: per-library (scoped) lookups.
+    global_lookups = None
+    if not config.use_harmonized_table:
+        logger.info("  Building lookup dictionaries...")
+        global_lookups = _build_lookups(None, None)
 
-    # Find counts files produced by Step 02
     counts_suffix = "_guide_donor_bc0_counts.tsv"
-    input_files = sorted(working_dir.glob(f"*{counts_suffix}"))
+    # Exclude this step's own outputs: "*_matched_guide_donor_bc0_counts.tsv"
+    # also ends in counts_suffix, so a naive glob re-ingests them on re-run
+    # (creating "_matched_matched_" junk and doubling runtime).
+    matched_suffix = "_matched_guide_donor_bc0_counts.tsv"
+    input_files = sorted(
+        f for f in working_dir.glob(f"*{counts_suffix}")
+        if not f.name.endswith(matched_suffix)
+    )
     if not input_files:
         logger.warning(
             f"  No files matching *{counts_suffix} found in {working_dir}. "
@@ -166,8 +196,16 @@ def run_oligo_matching(config: GuideDonorBC0Config) -> bool:
     for input_file in input_files:
         library_id = input_file.name.replace(counts_suffix, "")
         output_file = working_dir / f"{library_id}_matched_guide_donor_bc0_counts.tsv"
-        logger.info(f"  Matching {library_id} → {output_file.name}")
+        logger.info(f"  Matching {library_id} -> {output_file.name}")
         try:
+            if config.use_harmonized_table:
+                scope = config.library_scope.get(library_id, {})
+                lookups = _build_lookups(
+                    scope.get("v_libraries", config.harmonized_v_libraries),
+                    scope.get("nuclease_types", config.harmonized_nuclease_types),
+                )
+            else:
+                lookups = global_lookups
             stats = process_counts_file(input_file, output_file, lookups)
             total = stats["total"]
             matched = stats["matched"]
@@ -237,6 +275,22 @@ def run_bc0_purity(config: GuideDonorBC0Config) -> bool:
     return True
 
 
+def _canonical_twist_designs():
+    """Canonical Twist 200mer design files (with oligo_seq, hence SPS) for the
+    represent/plots steps in harmonized mode. Resolved relative to the harmonized
+    oligo table location so it tracks the same common/ tree the matcher uses."""
+    try:
+        from magestic.utils.oligo_annotations import HARMONIZED_OLIGO_TABLE
+        common = Path(HARMONIZED_OLIGO_TABLE).parent.parent  # annotation_files -> common
+    except Exception:
+        return []
+    candidates = [
+        common / "oligo_designs" / "20210422_Twist_200mer.tsv",                    # 2021: SpCas9 + (imp)LbCas12a
+        common / "oligo_designs" / "20240411_Twist_200mer_oligo_array_order.tsv",   # 2024: SpG
+    ]
+    return [c for c in candidates if c.exists()]
+
+
 def run_library_representation(config: GuideDonorBC0Config) -> bool:
     """Run Step 05: Aggregate to oligo-name level and identify missing oligos."""
     logger.info("Step 05: Assessing library representation...")
@@ -260,6 +314,14 @@ def run_library_representation(config: GuideDonorBC0Config) -> bool:
         kf_dir = config.project_dir / "keyfiles" / "guide_donor_bc0"
         oligo_pool_files = list(kf_dir.glob("*Twist*.tsv"))
 
+    if not oligo_pool_files and getattr(config, "use_harmonized_table", False):
+        oligo_pool_files = _canonical_twist_designs()
+        if oligo_pool_files:
+            logger.info(
+                "  Harmonized mode: using canonical Twist designs "
+                f"{[f.name for f in oligo_pool_files]} "
+                "(missing-oligo fill skipped unless library_sps_map is set)"
+            )
     if not oligo_pool_files:
         logger.error("  No oligo design files found. Configure config.oligo_design_file.")
         return False
@@ -307,6 +369,14 @@ def run_plots(config: GuideDonorBC0Config) -> bool:
         kf_dir = config.project_dir / "keyfiles" / "guide_donor_bc0"
         oligo_pool_files = list(kf_dir.glob("*Twist*.tsv"))
 
+    if not oligo_pool_files and getattr(config, "use_harmonized_table", False):
+        oligo_pool_files = _canonical_twist_designs()
+        if oligo_pool_files:
+            logger.info(
+                "  Harmonized mode: using canonical Twist designs "
+                f"{[f.name for f in oligo_pool_files]} "
+                "(missing-oligo fill skipped unless library_sps_map is set)"
+            )
     if not oligo_pool_files:
         logger.error("  No oligo design files found. Configure config.oligo_design_file.")
         return False
@@ -515,6 +585,33 @@ Examples:
         action="store_true",
         help="Enable debug mode"
     )
+    parser.add_argument(
+        "--use-harmonized-table",
+        action="store_true",
+        help="Match against the harmonized QTL oligo table (per-nuclease guide/donor) "
+             "instead of slicing the raw 200mer. Required for LbCas12a libraries."
+    )
+    parser.add_argument(
+        "--nuclease",
+        type=str,
+        default=None,
+        help="Comma-separated nuclease/PAM types to scope the harmonized lookup "
+             "(e.g. SpG_NGNG,SpCas9_NGG,LbCas12a_TTTV). Requires --use-harmonized-table."
+    )
+    parser.add_argument(
+        "--v-libraries",
+        type=str,
+        default=None,
+        help="Comma-separated V libraries to scope the harmonized lookup. "
+             "Requires --use-harmonized-table."
+    )
+    parser.add_argument(
+        "--library-scope-json",
+        type=Path,
+        default=None,
+        help="Optional JSON {library_ID: {nuclease_types:[...], v_libraries:[...]}} "
+             "for per-library harmonized scoping (mixed-nuclease pools)."
+    )
 
     args = parser.parse_args()
 
@@ -524,6 +621,18 @@ Examples:
     # Override oligo design file if specified
     if args.oligo_design_file:
         config.oligo_design_file = args.oligo_design_file
+
+    # Harmonized-table matching (gdb LbCas12a + dense-design fix)
+    if args.use_harmonized_table:
+        config.use_harmonized_table = True
+    if args.nuclease:
+        config.harmonized_nuclease_types = [x.strip() for x in args.nuclease.split(",") if x.strip()]
+    if args.v_libraries:
+        config.harmonized_v_libraries = [x.strip() for x in args.v_libraries.split(",") if x.strip()]
+    if args.library_scope_json:
+        import json
+        with open(args.library_scope_json) as _fh:
+            config.library_scope = json.load(_fh)
 
     # Apply scratch setting
     if args.use_scratch:

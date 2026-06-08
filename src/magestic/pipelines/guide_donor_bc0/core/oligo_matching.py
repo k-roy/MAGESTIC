@@ -61,6 +61,46 @@ def load_oligo_pool(
     return df
 
 
+def load_oligo_pool_harmonized(
+    v_libraries: Optional[List[str]] = None,
+    nuclease_types: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Load designed oligos from the harmonized QTL table instead of slicing a raw
+    200mer order file.
+
+    The harmonized table carries ``guide`` / ``donor`` already extracted *per
+    nuclease*. This fixes LbCas12a matching: the fixed [20:40]/[51:180] slice in
+    :func:`load_oligo_pool` is correct only for the SpCas9/SpG 200mer layout and
+    mis-extracts the LbCas12a guide/donor (~0%% matches against a raw LbCas12a
+    design). Optional ``v_libraries`` / ``nuclease_types`` scoping restricts the
+    lookup to one library's nuclease/sublibrary, reducing cross-sublibrary
+    donor/guide ambiguity on the dense 2024 SpG design.
+
+    Returns the same schema as :func:`load_oligo_pool`
+    (``oligo_name``, ``guide``, ``donor``, ``middle_donor``) so
+    :func:`build_lookup_dictionaries` consumes it unchanged.
+    """
+    from magestic.utils.oligo_annotations import load_oligo_annotations
+
+    cols = [
+        "oligo_name", "guide", "donor",
+        "guide_nuclease_PAM", "guide_donor_bc0_plasmid_library",
+    ]
+    df = load_oligo_annotations(columns=cols, add_is_control=False)
+
+    if v_libraries:
+        df = df[df["guide_donor_bc0_plasmid_library"].isin(v_libraries)]
+    if nuclease_types:
+        df = df[df["guide_nuclease_PAM"].isin(nuclease_types)]
+
+    df = df.dropna(subset=["guide", "donor"]).copy()
+    df["guide"] = df["guide"].astype(str).str.upper()
+    df["donor"] = df["donor"].astype(str).str.upper()
+    df["middle_donor"] = df["donor"].str.slice(MIDDLE_DONOR_START, MIDDLE_DONOR_END)
+    return df[["oligo_name", "guide", "donor", "middle_donor"]]
+
+
 def build_lookup_dictionaries(oligo_pool_df: pd.DataFrame) -> Dict[str, Dict]:
     """
     Build lookup dictionaries for matching sequences to oligos.

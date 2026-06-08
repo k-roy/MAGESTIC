@@ -121,6 +121,20 @@ class GuideDonorBC0Config:
     """Maps library ID → expected SPS sequence (e.g. {"V629": "CTTGAC..."}).
     Leave empty to skip missing-oligo filling."""
 
+    # Oligo-design source for Step 03 matching
+    use_harmonized_table: bool = False
+    """Match against the harmonized QTL oligo table (per-nuclease guide/donor)
+    instead of slicing the raw 200mer at fixed SpCas9/SpG offsets. Required for
+    LbCas12a libraries (the fixed slice mis-extracts their guide/donor)."""
+    harmonized_v_libraries: Optional[List[str]] = None
+    """Global V-library scope for the harmonized lookup (None = all)."""
+    harmonized_nuclease_types: Optional[List[str]] = None
+    """Global nuclease/PAM scope for the harmonized lookup (None = all)."""
+    library_scope: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
+    """Per-library harmonized scoping: {library_ID: {"nuclease_types": [...],
+    "v_libraries": [...]}}. Overrides the global scope for that library so each V
+    library in a mixed-nuclease pool matches only its own nuclease/sublibrary."""
+
     # Scratch I/O
     use_scratch: bool = False
     scratch_dir: Optional[Path] = None
