@@ -52,13 +52,12 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+from .path_utils import HARMONIZED_VARIANTS_FILE
+
 logger = logging.getLogger(__name__)
 
 # Canonical path to harmonized oligo table
-HARMONIZED_OLIGO_TABLE = Path(
-    "/path/to/common/annotation_files/"
-    "20210422_and_20240411_Bloom_et_al_16_strains_QTL_harmonized_designed_variant_oligos.tsv"
-)
+HARMONIZED_OLIGO_TABLE = HARMONIZED_VARIANTS_FILE
 
 # Column name mappings: harmonized table -> legacy annotation.py names
 # Use these to maintain backward compatibility with existing code

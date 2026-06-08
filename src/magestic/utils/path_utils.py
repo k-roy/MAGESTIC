@@ -12,6 +12,7 @@ Provides standardized path handling for the project structure:
 Author: Kevin Roy Lab
 """
 
+import os
 from pathlib import Path
 from typing import Optional, Dict, List
 from dataclasses import dataclass
@@ -19,9 +20,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Base directories
-DEFAULT_BASE_DIR = Path("/path/to")
-DEFAULT_COMMON_DIR = DEFAULT_BASE_DIR / "common"
+# Base directories. Defaults are public placeholders; set MAGESTIC_BASE_DIR /
+# MAGESTIC_COMMON_DIR (e.g. in ~/.bashrc on the deployment host) to point at the
+# real common/ tree without editing package code.
+DEFAULT_BASE_DIR = Path(
+    os.environ.get("MAGESTIC_BASE_DIR", "/path/to")
+)
+DEFAULT_COMMON_DIR = Path(
+    os.environ.get("MAGESTIC_COMMON_DIR", str(DEFAULT_BASE_DIR / "common"))
+)
 
 
 @dataclass
