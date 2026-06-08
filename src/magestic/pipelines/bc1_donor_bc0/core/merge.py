@@ -84,9 +84,9 @@ class BC1Record:
         2. Donor from gdb (if available and consistent)
         3. None if only fragment available (need to infer from matching)
         """
-        if self.donor_full:
+        if isinstance(self.donor_full, str) and self.donor_full:
             return self.donor_full
-        if self.donor_from_gdb:
+        if isinstance(self.donor_from_gdb, str) and self.donor_from_gdb:
             return self.donor_from_gdb
         return None
 
@@ -98,7 +98,9 @@ class BC1Record:
         This is the 30bp donor portion + 10bp bc0 that uniquely identifies
         a donor-bc0 combination and can link 2x150 fragments to 2x300 data.
         """
-        if self.donor_bc0_fragment:
+        if not isinstance(self.bc0, str):
+            return None
+        if isinstance(self.donor_bc0_fragment, str) and self.donor_bc0_fragment:
             # Extract donor portion (before common sequence)
             if COMMON_SEQUENCE_START in self.donor_bc0_fragment:
                 donor_portion = self.donor_bc0_fragment[:self.donor_bc0_fragment.index(COMMON_SEQUENCE_START)]
@@ -107,7 +109,7 @@ class BC1Record:
                 donor_portion = self.donor_bc0_fragment[:-BC0_LENGTH]
             return donor_portion + self.bc0
 
-        if self.donor_full:
+        if isinstance(self.donor_full, str) and self.donor_full:
             # Extract last 30bp of donor + bc0
             donor_portion = self.donor_full[-30:] if len(self.donor_full) >= 30 else self.donor_full
             return donor_portion + self.bc0
@@ -172,6 +174,9 @@ def build_donor_bc0_key(donor: str, bc0: str, use_last_n_bp: int = 30) -> str:
     Returns:
         Concatenated key: donor_portion + bc0
     """
+    # Guard against non-string donor/bc0 (NaN floats from NA-donor gdb rows)
+    if not isinstance(donor, str) or not isinstance(bc0, str):
+        return ""
     if len(donor) >= use_last_n_bp:
         donor_portion = donor[-use_last_n_bp:]
     else:
@@ -406,6 +411,9 @@ def merge_gdb_data(df_gdb: pd.DataFrame,
     for _, row in df_gdb.iterrows():
         donor = row['donor']
         bc0 = row['bc0']
+        # NA-donor gdb rows (unmatched reads in the matched table) cannot bridge
+        if not isinstance(donor, str) or not isinstance(bc0, str):
+            continue
         key = build_donor_bc0_key(donor, bc0)
         gdb_lookup[key].append(row)
 
@@ -472,9 +480,9 @@ def resolve_donor_conflicts(records: Dict[str, BC1Record]) -> Dict[str, BC1Recor
             # Check for conflicts between sources
             donors_to_compare = []
 
-            if record.donor_full:
+            if isinstance(record.donor_full, str) and record.donor_full:
                 donors_to_compare.append(('2x300', record.donor_full))
-            if record.donor_from_gdb:
+            if isinstance(record.donor_from_gdb, str) and record.donor_from_gdb:
                 donors_to_compare.append(('gdb', record.donor_from_gdb))
 
             if len(donors_to_compare) >= 2:
@@ -488,7 +496,7 @@ def resolve_donor_conflicts(records: Dict[str, BC1Record]) -> Dict[str, BC1Recor
                     conflict_count += 1
 
             # Check fragment consistency if available
-            if record.donor_bc0_fragment and record.donor_full:
+            if (isinstance(record.donor_bc0_fragment, str) and record.donor_bc0_fragment and isinstance(record.donor_full, str) and record.donor_full):
                 donor_portion = extract_donor_portion_from_fragment(record.donor_bc0_fragment)
                 if not record.donor_full.endswith(donor_portion):
                     if not record.has_donor_conflict:

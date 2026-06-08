@@ -21,6 +21,7 @@ processing accordingly. It supports three scenarios:
 import argparse
 import logging
 import sys
+import subprocess
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -115,6 +116,49 @@ Examples:
         type=int,
         default=16,
         help='Number of parallel jobs (default: 16)'
+    )
+
+    parser.add_argument(
+        '--annotate-unmatched',
+        action='store_true',
+        help='STEP 6: annotate unmatched donors via 06_annotate_unmatched_donors.py '
+             '(uses the MAGESTIC_cs DESIGN reference, not the yKR1033 WGS assembly)'
+    )
+
+    parser.add_argument(
+        '--integrate-annotations',
+        action='store_true',
+        help='After STEP 6, run 07 to integrate unmatched annotations into the final table'
+    )
+
+    parser.add_argument(
+        '--spg-oligo-design', type=Path, default=None,
+        help='SpG oligo design TSV for STEP 6 '
+             '(default: common/oligo_designs/20240411_Twist_200mer_oligo_array_order.tsv)'
+    )
+
+    parser.add_argument(
+        '--spcas9-oligo-design', type=Path, default=None,
+        help='SpCas9 oligo design TSV for STEP 6 '
+             '(default: common/oligo_designs/20210422_Twist_200mer.tsv)'
+    )
+
+    parser.add_argument(
+        '--reference-genome', type=Path, default=None,
+        help='MAGESTIC_cs DESIGN reference FASTA for STEP 6 '
+             '(default: common/reference_genomes/MAGESTIC/MAGESTIC_background_strain.fasta)'
+    )
+
+    parser.add_argument(
+        '--annotation-gff', type=Path, default=None,
+        help='MAGESTIC_cs annotation GFF for STEP 6 '
+             '(default: common/annotation_files/MAGESTIC_background_strain_annotations.gff)'
+    )
+
+    parser.add_argument(
+        '--harmonized-oligo-key', type=Path, default=None,
+        help='Harmonized oligo key for STEP 6 delta-variant computation '
+             '(default: canonical harmonized table)'
     )
 
     return parser.parse_args()
@@ -288,6 +332,16 @@ def aggregate_and_filter(
     if 'donor_bc0_fragment' in df.columns:
         agg_cols['donor_bc0_fragment'] = 'first'
 
+    # Preserve the guide propagated by the gdb bridge (merge sets record.guide for
+    # bridged bc1s). Without this the groupby drops it, STEP 4 matches donor-only,
+    # and guide_match is always False -> donor-sharing oligos (same edit, different
+    # PAM/guide) get resolved arbitrarily. 'first' skips NaN, so a bc1 that bridged
+    # in any of its rows keeps its guide.
+    if 'guide' in df.columns:
+        agg_cols['guide'] = 'first'
+    if 'donor_from_gdb' in df.columns:
+        agg_cols['donor_from_gdb'] = 'first'
+
     group_cols = ['bc1', 'donor', 'bc0']
     group_cols = [c for c in group_cols if c in df.columns]
 
@@ -345,6 +399,93 @@ def aggregate_and_filter(
             agg_df['num_distinct_donors'] = agg_df.groupby('bc1')['donor'].transform('nunique')
 
     return agg_df
+
+
+def _resolve_annot_paths(args):
+    """Resolve STEP-6 reference/design paths, falling back to canonical MAGESTIC_cs
+    DESIGN refs. gdb/bdb donors are compared against the design space they were built
+    against -- the MAGESTIC_background_strain (MAGESTIC_cs) assembly -- NOT the more
+    polished yKR1033-based assembly used for WGS/TRACE."""
+    common = Path(args.common_dir)
+    defaults = {
+        "spg_oligo_design": common / "oligo_designs" / "20240411_Twist_200mer_oligo_array_order.tsv",
+        "spcas9_oligo_design": common / "oligo_designs" / "20210422_Twist_200mer.tsv",
+        "reference_genome": common / "reference_genomes" / "MAGESTIC" / "MAGESTIC_background_strain.fasta",
+        "annotation_gff": common / "annotation_files" / "MAGESTIC_background_strain_annotations.gff",
+        "harmonized_oligo_key": common / "annotation_files"
+            / "20210422_and_20240411_Bloom_et_al_16_strains_QTL_harmonized_designed_variant_oligos.tsv",
+    }
+    resolved = {}
+    for k, d in defaults.items():
+        v = getattr(args, k, None)
+        resolved[k] = Path(v) if v else d
+    return resolved
+
+
+def _run_unmatched_annotation(args, config, bc1_reference_table):
+    """Flag-gated STEP 6: invoke 06_annotate_unmatched_donors.py (+ optional 07 integrate).
+
+    Runs as a subprocess because 06 uses fork-based parallelism with its own main().
+    06's raw output is not the deliverable; the integrated table (07) is, so 07 is
+    chained when --integrate-annotations is set. Failures here never clobber the
+    STEP-5 reference table, which is already on disk."""
+    paths = _resolve_annot_paths(args)
+    missing = [str(p) for p in paths.values() if not Path(p).exists()]
+    if missing:
+        logger.error("STEP 6 skipped -- required reference/design files not found:")
+        for m in missing:
+            logger.error(f"    {m}")
+        logger.error("  (the STEP-5 bc1 reference table is unaffected)")
+        return
+
+    script = Path(__file__).resolve().parent.parent / "snakemake" / "06_annotate_unmatched_donors.py"
+    out_dir = config.output_dir / "unmatched_annotation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, str(script),
+        "--input", str(bc1_reference_table),
+        "--output-dir", str(out_dir),
+        "--spg-oligo-design", str(paths["spg_oligo_design"]),
+        "--spcas9-oligo-design", str(paths["spcas9_oligo_design"]),
+        "--reference-genome", str(paths["reference_genome"]),
+        "--annotation-gff", str(paths["annotation_gff"]),
+        "--harmonized-oligo-key", str(paths["harmonized_oligo_key"]),
+        "--n-workers", str(args.n_jobs),
+        "--n-chunks", str(args.n_jobs),
+    ]
+    logger.info("  Running 06_annotate_unmatched_donors.py:")
+    logger.info("    " + " ".join(cmd))
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        logger.error(f"STEP 6 (06_annotate_unmatched_donors) failed with exit {result.returncode}")
+        return
+    logger.info(f"  Unmatched-donor annotations written under: {out_dir}")
+
+    if not getattr(args, "integrate_annotations", False):
+        return
+    annotations_file = out_dir / "unmatched_donor_annotations.tsv"
+    if not annotations_file.exists():
+        logger.error(f"STEP 6 integrate skipped -- {annotations_file} not found")
+        return
+    integrate_script = (Path(__file__).resolve().parent.parent / "snakemake"
+                        / "07_integrate_unmatched_annotations.py")
+    final_dir = config.output_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    integrated = final_dir / "bc1_reference_table_with_unmatched_annotations.tsv"
+    icmd = [
+        sys.executable, str(integrate_script),
+        "--bc1-reference", str(bc1_reference_table),
+        "--unmatched-annotations", str(annotations_file),
+        "--output", str(integrated),
+    ]
+    logger.info("  Running 07_integrate_unmatched_annotations.py:")
+    logger.info("    " + " ".join(icmd))
+    ires = subprocess.run(icmd)
+    if ires.returncode != 0:
+        logger.error(f"STEP 6 integrate (07) failed with exit {ires.returncode}")
+    else:
+        logger.info(f"  Integrated reference table: {integrated}")
 
 
 def run_pipeline(args):
@@ -495,6 +636,13 @@ def run_pipeline(args):
         for source in matched_df['data_source'].unique():
             count = len(matched_df[matched_df['data_source'].str.contains(source, na=False)])
             logger.info(f"  {source}: {count}")
+
+    # Step 6: Annotate unmatched donors (optional, flag-gated)
+    if getattr(args, "annotate_unmatched", False):
+        logger.info("\n" + "=" * 60)
+        logger.info("STEP 6: Annotating unmatched donors")
+        logger.info("=" * 60)
+        _run_unmatched_annotation(args, config, output_file)
 
     return matched_df
 
