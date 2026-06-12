@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import numpy as np
 import pandas as pd
 
 from ..config import (
@@ -243,6 +244,27 @@ def resolve_oligo_name(
     )
 
 
+def _derive_match_maps(lookups: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Precompute count + single-oligo maps from the list-valued lookups.
+
+    Lets the per-row :func:`resolve_oligo_name` cascade be applied vectorized:
+    ``*_count`` give the candidate count (for the perfect_/unambiguous_ flags and
+    the cascade gates) and ``*_single`` give the lone oligo when a key is unique.
+    Built once per call, O(#oligos).
+    """
+    g2o = lookups["guide_to_oligos"]
+    d2o = lookups["perfect_donor_to_oligos"]
+    m2o = lookups["partial_donor_to_oligos"]
+    return {
+        "guide_count": {k: len(v) for k, v in g2o.items()},
+        "donor_count": {k: len(v) for k, v in d2o.items()},
+        "middle_count": {k: len(v) for k, v in m2o.items()},
+        "guide_single": {k: v[0] for k, v in g2o.items() if len(v) == 1},
+        "donor_single": {k: v[0] for k, v in d2o.items() if len(v) == 1},
+        "middle_single": {k: v[0] for k, v in m2o.items() if len(v) == 1},
+    }
+
+
 def process_counts_file(
     input_path: Path,
     output_path: Path,
@@ -253,8 +275,16 @@ def process_counts_file(
     Match every row in a Step-02 counts file to the designed oligo pool.
 
     Reads *input_path* (produced by :func:`fastq_processing.process_library`)
-    in chunks, calls :func:`resolve_oligo_name` for each row, and writes the
-    result to *output_path*.
+    in chunks and writes the matched result to *output_path*.
+
+    PERFORMANCE (2026-06-12, R4): fully vectorized — replaces the prior
+    row-by-row ``iterrows`` (which called :func:`resolve_oligo_name` per row) with
+    a vectorized exact guide+donor ``Series.map`` plus an ``np.select`` cascade
+    that reproduces ``resolve_oligo_name``'s branch order exactly
+    (exact → both-unique-same → guide-only → donor-only → partial → unmatched).
+    The flag columns (perfect_/unambiguous_) are computed by vectorized count
+    lookups. Output is byte-identical to the legacy per-row version (verified by
+    all-branch parity test); no per-row Python loop, so no joblib needed.
 
     Parameters
     ----------
@@ -276,76 +306,92 @@ def process_counts_file(
         ``total``, ``matched``, ``perfect_match`` counts.
     """
     stats: Dict[str, int] = {"total": 0, "matched": 0, "perfect_match": 0}
+    maps = _derive_match_maps(lookups)
+    gd2o = lookups["guide_donor_to_oligo"]
     first_chunk = True
 
     for chunk in pd.read_csv(input_path, sep="\t", chunksize=chunk_size):
-        stats["total"] += len(chunk)
-        rows = []
-        for _, row in chunk.iterrows():
-            guide = row.get("guide", "NA")
-            donor = row.get("donor", "NA")
-            leader = row.get("leader", "NA")
-            bc0 = row.get("bc0", "NA")
-            donor_bc0_fragment = row.get("donor_bc0_fragment", "NA")
-            library_id = row.get("library_ID", "NA")
-            counts = row.get("total_counts", 0)
+        n = len(chunk)
+        stats["total"] += n
+        idx = chunk.index
 
-            if pd.isna(guide) or guide == "NA":
-                rows.append({
-                    "library_ID": library_id,
-                    "scaffold": "NA",
-                    "bc0": bc0,
-                    "counts": counts,
-                    "perfect_leader": False,
-                    "leader": leader,
-                    "perfect_guide": False,
-                    "guide": guide,
-                    "perfect_donor": False,
-                    "perfect_middle_donor_region": False,
-                    "donor": donor,
-                    "donor_bc0_fragment": donor_bc0_fragment,
-                    "unambiguous_guide": False,
-                    "unambiguous_donor": False,
-                    "oligo_name": "NA",
-                    "match_type": "unmatched",
-                })
-                continue
+        def col(name, default):
+            return chunk[name] if name in chunk.columns else pd.Series([default] * n, index=idx)
 
-            result = resolve_oligo_name(
-                str(guide), str(donor) if not pd.isna(donor) else "", lookups
-            )
-            guide_matches = lookups["guide_to_oligos"].get(str(guide), [])
-            donor_key = str(donor).upper() if not pd.isna(donor) else ""
-            donor_matches = lookups["perfect_donor_to_oligos"].get(donor_key, [])
-            middle_donor = donor_key[MIDDLE_DONOR_START:MIDDLE_DONOR_END]
-            middle_matches = lookups["partial_donor_to_oligos"].get(middle_donor, [])
+        guide = col("guide", "NA")
+        donor_raw = col("donor", "NA")
+        leader = col("leader", "NA")
+        guide_s = guide.astype(str)
+        # Uppercased donor for lookups; NaN -> "" (matches the legacy
+        # `str(donor) if not pd.isna(donor) else ""`). Output keeps original case.
+        donor_up = donor_raw.where(donor_raw.notna(), "").astype(str).str.upper()
+        nag = (guide.isna() | (guide_s == "NA")).to_numpy()
 
-            matched = result.oligo_name is not None
-            if matched:
-                stats["matched"] += 1
-            if result.match_type == "exact":
-                stats["perfect_match"] += 1
+        # Vectorized candidate counts -> flag columns + cascade gates.
+        ng = guide_s.map(maps["guide_count"]).fillna(0).to_numpy()
+        nd = donor_up.map(maps["donor_count"]).fillna(0).to_numpy()
+        middle = donor_up.str.slice(MIDDLE_DONOR_START, MIDDLE_DONOR_END)
+        nm = middle.map(maps["middle_count"]).fillna(0).to_numpy()
+        gsv = guide_s.map(maps["guide_single"]).to_numpy(dtype=object)
+        dsv = donor_up.map(maps["donor_single"]).to_numpy(dtype=object)
+        msv = middle.map(maps["middle_single"]).to_numpy(dtype=object)
 
-            rows.append({
-                "library_ID": library_id,
-                "scaffold": "WT_SpCas9",
-                "bc0": bc0,
-                "counts": counts,
-                "perfect_leader": str(leader) == PERFECT_LEADER,
-                "leader": leader,
-                "perfect_guide": len(guide_matches) > 0,
-                "guide": guide,
-                "perfect_donor": len(donor_matches) > 0,
-                "perfect_middle_donor_region": len(middle_matches) > 0,
-                "donor": donor,
-                "donor_bc0_fragment": donor_bc0_fragment,
-                "unambiguous_guide": len(guide_matches) == 1,
-                "unambiguous_donor": len(donor_matches) == 1,
-                "oligo_name": result.oligo_name if matched else "NA",
-                "match_type": result.match_type,
-            })
+        # Priority 1: exact guide+cloning_site+donor.
+        oligo_exact = (guide_s + SPCAS9_CLONING_SITE + donor_up).map(gd2o)
+        has_exact = oligo_exact.notna().to_numpy() & ~nag
 
-        out_df = pd.DataFrame(rows)
+        # Remaining cascade (resolve_oligo_name order), all vectorized.
+        both_same = (~has_exact) & ~nag & (ng == 1) & (nd == 1) & (gsv == dsv)
+        guide_only = (~has_exact) & (~both_same) & ~nag & (ng == 1)
+        donor_only = (~has_exact) & (~both_same) & (~guide_only) & ~nag & (nd == 1)
+        partial = (~has_exact) & (~both_same) & (~guide_only) & (~donor_only) & ~nag & (nm == 1)
+
+        oligo = np.full(n, "NA", dtype=object)
+        oligo[has_exact] = oligo_exact.to_numpy(dtype=object)[has_exact]
+        oligo[both_same] = gsv[both_same]
+        oligo[guide_only] = gsv[guide_only]
+        oligo[donor_only] = dsv[donor_only]
+        oligo[partial] = msv[partial]
+
+        mtype = np.full(n, "unmatched", dtype=object)
+        mtype[has_exact] = "exact"
+        mtype[both_same] = "exact"
+        mtype[guide_only] = "guide_only"
+        mtype[donor_only] = "donor_only"
+        mtype[partial] = "partial"
+
+        stats["matched"] += int((oligo != "NA").sum())
+        stats["perfect_match"] += int((mtype == "exact").sum())
+
+        # Flag columns (legacy hardcodes all False for the NA-guide rows).
+        perfect_leader = (leader.astype(str).to_numpy() == PERFECT_LEADER)
+        perfect_guide = ng > 0
+        perfect_donor = nd > 0
+        perfect_middle = nm > 0
+        unamb_guide = ng == 1
+        unamb_donor = nd == 1
+        for arr in (perfect_leader, perfect_guide, perfect_donor, perfect_middle,
+                    unamb_guide, unamb_donor):
+            arr[nag] = False
+
+        out_df = pd.DataFrame({
+            "library_ID": col("library_ID", "NA").to_numpy(),
+            "scaffold": np.where(nag, "NA", "WT_SpCas9"),
+            "bc0": col("bc0", "NA").to_numpy(),
+            "counts": col("total_counts", 0).to_numpy(),
+            "perfect_leader": perfect_leader,
+            "leader": leader.to_numpy(),
+            "perfect_guide": perfect_guide,
+            "guide": guide.to_numpy(),
+            "perfect_donor": perfect_donor,
+            "perfect_middle_donor_region": perfect_middle,
+            "donor": donor_raw.to_numpy(),
+            "donor_bc0_fragment": col("donor_bc0_fragment", "NA").to_numpy(),
+            "unambiguous_guide": unamb_guide,
+            "unambiguous_donor": unamb_donor,
+            "oligo_name": oligo,
+            "match_type": mtype,
+        })
         out_df.to_csv(
             output_path,
             sep="\t",
