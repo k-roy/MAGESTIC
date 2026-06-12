@@ -214,25 +214,39 @@ def merge_2x150_data(df_2x150: pd.DataFrame, show_progress: bool = True) -> Dict
     pcr_col = 'num_PCR_replicates' if 'num_PCR_replicates' in df_2x150.columns else None
     # 2026-05-31 fix: when the parsed TSV does not carry a pre-aggregated
     # num_PCR_replicates column (the current parser does not), derive the
-    # n-distinct-samples count from sample_number (tagged per-row by
-    # data_loader.load_2x150_bc1_donor_bc0_data ~line 273).
-    sample_col = 'sample_number' if pcr_col is None and 'sample_number' in df_2x150.columns else None
+    # replicate count from the per-sample replicate identity.
+    # 2026-06-11 R2 fix: prefer the composite pcr_replicate_id (full
+    # PCR_plate_name identity: gDNA_plate_name + inner_primers + outer_primers +
+    # sample_number) carried by data_loader, so a sample split across distinct
+    # primer plates — or independently re-prepped (new gDNA plate, even if the
+    # outer primers coincide) — counts as multiple independent PCR replicates.
+    # Re-sequencing the same library is intentionally NOT a new replicate
+    # (sequencing_date is excluded from the id). Fall back to bare sample_number
+    # for backward compat.
+    if pcr_col is not None:
+        replicate_col = None
+    elif 'pcr_replicate_id' in df_2x150.columns:
+        replicate_col = 'pcr_replicate_id'
+    elif 'sample_number' in df_2x150.columns:
+        replicate_col = 'sample_number'
+    else:
+        replicate_col = None
     has_library_id = 'library_ID' in df_2x150.columns
 
     # Prepare subset of columns for efficient iteration
     cols_needed = ['bc1', 'bc0', fragment_col, counts_col]
     if pcr_col:
         cols_needed.append(pcr_col)
-    elif sample_col:
-        cols_needed.append(sample_col)
+    elif replicate_col:
+        cols_needed.append(replicate_col)
     if has_library_id:
         cols_needed.append('library_ID')
 
     df_subset = df_2x150[cols_needed]
 
-    # samples-per-bc1 accumulator: drives pcr_replicates_2x150 when the input
+    # replicates-per-bc1 accumulator: drives pcr_replicates_2x150 when the input
     # lacks a pre-aggregated num_PCR_replicates column.
-    samples_per_bc1: Dict[str, set] = defaultdict(set) if sample_col else {}
+    replicates_per_bc1: Dict[str, set] = defaultdict(set) if replicate_col else {}
 
     # Use itertuples for faster iteration
     iterator = df_subset.itertuples(index=False)
@@ -264,20 +278,20 @@ def merge_2x150_data(df_2x150: pd.DataFrame, show_progress: bool = True) -> Dict
             pcr_val = row[4]
             # 2026-05-31 fix: SUM pre-aggregated PCR replicate counts across rows.
             record.pcr_replicates_2x150 += int(pcr_val) if pd.notna(pcr_val) else 0
-        elif sample_col:
-            samples_per_bc1[bc1].add(row[4])
+        elif replicate_col:
+            replicates_per_bc1[bc1].add(row[4])
 
         if has_library_id:
-            lib_idx = 5 if (pcr_col or sample_col) else 4
+            lib_idx = 5 if (pcr_col or replicate_col) else 4
             lib_id = row[lib_idx] if len(row) > lib_idx else None
             if pd.notna(lib_id):
                 record.library_id = lib_id
 
     # 2026-05-31 fix: when num_PCR_replicates was absent, derive
-    # pcr_replicates_2x150 from distinct sample_number count per bc1.
-    if sample_col:
-        for bc1, samples in samples_per_bc1.items():
-            records[bc1].pcr_replicates_2x150 = len(samples)
+    # pcr_replicates_2x150 from the distinct replicate-identity count per bc1.
+    if replicate_col:
+        for bc1, replicates in replicates_per_bc1.items():
+            records[bc1].pcr_replicates_2x150 = len(replicates)
 
     logger.info(f"Processed {len(records)} bc1 records from 2x150 data")
     return records
@@ -314,11 +328,23 @@ def merge_2x300_data(df_2x300: pd.DataFrame,
     donor_col = 'donor' if 'donor' in df_2x300.columns else 'bdb_donor'
     counts_col = 'total_bc1_donor_bc0_counts' if 'total_bc1_donor_bc0_counts' in df_2x300.columns else 'counts'
     pcr_col = 'num_PCR_replicates' if 'num_PCR_replicates' in df_2x300.columns else None
-    # 2026-05-31 fix: derive pcr_replicates_2x300 from distinct sample_number
-    # values per bc1 when the parsed TSV lacks a pre-aggregated
-    # num_PCR_replicates column (the current 2x300 parser does not produce one;
-    # data_loader.load_2x300_data tags each row with sample_number ~line 153).
-    sample_col = 'sample_number' if pcr_col is None and 'sample_number' in df_2x300.columns else None
+    # 2026-05-31 fix: derive pcr_replicates_2x300 from the per-sample replicate
+    # identity when the parsed TSV lacks a pre-aggregated num_PCR_replicates
+    # column (the current 2x300 parser does not produce one).
+    # 2026-06-11 R2 fix: prefer the composite pcr_replicate_id (full
+    # PCR_plate_name identity: gDNA_plate_name + inner_primers + outer_primers +
+    # sample_number) tagged by data_loader.load_2x300_data; count distinct
+    # sample_number only as a backward-compat fallback (it under-counts a sample
+    # split across primer plates or independently re-prepped). Re-sequencing the
+    # same library is NOT a new PCR replicate (sequencing_date excluded).
+    if pcr_col is not None:
+        replicate_col = None
+    elif 'pcr_replicate_id' in df_2x300.columns:
+        replicate_col = 'pcr_replicate_id'
+    elif 'sample_number' in df_2x300.columns:
+        replicate_col = 'sample_number'
+    else:
+        replicate_col = None
     has_library_id = 'library_ID' in df_2x300.columns
 
     new_records = 0
@@ -330,11 +356,11 @@ def merge_2x300_data(df_2x300: pd.DataFrame,
     donor_vals = df_2x300[donor_col].values
     counts_vals = df_2x300[counts_col].values
     pcr_vals = df_2x300[pcr_col].values if pcr_col else None
-    sample_vals = df_2x300[sample_col].values if sample_col else None
+    replicate_vals = df_2x300[replicate_col].values if replicate_col else None
     lib_vals = df_2x300['library_ID'].values if has_library_id else None
 
-    # samples-per-bc1 accumulator for the no-num_PCR_replicates path.
-    samples_per_bc1: Dict[str, set] = defaultdict(set) if sample_col else {}
+    # replicates-per-bc1 accumulator for the no-num_PCR_replicates path.
+    replicates_per_bc1: Dict[str, set] = defaultdict(set) if replicate_col else {}
 
     iterator = range(len(df_2x300))
     if show_progress:
@@ -362,8 +388,8 @@ def merge_2x300_data(df_2x300: pd.DataFrame,
         if pcr_vals is not None:
             # 2026-05-31 fix: SUM pre-aggregated PCR replicate counts across rows.
             record.pcr_replicates_2x300 += int(pcr_vals[i]) if pd.notna(pcr_vals[i]) else 0
-        elif sample_vals is not None:
-            samples_per_bc1[bc1].add(sample_vals[i])
+        elif replicate_vals is not None:
+            replicates_per_bc1[bc1].add(replicate_vals[i])
 
         # Check for bc0 consistency
         if record.bc0 != bc0:
@@ -374,10 +400,10 @@ def merge_2x300_data(df_2x300: pd.DataFrame,
             record.library_id = lib_vals[i]
 
     # 2026-05-31 fix: when num_PCR_replicates was absent, derive
-    # pcr_replicates_2x300 from distinct sample_number count per bc1.
-    if sample_vals is not None:
-        for bc1, samples in samples_per_bc1.items():
-            records[bc1].pcr_replicates_2x300 = len(samples)
+    # pcr_replicates_2x300 from the distinct replicate-identity count per bc1.
+    if replicate_vals is not None:
+        for bc1, replicates in replicates_per_bc1.items():
+            records[bc1].pcr_replicates_2x300 = len(replicates)
 
     logger.info(f"Processed 2x300 data: {new_records} new records, {merged_records} merged with existing")
     return records

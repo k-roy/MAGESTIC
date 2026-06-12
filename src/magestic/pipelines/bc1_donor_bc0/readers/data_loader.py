@@ -19,6 +19,153 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
+# Fields composing the PCR-replicate identity, in order. This is the keyfile's
+# own PCR_plate_name (gDNA_plate_name + inner_primers + outer_primers) at well
+# (sample_number) resolution. sequencing_date is intentionally NOT here.
+PCR_REPLICATE_ID_FIELDS = ('gDNA_plate_name', 'inner_primers', 'outer_primers', 'sample_number')
+
+
+def build_pcr_replicate_id(row) -> str:
+    """PCR-replicate identity = one independent amplification of the gDNA, per well.
+
+    Identity = ``(gDNA_plate_name, inner_primers, outer_primers, sample_number)``
+    — the keyfile's own ``PCR_plate_name`` (gDNA_plate + inner + outer) at well
+    resolution. Rationale:
+
+    - ``gDNA_plate_name`` identifies the physical prep/amplification event, so an
+      independent re-prep or re-amplification that *coincidentally* reuses the
+      same outer primers is still distinguished (different gDNA plate → a new
+      replicate) instead of being silently collapsed.
+    - ``inner_primers`` / ``outer_primers`` distinguish independent amplifications
+      of one prep (the same sample split across primer plates = real technical
+      replicates).
+    - ``sample_number`` is the well.
+    - ``sequencing_date`` is deliberately EXCLUDED: re-sequencing the *same*
+      library (same gDNA_plate + primers + well, new flowcell/date) is a
+      sequencing replicate, not an independent PCR replicate — a PCR/chimera
+      artifact reappears in every re-sequencing, so it is not independent
+      evidence and must collapse to a single replicate.
+
+    Absent/NaN fields render as ``"NA"`` so the id degrades gracefully (never
+    worse than the prior sample_number-only behaviour). When ``gDNA_plate_name``
+    is unavailable the re-prep guard is inactive; :func:`check_replicate_metadata`
+    warns so this is never silent.
+
+    Args:
+        row: A keyfile row (pandas Series or mapping).
+
+    Returns:
+        ``"{gDNA_plate_name}_{inner_primers}_{outer_primers}_{sample_number}"``.
+    """
+    def _f(key: str) -> str:
+        val = row.get(key) if hasattr(row, 'get') else (row[key] if key in row else None)
+        return str(val) if pd.notna(val) else 'NA'
+
+    return "_".join(_f(k) for k in PCR_REPLICATE_ID_FIELDS)
+
+
+def check_replicate_metadata(df: pd.DataFrame, source_label: str = "data") -> None:
+    """Sanity-check PCR-replicate metadata after loading; warn (never silently).
+
+    Two conditions are surfaced:
+
+    1. ``gDNA_plate_name`` absent / all-NA → the re-prep guard is INACTIVE; the
+       replicate id degrades to ``(inner_primers, outer_primers, sample_number)``,
+       so an independent re-prep that reused the same outer primers would be
+       under-counted as one replicate. Reported so the user can supply
+       ``gDNA_plate_name`` (it lives in the plate_key).
+    2. The same ``(sample_number, outer_primers)`` maps to >1 ``gDNA_plate_name``
+       → genuine independent preps/amplifications reused the same outer primers.
+       These are now (correctly) counted as separate PCR replicates; reported so
+       the count change is visible rather than silent.
+
+    Args:
+        df: A loaded source frame (post-concat, pre-merge).
+        source_label: Tag for the log line (e.g. "2x300", "2x150").
+    """
+    if df is None or len(df) == 0:
+        return
+
+    cols = df.columns
+    have_gdna = (
+        'gDNA_plate_name' in cols
+        and df['gDNA_plate_name'].notna().any()
+        and (df['gDNA_plate_name'].astype(str) != 'NA').any()
+    )
+    if not have_gdna:
+        logger.warning(
+            f"[{source_label}] gDNA_plate_name unavailable -> PCR-replicate re-prep guard "
+            f"INACTIVE; replicate id degrades to (inner_primers, outer_primers, sample_number). "
+            f"An independent re-prep that reused the same outer primers would be under-counted "
+            f"as one replicate. Supply gDNA_plate_name (plate_key) to activate the guard."
+        )
+        return
+
+    if 'sample_number' in cols and 'outer_primers' in cols:
+        combos = df[['sample_number', 'outer_primers', 'gDNA_plate_name']].drop_duplicates()
+        per = combos.groupby(['sample_number', 'outer_primers'])['gDNA_plate_name'].nunique()
+        multi = per[per > 1]
+        if len(multi) > 0:
+            logger.warning(
+                f"[{source_label}] {len(multi)} (sample_number, outer_primers) combo(s) span "
+                f">1 gDNA_plate_name -> independent re-preps reused the same outer primers; each "
+                f"gDNA plate is now counted as a separate PCR replicate. Examples: "
+                f"{list(multi.index[:5])}"
+            )
+        else:
+            logger.info(
+                f"[{source_label}] replicate-metadata OK: no outer-primer reuse across gDNA plates."
+            )
+
+
+def _read_keyfiles_concat(
+    keyfile_dir: Path,
+    explicit_name: str,
+    glob_pattern: str,
+    dedup_subset: Optional[List[str]] = None,
+) -> Optional[pd.DataFrame]:
+    """Load and concatenate ALL keyfiles matching ``explicit_name`` or ``glob_pattern``.
+
+    Recent screens ship **per-sequencing-date** plate_keys / sample_keys (e.g.
+    ``20251125_*_plate_key.tsv`` AND ``20251212_*_plate_key.tsv``). The prior
+    code took only the first glob match (``matches[0]``), so the other date's
+    rows — and their ``gDNA_plate_name`` / ``inner_primers`` — were dropped,
+    silently degrading the PCR-replicate re-prep guard (which needs every date's
+    plate_key to tell re-sequencing from an independent re-prep). This loads
+    every match and de-duplicates, so single-keyfile screens are unchanged while
+    multi-keyfile screens get the full set.
+
+    Args:
+        keyfile_dir: Directory to search.
+        explicit_name: Exact filename to prefer if present (e.g. "plate_key.tsv").
+        glob_pattern: Glob for the per-date variants (e.g. "*_plate_key.tsv").
+        dedup_subset: Columns to de-duplicate on after concat (None = full row).
+
+    Returns:
+        Concatenated/de-duplicated DataFrame, or None if nothing matched.
+    """
+    paths: List[Path] = []
+    explicit = keyfile_dir / explicit_name
+    if explicit.exists():
+        paths.append(explicit)
+    for m in sorted(keyfile_dir.glob(glob_pattern)):
+        if m not in paths:
+            paths.append(m)
+    if not paths:
+        return None
+
+    frames = [pd.read_csv(p, sep='\t') for p in paths]
+    out = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0].copy()
+    if len(frames) > 1:
+        subset = [c for c in dedup_subset if c in out.columns] if dedup_subset else None
+        out = out.drop_duplicates(subset=subset).reset_index(drop=True)
+        logger.info(
+            f"Concatenated {len(paths)} keyfiles matching '{glob_pattern}' "
+            f"({[p.name for p in paths]}) -> {len(out)} rows after de-dup"
+        )
+    return out
+
+
 @dataclass
 class DataSourceInfo:
     """Information about a loaded data source."""
@@ -79,22 +226,10 @@ def load_2x300_data(
     """
     logger.info("Loading 2x300 bp data...")
 
-    # Try to find keyfiles with various naming conventions
-    plate_key_paths = [
-        keyfile_dir / plate_key_name,
-        keyfile_dir / f"*_plate_key.tsv",
-    ]
-
-    plate_key = None
-    for pattern in plate_key_paths:
-        if '*' in str(pattern):
-            matches = list(keyfile_dir.glob(pattern.name))
-            if matches:
-                plate_key = pd.read_csv(matches[0], sep='\t')
-                break
-        elif pattern.exists():
-            plate_key = pd.read_csv(pattern, sep='\t')
-            break
+    # Load ALL matching plate keyfiles (recent screens ship one per sequencing
+    # date; each carries that date's gDNA_plate_name needed by the replicate
+    # re-prep guard). Concatenate rather than taking only the first match.
+    plate_key = _read_keyfiles_concat(keyfile_dir, plate_key_name, "*_plate_key.tsv")
 
     if plate_key is None:
         logger.warning(f"No plate keyfile found in {keyfile_dir}")
@@ -104,18 +239,41 @@ def load_2x300_data(
     if 'description' in plate_key.columns:
         plate_key = plate_key[plate_key['description'] == 'bc1-donor-bc0']
 
-    # Load sample key
-    sample_key_path = keyfile_dir / sample_key_name
-    if not sample_key_path.exists():
-        matches = list(keyfile_dir.glob("*_sample_key.tsv"))
-        if matches:
-            sample_key_path = matches[0]
+    # Expand rows whose sequencing_date encodes multiple re-sequencing dates as
+    # "d1,d2" into one row per date, so every date's file loads and shares the
+    # same gDNA_plate_name -> re-sequencing collapses to one PCR replicate (the
+    # filename is per-date, so a comma-joined date would otherwise match no file).
+    if 'sequencing_date' in plate_key.columns:
+        plate_key = plate_key.copy()
+        plate_key['sequencing_date'] = (
+            plate_key['sequencing_date'].astype(str).str.split(r'\s*,\s*')
+        )
+        plate_key = plate_key.explode('sequencing_date', ignore_index=True)
+        plate_key['sequencing_date'] = plate_key['sequencing_date'].str.strip()
 
-    if sample_key_path.exists():
-        sample_key = pd.read_csv(sample_key_path, sep='\t')
+    # Load ALL matching sample keyfiles (de-dup on sample_number so duplicate
+    # per-date sample keys don't double-load the same file via the cross join).
+    sample_key = _read_keyfiles_concat(
+        keyfile_dir, sample_key_name, "*_sample_key.tsv", dedup_subset=['sample_number'])
+
+    if sample_key is not None:
         combined_key = plate_key.merge(sample_key, how='cross')
     else:
         combined_key = plate_key
+
+    # One physical file == one (sequencing_date, outer_primers, sample_number);
+    # the filename does not encode gDNA_plate_name, so two plate-key rows that
+    # differ only in gDNA but share (date, outer) point at the SAME file and must
+    # not be loaded twice. Genuine independent re-preps appear as a DIFFERENT
+    # sequencing_date (hence a different file) and are preserved.
+    file_id_cols = [c for c in ('sequencing_date', 'outer_primers', 'sample_number')
+                    if c in combined_key.columns]
+    if file_id_cols:
+        before = len(combined_key)
+        combined_key = combined_key.drop_duplicates(subset=file_id_cols).reset_index(drop=True)
+        if len(combined_key) < before:
+            logger.info(f"  De-duplicated combined_key on {file_id_cols}: "
+                        f"{before} -> {len(combined_key)} file rows")
 
     if debug_mode:
         combined_key = combined_key.head(debug_n_samples)
@@ -151,6 +309,15 @@ def load_2x300_data(
 
             # Standardize columns
             df['sample_number'] = row.get('sample_number', 'unknown')
+            # Carry the replicate-identity fields so the merge step can count
+            # PCR replicates on the full PCR_plate_name identity
+            # (gDNA_plate_name, inner_primers, outer_primers, sample_number)
+            # instead of sample_number alone (R2 fix); see build_pcr_replicate_id.
+            df['outer_primers'] = row.get('outer_primers') if pd.notna(row.get('outer_primers')) else 'NA'
+            df['inner_primers'] = row.get('inner_primers') if pd.notna(row.get('inner_primers')) else 'NA'
+            df['gDNA_plate_name'] = row.get('gDNA_plate_name') if pd.notna(row.get('gDNA_plate_name')) else 'NA'
+            df['sequencing_date'] = row.get('sequencing_date') if pd.notna(row.get('sequencing_date')) else 'NA'
+            df['pcr_replicate_id'] = build_pcr_replicate_id(row)
             df['sequencing_run'] = '2x300'
             df['data_source'] = '2x300'
 
@@ -172,7 +339,9 @@ def load_2x300_data(
 
             # Select standard columns
             std_cols = ['counts', 'bc1', 'donor', 'bc0', 'donor_bc0_fragment',
-                       'sample_number', 'sequencing_run', 'data_source']
+                       'sample_number', 'outer_primers', 'inner_primers',
+                       'gDNA_plate_name', 'sequencing_date', 'pcr_replicate_id',
+                       'sequencing_run', 'data_source']
             available_cols = [c for c in std_cols if c in df.columns]
             dfs.append(df[available_cols])
             loaded_files.append(filepath)
@@ -182,6 +351,7 @@ def load_2x300_data(
         return pd.DataFrame(), DataSourceInfo("2x300", 0, 0, 0, [])
 
     combined = pd.concat(dfs, ignore_index=True)
+    check_replicate_metadata(combined, "2x300")
 
     info = DataSourceInfo(
         source_type="2x300",
@@ -271,6 +441,14 @@ def load_2x150_bc1_donor_bc0_data(
             df = pd.read_csv(filepath, sep='\t')
 
             df['sample_number'] = row.get('sample_number', 'unknown')
+            # Carry replicate-identity fields for the full PCR_plate_name
+            # replicate id (gDNA_plate_name, inner_primers, outer_primers,
+            # sample_number); sequencing_date for provenance only (R2 fix).
+            df['outer_primers'] = row.get('outer_primers') if pd.notna(row.get('outer_primers')) else 'NA'
+            df['inner_primers'] = row.get('inner_primers') if pd.notna(row.get('inner_primers')) else 'NA'
+            df['gDNA_plate_name'] = row.get('gDNA_plate_name') if pd.notna(row.get('gDNA_plate_name')) else 'NA'
+            df['sequencing_date'] = row.get('sequencing_date') if pd.notna(row.get('sequencing_date')) else 'NA'
+            df['pcr_replicate_id'] = build_pcr_replicate_id(row)
             df['sequencing_run'] = '2x150'
             df['data_source'] = '2x150'
 
@@ -279,7 +457,9 @@ def load_2x150_bc1_donor_bc0_data(
                 df['bc0'] = df['donor_bc0_fragment'].str[-10:]
 
             std_cols = ['counts', 'bc1', 'donor_bc0_fragment', 'bc0',
-                       'sample_number', 'sequencing_run', 'data_source']
+                       'sample_number', 'outer_primers', 'inner_primers',
+                       'gDNA_plate_name', 'sequencing_date', 'pcr_replicate_id',
+                       'sequencing_run', 'data_source']
             available_cols = [c for c in std_cols if c in df.columns]
             dfs.append(df[available_cols])
             loaded_files.append(filepath)
@@ -289,6 +469,7 @@ def load_2x150_bc1_donor_bc0_data(
         return pd.DataFrame(), DataSourceInfo("2x150", 0, 0, 0, [])
 
     combined = pd.concat(dfs, ignore_index=True)
+    check_replicate_metadata(combined, "2x150")
 
     info = DataSourceInfo(
         source_type="2x150",
