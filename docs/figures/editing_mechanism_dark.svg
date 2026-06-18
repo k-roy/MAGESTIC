@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="588" viewBox="0 0 1200 588">
+<defs><marker id="arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L0,7 L7,3.5 z" fill="#94a3b8"/></marker><marker id="arrb" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L0,7 L7,3.5 z" fill="#ff6aa0"/></marker></defs>
+<rect width="1200" height="588" fill="#0f172a"/>
+<g font-family="Inter, Helvetica Neue, Helvetica, Arial, sans-serif">
+<text x="40.0" y="36.0" font-size="19" fill="#f1f5f9" font-weight="700" text-anchor="start">The MAGESTIC 3.0 editing mechanism</text>
+<text x="40.0" y="59.0" font-size="12.5" fill="#94a3b8" font-weight="400" text-anchor="start">three routes deliver the donor to the Cas9 break for maximal HDR</text>
+<text x="260.0" y="100.0" font-size="13" fill="#cbd5e1" font-weight="700" text-anchor="middle">Plasmid recruitment</text>
+<text x="260.0" y="117.0" font-size="9" fill="#64748b" font-weight="400" text-anchor="middle" font-style="italic">dsDNA plasmid donor</text>
+<circle cx="260" cy="198" r="52" fill="none" stroke="#1e293b" stroke-width="7"/>
+<path d="M214.97 224.00 A52 52 0 0 1 214.97 172.00" stroke="#34c6e6" stroke-width="7" fill="none" stroke-linecap="round"/>
+<path d="M305.03 172.00 A52 52 0 0 1 306.74 220.80" stroke="#60a5fa" stroke-width="7" fill="none" stroke-linecap="round"/>
+<circle cx="312" cy="200" r="4" fill="#ff6aa0"/>
+<text x="202.0" y="196.0" font-size="9" fill="#34c6e6" font-weight="600" text-anchor="end">guide</text>
+<text x="318.0" y="204.0" font-size="9" fill="#60a5fa" font-weight="600" text-anchor="start">donor*</text>
+<circle cx="269" cy="249" r="4" fill="#34d6bd"/>
+<circle cx="258" cy="250" r="4" fill="#34d6bd"/>
+<circle cx="247" cy="248" r="4" fill="#34d6bd"/>
+<text x="300.0" y="254.0" font-size="8.5" fill="#34d6bd" font-weight="400" text-anchor="middle">LexO</text>
+<line x1="260.0" y1="250.0" x2="260.0" y2="285.0" stroke="#34d6bd" stroke-width="1.6" stroke-linecap="round"/>
+<rect x="238.0" y="285.5" width="44.0" height="21.0" rx="7.98" ry="7.98" fill="#06323f" stroke="#34c6e6" stroke-width="2"/>
+<text x="260.0" y="299.4" font-size="10" fill="#34c6e6" font-weight="700" text-anchor="middle">LexA</text>
+<rect x="201.8" y="285.5" width="36.5" height="21.0" rx="7.98" ry="7.98" fill="#3a2706" stroke="#fbbf24" stroke-width="2"/>
+<text x="220.0" y="299.1" font-size="9" fill="#fbbf24" font-weight="700" text-anchor="middle">MCP</text>
+<line x1="238.0" y1="296.0" x2="246.0" y2="296.0" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round"/>
+<rect x="241.8" y="319.5" width="36.5" height="21.0" rx="7.98" ry="7.98" fill="#11244a" stroke="#60a5fa" stroke-width="2"/>
+<text x="260.0" y="333.4" font-size="10" fill="#60a5fa" font-weight="700" text-anchor="middle">FHA</text>
+<line x1="260.0" y1="307.0" x2="260.0" y2="319.0" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round"/>
+<line x1="260.0" y1="341.0" x2="260.0" y2="364.0" stroke="#60a5fa" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="2 4"/>
+<ellipse cx="216" cy="366" rx="22" ry="15" fill="#43122a" stroke="#ff6aa0" stroke-width="1.2"/>
+<text x="216.0" y="369.5" font-size="9" fill="#ff6aa0" font-weight="700" text-anchor="middle">pT</text>
+<ellipse cx="304" cy="366" rx="22" ry="15" fill="#43122a" stroke="#ff6aa0" stroke-width="1.2"/>
+<text x="304.0" y="369.5" font-size="9" fill="#ff6aa0" font-weight="700" text-anchor="middle">pT</text>
+<line x1="185.0" y1="360.0" x2="248.0" y2="360.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="185.0" y1="372.0" x2="248.0" y2="372.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="272.0" y1="360.0" x2="335.0" y2="360.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="272.0" y1="372.0" x2="335.0" y2="372.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<path d="M254 354 L263 365 L256 372 L266 383" stroke="#fbbf24" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="600.0" y="100.0" font-size="13" fill="#cbd5e1" font-weight="700" text-anchor="middle">Retron recruitment</text>
+<text x="600.0" y="117.0" font-size="9" fill="#64748b" font-weight="400" text-anchor="middle" font-style="italic">retron-derived ssDNA donor</text>
+<line x1="522.0" y1="206.0" x2="630.0" y2="206.0" stroke="#34d6bd" stroke-width="2.6" stroke-linecap="round"/>
+<path d="M536.0 206.0 L536.0 184.0 A4.0 4.0 0 1 1 544.0 184.0 L544.0 206.0" stroke="#34d6bd" stroke-width="2.2" fill="none" stroke-linejoin="round"/>
+<path d="M554.0 206.0 L554.0 184.0 A4.0 4.0 0 1 1 562.0 184.0 L562.0 206.0" stroke="#34d6bd" stroke-width="2.2" fill="none" stroke-linejoin="round"/>
+<path d="M572.0 206.0 L572.0 184.0 A4.0 4.0 0 1 1 580.0 184.0 L580.0 206.0" stroke="#34d6bd" stroke-width="2.2" fill="none" stroke-linejoin="round"/>
+<path d="M630 206 C658 180, 692 224, 662 236 C640 244, 628 218, 630 206" fill="none" stroke="#60a5fa" stroke-width="2.4"/>
+<circle cx="598" cy="206" r="4" fill="#ff6aa0"/>
+<text x="550.0" y="230.0" font-size="8.5" fill="#34d6bd" font-weight="400" text-anchor="middle">MS2 loops</text>
+<line x1="600.0" y1="212.0" x2="600.0" y2="285.0" stroke="#34d6bd" stroke-width="1.6" stroke-linecap="round"/>
+<rect x="581.8" y="285.5" width="36.5" height="21.0" rx="7.98" ry="7.98" fill="#3a2706" stroke="#fbbf24" stroke-width="2"/>
+<text x="600.0" y="299.4" font-size="10" fill="#fbbf24" font-weight="700" text-anchor="middle">MCP</text>
+<rect x="538.0" y="285.5" width="44.0" height="21.0" rx="7.98" ry="7.98" fill="#06323f" stroke="#34c6e6" stroke-width="2"/>
+<text x="560.0" y="299.1" font-size="9" fill="#34c6e6" font-weight="700" text-anchor="middle">LexA</text>
+<line x1="578.0" y1="296.0" x2="586.0" y2="296.0" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round"/>
+<rect x="581.8" y="319.5" width="36.5" height="21.0" rx="7.98" ry="7.98" fill="#11244a" stroke="#60a5fa" stroke-width="2"/>
+<text x="600.0" y="333.4" font-size="10" fill="#60a5fa" font-weight="700" text-anchor="middle">FHA</text>
+<line x1="600.0" y1="307.0" x2="600.0" y2="319.0" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round"/>
+<line x1="600.0" y1="341.0" x2="600.0" y2="364.0" stroke="#60a5fa" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="2 4"/>
+<ellipse cx="556" cy="366" rx="22" ry="15" fill="#43122a" stroke="#ff6aa0" stroke-width="1.2"/>
+<text x="556.0" y="369.5" font-size="9" fill="#ff6aa0" font-weight="700" text-anchor="middle">pT</text>
+<ellipse cx="644" cy="366" rx="22" ry="15" fill="#43122a" stroke="#ff6aa0" stroke-width="1.2"/>
+<text x="644.0" y="369.5" font-size="9" fill="#ff6aa0" font-weight="700" text-anchor="middle">pT</text>
+<line x1="525.0" y1="360.0" x2="588.0" y2="360.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="525.0" y1="372.0" x2="588.0" y2="372.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="612.0" y1="360.0" x2="675.0" y2="360.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="612.0" y1="372.0" x2="675.0" y2="372.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<path d="M594 354 L603 365 L596 372 L606 383" stroke="#fbbf24" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="940.0" y="100.0" font-size="13" fill="#cbd5e1" font-weight="700" text-anchor="middle">Plasmid assembly</text>
+<text x="940.0" y="117.0" font-size="9" fill="#64748b" font-weight="400" text-anchor="middle" font-style="italic">(proposed)</text>
+<line x1="856.0" y1="158.0" x2="958.0" y2="158.0" stroke="#9aa8c0" stroke-width="4" stroke-linecap="round"/>
+<line x1="904.0" y1="158.0" x2="954.0" y2="158.0" stroke="#60a5fa" stroke-width="4" stroke-linecap="round"/>
+<circle cx="938" cy="158" r="4" fill="#ff6aa0"/>
+<text x="910.0" y="146.0" font-size="8.5" fill="#64748b" font-weight="400" text-anchor="middle">linear donor</text>
+<line x1="938.0" y1="166.0" x2="940.0" y2="300.0" stroke="#94a3b8" stroke-width="1.8" stroke-linecap="round" marker-end="url(#arr)" stroke-dasharray="3 4"/>
+<text x="916.0" y="244.0" font-size="8" fill="#cbd5e1" font-weight="400" text-anchor="end" font-style="italic">templates</text>
+<text x="916.0" y="255.0" font-size="8" fill="#cbd5e1" font-weight="400" text-anchor="end" font-style="italic">the edit</text>
+<path d="M1021.45 234.00 A28 28 0 1 1 986.00 191.75" stroke="#34d6bd" stroke-width="5" fill="none" stroke-linecap="butt"/>
+<path d="M986.0 191.8 A28 28 0 1 1 1021.4 234.0" stroke="#60a5fa" stroke-width="2.4" fill="none" stroke-dasharray="3 3"/>
+<text x="1000.0" y="219.0" font-size="8" fill="#34d6bd" font-weight="400" text-anchor="middle">marker</text>
+<text x="1000.0" y="257.0" font-size="8" fill="#64748b" font-weight="400" text-anchor="middle">new plasmid</text>
+<line x1="960.0" y1="160.0" x2="969.0" y2="208.0" stroke="#94a3b8" stroke-width="1.6" stroke-linecap="round" marker-end="url(#arr)" stroke-dasharray="3 4"/>
+<text x="974.0" y="174.0" font-size="8" fill="#cbd5e1" font-weight="400" text-anchor="start" font-style="italic">templates</text>
+<text x="974.0" y="185.0" font-size="8" fill="#cbd5e1" font-weight="400" text-anchor="start" font-style="italic">synthesis</text>
+<ellipse cx="896" cy="366" rx="22" ry="15" fill="#43122a" stroke="#ff6aa0" stroke-width="1.2"/>
+<text x="896.0" y="369.5" font-size="9" fill="#ff6aa0" font-weight="700" text-anchor="middle">pT</text>
+<ellipse cx="984" cy="366" rx="22" ry="15" fill="#43122a" stroke="#ff6aa0" stroke-width="1.2"/>
+<text x="984.0" y="369.5" font-size="9" fill="#ff6aa0" font-weight="700" text-anchor="middle">pT</text>
+<line x1="865.0" y1="360.0" x2="928.0" y2="360.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="865.0" y1="372.0" x2="928.0" y2="372.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="952.0" y1="360.0" x2="1015.0" y2="360.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="952.0" y1="372.0" x2="1015.0" y2="372.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<path d="M934 354 L943 365 L936 372 L946 383" stroke="#fbbf24" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="260.0" y1="388.0" x2="538.8" y2="426.0" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" marker-end="url(#arr)"/>
+<line x1="600.0" y1="388.0" x2="600.0" y2="426.0" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" marker-end="url(#arr)"/>
+<line x1="940.0" y1="388.0" x2="661.2" y2="426.0" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" marker-end="url(#arr)"/>
+<text x="600.0" y="454.0" font-size="17" fill="#f1f5f9" font-weight="700" text-anchor="middle">MAGESTIC 3.0</text>
+<line x1="536.0" y1="476.0" x2="664.0" y2="476.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="536.0" y1="488.0" x2="664.0" y2="488.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<circle cx="600" cy="482" r="5.5" fill="#ff6aa0"/>
+<text x="600.0" y="506.0" font-size="10.5" fill="#64748b" font-weight="400" text-anchor="middle" font-style="italic">maximal HDR  ·  precise edit</text>
+<text x="40.0" y="542.0" font-size="9" fill="#94a3b8" font-weight="400" text-anchor="start">MCP–LexA(DBD)–FHA — a single fusion protein:  MCP binds MS2 loops  ·  LexA binds the LexO array  ·  FHA binds pT at the break</text>
+<text x="40.0" y="556.0" font-size="9" fill="#64748b" font-weight="400" text-anchor="start" font-style="italic">pT = phospho-threonine (the FHA-binding mark at the Cas9 break)</text>
+<text x="40.0" y="570.0" font-size="9" fill="#64748b" font-weight="400" text-anchor="start" font-style="italic">Plasmid assembly (proposed, mechanism not fully resolved): the one linear donor templates both the genomic edit and synthesis from the marker fragment into a new circular plasmid — without consuming the backbone.   ·   Roy et al., in preparation</text>
+<text x="1192.0" y="581.0" font-size="6" fill="#64748b" font-weight="400" text-anchor="end">editing_mechanism.py · MAGESTIC v3.0.0 · schematic · rendered 2026-06-11</text>
+</g>
+</svg>

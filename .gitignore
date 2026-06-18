@@ -13,3 +13,6 @@ __pycache__/
 # Generated pipeline outputs under reproduce/ (large regenerable data,
 # keep only the source config/run scripts/README/checksums)
 reproduce/*/output/
+.DS_Store
+site/
+**/.DS_Store

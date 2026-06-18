@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MAGESTIC">
+  <defs>
+    <!-- cyan -> indigo cell tile -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00c6ff"/>
+      <stop offset="0.5" stop-color="#0072ff"/>
+      <stop offset="1" stop-color="#101046"/>
+    </linearGradient>
+    <!-- central edit accent -->
+    <linearGradient id="edit" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd166"/>
+      <stop offset="0.5" stop-color="#ff4d8d"/>
+      <stop offset="1" stop-color="#ff2e63"/>
+    </linearGradient>
+    <!-- homology-arm / barcode mint -->
+    <linearGradient id="arm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e6fffb"/>
+      <stop offset="1" stop-color="#5ff0e6"/>
+    </linearGradient>
+    <linearGradient id="strand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#eafdff"/>
+      <stop offset="1" stop-color="#5ff0e6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#ff4d8d" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#ff4d8d" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3.5" flood-color="#06122e" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <!-- cell tile -->
+  <rect x="8" y="8" width="240" height="240" rx="54" ry="54" fill="url(#bg)"/>
+  <!-- top sheen + focal glow at the edit site -->
+  <rect x="8" y="8" width="240" height="120" rx="54" ry="54" fill="#ffffff" opacity="0.06"/>
+  <circle cx="128" cy="118" r="92" fill="url(#glow)"/>
+
+  <!-- genomic duplex with a clean double-strand break (DSB) at the locus -->
+  <g filter="url(#soft)">
+    <rect x="26"  y="156" width="76" height="11" rx="5.5" fill="url(#strand)" opacity="0.95"/>
+    <rect x="154" y="156" width="76" height="11" rx="5.5" fill="url(#strand)" opacity="0.95"/>
+    <rect x="26"  y="174" width="76" height="11" rx="5.5" fill="url(#strand)" opacity="0.6"/>
+    <rect x="154" y="174" width="76" height="11" rx="5.5" fill="url(#strand)" opacity="0.6"/>
+  </g>
+
+  <!-- donor recruited above the cut: teal homology arms flanking the edit -->
+  <g filter="url(#soft)">
+    <rect x="86"  y="86" width="26" height="20" rx="6" fill="url(#arm)"/>
+    <rect x="115" y="80" width="26" height="26" rx="6" fill="url(#edit)"/>
+    <rect x="144" y="86" width="26" height="20" rx="6" fill="url(#arm)"/>
+  </g>
+
+  <!-- recruitment arrows drawing the donor down to bridge the break -->
+  <path d="M99 110 Q104 134 118 152" stroke="#ffe08a" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.95"/>
+  <path d="M157 110 Q152 134 138 152" stroke="#ffe08a" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.95"/>
+
+  <!-- integrated, trackable barcode at the repaired site -->
+  <g filter="url(#soft)">
+    <rect x="104" y="196" width="9"  height="38" rx="3" fill="url(#arm)"/>
+    <rect x="117" y="196" width="6"  height="38" rx="3" fill="#eafdff"/>
+    <rect x="127" y="196" width="11" height="38" rx="3" fill="url(#edit)"/>
+    <rect x="142" y="196" width="7"  height="38" rx="3" fill="url(#strand)"/>
+  </g>
+</svg>

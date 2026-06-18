@@ -1,0 +1,162 @@
+site_name: MAGESTIC
+site_description: "Multiplexed Accurate Genome Editing with Short, Trackable, Integrated Cellular barcodes — CRISPR library design and analysis for functional genomics in yeast"
+site_author: Kevin R. Roy
+site_url: https://magestic.readthedocs.io
+repo_url: https://github.com/k-roy/MAGESTIC
+repo_name: k-roy/MAGESTIC
+edit_uri: edit/master/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  logo: branding/magestic_mark.svg
+  favicon: branding/magestic_favicon.png
+  font:
+    text: Roboto
+    code: Roboto Mono
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - autorefs
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            separate_signature: true
+            docstring_style: google
+            merge_init_into_class: true
+            filters: ["!^_"]
+
+markdown_extensions:
+  - admonition
+  - abbr
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+  - pymdownx.snippets:
+      base_path: ["."]
+  - tables
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/k-roy/MAGESTIC
+  version:
+    provider: mike
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quick Start:
+      - Library Design: quickstart/design.md
+      - Screen Analysis: quickstart/screen.md
+  - Architecture: ARCHITECTURE.md
+  - User Guide:
+      - Overview: user_guide/overview.md
+      - Library Design:
+          - magestic-pam-search: user_guide/commands/pam_search.md
+          - magestic-design-vcf: user_guide/commands/design_vcf.md
+          - magestic-design-saturation: user_guide/commands/design_saturation.md
+      - Analysis Pipelines:
+          - magestic-gdb-pipeline (BC0 QC): user_guide/commands/gdb_pipeline.md
+          - magestic-bc1-link (BC1 linking): user_guide/commands/bc1_link.md
+          - magestic-screen-analysis: user_guide/commands/screen_analysis.md
+          - magestic-redi (clone arrays): user_guide/commands/redi.md
+      - Annotation Utilities:
+          - magestic-harmonize-oligos: user_guide/commands/harmonize_oligos.md
+          - magestic-annotate-deseq2: user_guide/commands/annotate_deseq2.md
+      - HPC / SLURM: user_guide/hpc_slurm.md
+  - Pipelines:
+      - Overview: pipelines/overview.md
+      - Guide-Donor-BC0 (plasmid QC): pipelines/guide_donor_bc0.md
+      - BC1-Donor-BC0 (linking): pipelines/bc1_donor_bc0.md
+      - BC1 Screen Analysis: pipelines/bc1_from_screen.md
+      - REDI (clone arrays): pipelines/redi.md
+  - Algorithms:
+      - Overview: algorithms/overview.md
+      - PAM Search & Off-Target: algorithms/pam_search.md
+      - Guide Selection: algorithms/guide_selection.md
+      - Donor Assembly: algorithms/donor_assembly.md
+      - Saturation Design: algorithms/saturation_design.md
+      - Barcode Collapse & Error Correction: algorithms/barcode_collapse.md
+      - Donor-to-Oligo Matching: algorithms/oligo_matching.md
+      - Tiered Hit Calling (DESeq2): algorithms/hit_calling.md
+      - REDI Colony Purity: algorithms/redi_purity.md
+  - Projects:
+      - NRD1 Alanine Scan: projects/nrd1.md
+      - Variant Effect Prediction: projects/vep.md
+  - Reference:
+      - Coordinate Systems: coordinate_system.md
+      - Known Issues: known_issues.md
+      - "Overlapping-Gene Coordinate Bug": overlapping_gene_coordinate_bug.md
+      - Troubleshooting: troubleshooting.md
+  - API Reference:
+      - Overview: api/index.md
+      - magestic.design: api/design.md
+      - magestic.genomics: api/genomics.md
+      - magestic.utils: api/utils.md
+      - magestic.plotting: api/plotting.md
+      - magestic.pipelines: api/pipelines.md
+  - Changelog: changelog.md
+  - Contributing: contributing.md
