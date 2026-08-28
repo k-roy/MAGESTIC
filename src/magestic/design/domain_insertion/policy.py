@@ -41,14 +41,31 @@ Retired from v1, deliberately: `rank_key`, `LAMBDA_DEFAULT`, `CLIFF`, `is_blocke
 `insertion-v1`; `git show insertion-v1:src/magestic/design/domain_insertion/policy.py` is the
 whole of it, which is why no shadow copy is kept beside this file.
 """
+import math
 from dataclasses import dataclass, field
 
 from .designer import (design_oligo, protospacer_span, spans_insertion,
                        insertion_separates_pam, alternatives, codons_in_window)
 from .guides import guides_near
+from . import score
 from .score import design_score
 
 MAX_DISTANCE = 30
+
+# --- the indistinguishability band (Kevin, 2026-08-28) -------------------------------------------
+# Two designs whose scores differ by less than this are treated as TIED and ordered by the explicit
+# preference in `design_position` instead. `677`/`685` measured why this is necessary: `P_eff` takes
+# only 4 distinct values and `P_dist` is flat inside the plateau -- both deliberately, so the
+# fewest-codons rule can decide -- but `(1 - sv)` takes 4,635 values and therefore never ties. On
+# 17.9 % of contested positions every informative factor tied and `sv` alone picked the winner,
+# which produced 5,483 STRICTLY DOMINATED designs (`682`) and ~17,000 that took a lower-efficacy
+# guide for no stated reason (`680`).
+#
+# 🔴 THE VALUE IS BOUNDED BY THE CALIBRATION, NOT CHOSEN FOR EFFECT. The smallest gap between
+# adjacent `P_eff` levels is 0.8304 -> 0.8370, i.e. 0.79 %. Staying strictly below that guarantees
+# the band can never swallow a distinction the calibration actually draws; it only catches designs
+# the score genuinely cannot separate.
+SCORE_TOLERANCE = 0.005          # relative, in LINEAR score
 
 # --- the enumeration axes ------------------------------------------------------------------------
 # Every combination is generated for every guide and scored. These are NOT settings.
@@ -222,7 +239,40 @@ def design_position(model, chrom_seq, residue, spec, *, usage, allowed_guides, s
         # `variants` is built in a fixed order (guides_near order, then the fixed combo order), so
         # the final fallback is deterministic.
         order = {id(v): i for i, v in enumerate(variants)}
-        best = min(variants, key=lambda v: (-v.score, v.design.net_recoded, order[id(v)]))
+        top = max(v.score for v in variants)
+        # scores are logs, so a relative linear tolerance is an additive offset here
+        floor = top + math.log(1.0 - SCORE_TOLERANCE)
+        band = [v for v in variants if v.score >= floor]
+
+        # 🔴 PLATEAU-AWARE, and the `max(..., PLATEAU)` is the whole trick. `score.p_dist` is FLAT
+        # through PLATEAU nt BY MEASUREMENT (`670`: Cochran-Armitage z = -1.55, p = 0.12,
+        # n = 1,777), so ranking on a cut difference INSIDE that band would assert a difference we
+        # tested for and did not find -- the same error as `662`'s interpolated curve, just moved
+        # into the tie-break. Clamping every sub-plateau cut to one value makes them tie, so they
+        # fall through to raw efficacy; cuts that genuinely leave the plateau still rank.
+        #
+        # Kevin, 2026-08-28, choosing this over a plain "closest cut" second key: it "honors the
+        # ordering wherever distance is a measured difference, and declines to rank on it where we
+        # tested and found none." Measured, the two differ at 13,192 positions, 99.9 % of them
+        # inside the plateau (`686`).
+        #
+        # RAW efficacy, not `P_eff`: inside the band the calibrated value carries no information --
+        # that is what put the design in the band. Calibration strips efficacy's false SCALE, not
+        # its ranking power (AUC 0.626 for a correct edit -- weak, but real and non-zero), so the
+        # raw score is the right last resort once codons and real distance are spent.
+        plateau = score.PDIST_BINS[0][0]
+
+        def _prefer(v):
+            d = v.design
+            cut = abs(d.cut_distance)
+            eff = -1.0 if d.efficacy is None else float(d.efficacy)
+            return (d.net_recoded,          # 1. fewest recoded codons
+                    max(cut, plateau),      # 2. closest cut, but only outside the flat plateau
+                    -eff,                   # 3. highest RAW predicted efficacy
+                    cut,                    # 4. closest cut, now including inside the plateau
+                    order[id(v)])           # 5. deterministic fallback
+
+        best = min(band, key=_prefer)
         best.chosen = True
     design = None if best is None else best.design
     if return_candidates:
