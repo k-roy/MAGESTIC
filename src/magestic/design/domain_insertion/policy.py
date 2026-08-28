@@ -195,15 +195,24 @@ def design_position(model, chrom_seq, residue, spec, *, usage, allowed_guides, s
     for v in variants:
         d = v.design
         v.wm_in_gap = wm_in_gap(d, window, ins, codons, usage)
-        v.score = design_score(d.efficacy, d.sv_score, d.net_recoded, v.wm_in_gap)
+        v.score = design_score(d.efficacy, d.sv_score, d.net_recoded, v.wm_in_gap,
+                               cut_distance=d.cut_distance)
 
     best = None
     if variants:
         # TIE-BREAK: score first, then FEWEST recoded codons, then enumeration order.
         #
-        # 🔴 The codon tie-break is not cosmetic. `P_tract` is FLAT through the knot, so a 1-codon
-        # and a 3-codon design at the same guide score IDENTICALLY -- and enumeration order alone
-        # would hand the win to whichever axis happened to come first (it picked the 3-codon one).
+        # 🔴 The codon tie-break is not cosmetic, and 2026-08-28 made it LOAD-BEARING rather than
+        # a corner case. `P_tract` is FLAT through the knot, so a 1-codon and a 3-codon design at
+        # the same guide score IDENTICALLY -- and enumeration order alone would hand the win to
+        # whichever axis happened to come first (it picked the 3-codon one).
+        #
+        # `score.p_eff` now quantises efficacy to the four levels its calibration can actually
+        # resolve, and `score.p_dist` is FLAT through 5 nt by measurement. Both changes CREATE
+        # ties on purpose, so this line decides 63.1 % of the below-knot positions where raw
+        # efficacy previously decided 98.5 % of them on differences finer than the data
+        # (`671`). Anything that reintroduces a spurious slope in either factor silently
+        # disables it -- that is why `662`'s interpolated P_dist was not shipped (`670`).
         # Every recoded codon is a real edit whose risks the score does not fully see: off-target
         # consequences, a partially-copied multi-SNV codon that need not stay synonymous (`86`),
         # and simply more that can go wrong. Where the model is indifferent, do less.
