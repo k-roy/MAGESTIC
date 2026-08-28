@@ -1,294 +1,221 @@
 """
-Guide-selection policy for the essentialome AsLOV2 library.
+Guide-donor design policy for the AsLOV2 insertion library -- SINGLE PASS.
 
-Installed as `magestic/design/domain_insertion/policy.py` (2026-07-30, Kevin: *"Apply arm F at
-lambda 0.02 and regenerate the figures"*). The master copy lives in this workspace at
-`planning/120_policy.py`; `120_apply_arm_f.py` installs it and patches the designer.
+Kevin, 2026-08-27: *"a single, clean, updated version of the magestic guide-donor design code for
+the insertion module arm of the package that will produce the best version of the library on one
+go, without needing multiple passes."*
 
-`design_oligo` returns the FIRST guide that yields any design, ordered by distance bucket then
-predicted quality. `118` measured what that costs, and this module replaces it with the policy that
-won:
+THE CONSTRUCTION, and the property it buys
+------------------------------------------
+    every capability ENLARGES the candidate set, and the choice is argmax of ONE scalar over it
 
-  gate 1  Trp/Met-BLOCKED  (WT-identical run >= 3 nt between the cassette and the nearest SNV;
-                            `102`/`103`: 22-25 % partial incorporation vs 2-4 % at <= 2)
-  gate 2  >= 7 recoded codons  (`101` NE cliff, `108b` editing efficiency, `103` WGS replication)
-  then    maximise  quality - lam * net_recoded,  quality = efficacy - SV   (`guide_quality`)
+so adding a capability cannot lower the maximum. "v2 is never worse than v1" is therefore a
+property of the construction, checkable inside a single run
+(`design_position(..., return_candidates=True)` exposes every variant it considered), rather than
+something established by building the library twice and diffing it.
 
-Both gates are PURITY failures -- an unedited or partially-edited locus reads as "no phenotype" and
-no sequencing depth recovers it (HANDOFF, "abundance and PURITY are NOT one currency"). Everything
-below them is an abundance trade, which is what `lam` prices.
+🔴 THE GUARANTEE IS IN THE NEW SCORE, NOT THE OLD ONE. v2 will produce designs that are worse under
+the retired `q - 0.02*net_recoded` at some positions. That is intended: `648` measured that
+lam = 0.02 is right at 4 recoded codons and wrong on both sides -- the first three codons are FREE
+(implied lam is NEGATIVE) and ten codons cost 0.13/codon, six times what lam charged.
 
-`lam` = 0.02 efficacy-units per recoded codon, from Kevin's own bound (2026-07-30): *"If we need 10
-codons of recoding to get a 0.95 guide, but another guide with 0.84 sits close by, seems better to
-go with the 0.84"* => 10 codons must outweigh 0.11 efficacy (lam > 0.011), and one codon must not
-flip a 0.11 gap (lam < 0.11). `118`'s sweep confirmed the lower bound empirically: at lam = 0.01 the
->= 7-codon fraction rose to 8.44 %, WORSE than the unfixed designer's 7.21 %.
+WHAT V1 DID AND WHY IT NEEDED TWO PASSES
+----------------------------------------
+Four places SUBSTITUTED a design instead of ADDING a candidate, and the ranking could veto on a
+boolean (`planning/653` §2):
 
-Measured on 5,000 positions (`118`, arm F lam=0.02) against the stock designer:
+  1. `rank_key` was lexicographic -- (blocked, net_recoded >= CLIFF, -(q - lam*nr)). A q = 0.931
+     design sorted BELOW a q = 0.476 one at YEL002C res283 because one mandatory cloning-site strip
+     codon tripped `is_blocked` (`planning/643`).
+  2. `credit_pam_separated` REPLACED a guide's design, so the uncredited design for that same guide
+     became unreachable -- the shipped design was not in the new candidate set at all.
+  3. `stepped_design` tried min_disruption 4 -> 3 -> 2 and RETURNED THE FIRST under the cliff.
+  4. the donor slide returned the first that worked.
 
-    designable  95.40 -> 97.18 %      blocked   2.516 -> 0.412 %
-    >= 7 codons  7.212 -> 4.384 %     codons     3.829 -> 2.672
-    efficacy    0.8603 -> 0.8873
+`GUIDE_LOCAL_FALLBACK` was invented to patch (2) by re-deriving and comparing -- the two-pass
+pattern inside the designer. Here (1) is fixed by `score.design_score`, and (2) and (3) become
+enumeration axes. (4) is NOT enumerated; see `SLIDE_IS_NOT_ENUMERATED` below.
 
-Better on every axis at once. It also strictly dominates the pure-scalar arm (E) and the banded arm
-(D): same gates as D, yet fewer codons AND higher efficacy.
+Retired from v1, deliberately: `rank_key`, `LAMBDA_DEFAULT`, `CLIFF`, `is_blocked`,
+`TWO_HURDLE_BLOCK`, `GUIDE_LOCAL_FALLBACK`, `stepped_design`. v1 is preserved in git at tag
+`insertion-v1`; `git show insertion-v1:src/magestic/design/domain_insertion/policy.py` is the
+whole of it, which is why no shadow copy is kept beside this file.
 """
-from .designer import design_oligo
-from .guides import guide_quality, guides_near
+from dataclasses import dataclass, field
 
-CLIFF = 7                    # `101`/`103`/`108b`: NE and editing efficiency break at >= 7 codons
-BLOCK_GAP = 3                # `102`/`103`: WT gap >= 3 nt beside the cassette is the blocked state
-LAMBDA_DEFAULT = 0.02        # efficacy-units per recoded codon (`118` arm F)
-MIN_DISRUPTION_STEPS = (4, 3, 2)
+from .designer import (design_oligo, protospacer_span, spans_insertion,
+                       insertion_separates_pam, alternatives, codons_in_window)
+from .guides import guides_near
+from .score import design_score
+
 MAX_DISTANCE = 30
 
+# --- the enumeration axes ------------------------------------------------------------------------
+# Every combination is generated for every guide and scored. These are NOT settings.
+CREDIT_VARIANTS = (False, True)          # `576`: credit a PAM-separated guide as self-disrupting
+MIN_DISRUPTION_VARIANTS = (4, 3, 2)      # `112` clause 3 -- all of them, not first-success
+JUNCTION_RECODE_VARIANTS = (False, True)  # `621`(C): recode a cloning site across an oligo junction
 
-def gap_beside_cassette(design, window, ins):
-    """WT-identical nt between the cassette and the nearest recoded base.
+# 🔴 NOT ENUMERATED, stated so it is not mistaken for covered. The donor slide (17 offsets) is
+# chosen inside `design_oligo` by `_slide_anchor_score`, which is a principled criterion (maximise
+# uninterrupted distal homology), not a first-success accident. Enumerating it would multiply the
+# search by ~17 for a axis that is already optimised. The argmax below therefore covers
+# guide x credit x min_disruption x junction_recode, and NOT slide.
+SLIDE_IS_NOT_ENUMERATED = True
 
-    This is the `82`/`102` connectivity metric: a conversion tract can copy an SNV WITHOUT reaching
-    the insertion, destroying the protospacer while leaving the cassette uninstalled -- a clone that
-    looks quietly wild type. Returns a 99 sentinel when there is no SNV at all.
+# The Trp/Met missense bridge (`627`(E)) is a LAST RESORT and a DIFFERENT CONSTRUCT CLASS, never a
+# silent winner: a lethal W->Y otherwise reads as "AsLOV2 not tolerated at this residue"
+# (`621` §21, `151` §5). It is tried only when nothing else designs, and the result is labelled.
+NO_SYN_CODONS = ("TGG", "ATG")
+
+
+@dataclass
+class Variant:
+    """One reachable design for one guide, with how it was produced."""
+    design: object
+    protospacer: str
+    guide: object
+    credit: bool
+    min_disruption: int
+    junction_recode: bool
+    wm_missense_bridge: bool = False
+    score: float = float("-inf")
+    wm_in_gap: int = 0
+    chosen: bool = False
+
+    @property
+    def label(self):
+        bits = []
+        if self.credit:
+            bits.append("credit")
+        if self.junction_recode:
+            bits.append("jr")
+        if self.wm_missense_bridge:
+            bits.append("wm")
+        bits.append("md%d" % self.min_disruption)
+        return "+".join(bits)
+
+
+def wm_in_gap(design, window, ins, codons, usage):
+    """UNRECODABLE codons in the wild-type run between the cassette and the nearest edit.
+
+    This is the `102` mechanism and the input to `score.p_fidelity`: a Trp/Met that CANNOT be
+    recoded forces a wild-type gap a conversion tract can stop inside, giving partial incorporation
+    -- the cassette absent while the recoding is present. A gap the designer merely CHOSE not to
+    fill is a different object; this counts only the ones it could not.
     """
     n_left, n_right = len(design.left_arm), len(design.right_arm)
     nat_l, nat_r = window[ins - n_left:ins], window[ins:ins + n_right]
-    g_r = next((j for j, (a, b) in enumerate(zip(design.right_arm, nat_r)) if a != b), None)
-    g_l = next((j for j, (a, b) in enumerate(zip(design.left_arm[::-1], nat_l[::-1])) if a != b), None)
-    found = [g for g in (g_r, g_l) if g is not None]
-    return min(found) if found else 99
-
-
-def is_blocked(design, gap):
-    """A design with ZERO recoded bases is NOT blocked -- it is the opposite.
-
-    The hazard is a tract copying an SNV without the cassette; with no SNV to copy, the only way to
-    destroy the site is to install the cassette, so coupling is perfect. `gap_beside_cassette`
-    returns its 99 sentinel in that case and must not be read as a large gap.
-    """
-    return design.net_recoded > 0 and gap >= BLOCK_GAP
-
-
-# --- `618` two-hurdle block rule (Kevin, 2026-08-21). DEFAULT OFF. -------------------------------
-TWO_HURDLE_BLOCK = False     # flip to True to use hazard_blocked() instead of is_blocked()
-
-
-def hazardous_edits(design, window, ins, guide_length):
-    """Window-frame indices of the changed bases that clear BOTH hurdles.
-
-    hurdle 1 -- NOT shielded: |edit - cut| <= |insertion - cut|. Incorporation is first-come,
-                first-served outward from the cut, so an edit further from the cut than the
-                insertion cannot be copied without the cassette, whatever the wild-type gap.
-    hurdle 2 -- inside protospacer+PAM, so it can block re-cleavage. Outside that window the site
-                stays cuttable and is simply re-cut until the insertion lands.
-    """
-    from .designer import protospacer_span
-    n_left, n_right = len(design.left_arm), len(design.right_arm)
-    nat_l = window[ins - n_left:ins]
-    nat_r = window[ins:ins + n_right]
-    changed = [ins - 1 - j for j, (a, b) in enumerate(zip(design.left_arm[::-1], nat_l[::-1])) if a != b]
-    changed += [ins + j for j, (a, b) in enumerate(zip(design.right_arm, nat_r)) if a != b]
-    if not changed:
-        return []
-    cut = ins + design.cut_distance                      # cut junction, window frame
-    d_ins = abs(design.cut_distance)                     # insertion's distance from the cut
-    p_lo, p_hi = protospacer_span(design.guide, guide_length)
-    return [i for i in changed
-            if abs(i - cut) <= d_ins                     # hurdle 1 failed: not shielded
-            and p_lo <= i < p_hi]                        # hurdle 2 failed: blocks re-cleavage
-
-
-def hazard_gap(design, window, ins, guide_length):
-    """Distance from the cassette to the nearest HAZARDOUS edit; 99 sentinel when there is none.
-
-    Same 99 convention as `gap_beside_cassette`, and the same trap: 99 means "no hazard", NOT
-    "a very large gap". `hazard_blocked` reads it only together with the emptiness test.
-    """
-    haz = hazardous_edits(design, window, ins, guide_length)
-    if not haz:
-        return 99, 0
-    n_left = len(design.left_arm)
-    gaps = [(i - ins) if i >= ins else (ins - 1 - i) for i in haz]
-    return min(gaps), len(haz)
-
-
-def hazard_blocked(design, window, ins, guide_length):
-    """Two-hurdle replacement for `is_blocked`.
-
-    Blocked only when a hazardous edit exists AND it is disconnected from the cassette
-    (>= BLOCK_GAP). An in-protospacer edit that `_connect_edits_to_insertion` chained back to the
-    insertion has gap <= MAX_GAP_DEFAULT and stays unblocked -- so this keeps rejecting exactly the
-    configuration the guard exists for, including the post-final-strip case.
-    """
-    gap, n = hazard_gap(design, window, ins, guide_length)
-    return n > 0 and gap >= BLOCK_GAP
-
-
-# --- `621` (B) guide-local fallback = Kevin's rule (c). DEFAULT OFF. -----------------------------
-# "When an improved design is rejected for any reason, use that guide's PREVIOUS design rather than
-#  a different one."  With (A) and (C) in place this should rarely fire; its value is as a general
-#  backstop, so no change of this kind can silently make a position worse than what already ships.
-#
-# 🔴 Kevin asked for the FIRE COUNT (2026-08-22).  A module-level counter is useless in a 400-task
-# array, so the runner MUST dump `fallback_report()` per chunk -- see `622`.
-GUIDE_LOCAL_FALLBACK = False
-
-import collections as _collections
-FALLBACK_COUNTS = _collections.Counter()
-
-
-def fallback_reset():
-    FALLBACK_COUNTS.clear()
-
-
-def fallback_report():
-    """Plain dict, safe to json.dump per chunk."""
-    return dict(FALLBACK_COUNTS)
-
-
-def _glf_recover(rec, model, chrom_seq, residue, spec, usage, scores, slide_range,
-                 max_distance, window, ins):
-    """Replace `rec` in place with the guide's UNCREDITED design when that ranks better.
-
-    Reasons counted separately, because they mean different things:
-      no_design      the credited design does not exist at all (the `604` junction class)
-      blocked        the credited design exists but `is_blocked`/`hazard_blocked` fires (`599`)
-      outranked_check the credited design is fine; compared anyway (the `627` unconditional arm --
-                     this is the one that catches HCA4-style rank reordering)
-      taken          the uncredited design was actually adopted
-      kept_credited  the uncredited design existed but did not rank better -- no change
-      unavailable    neither state yields a design; nothing to fall back to
-    """
-    d_c = rec["design"]
-    reason = ("no_design" if d_c is None
-              else "blocked" if rec.get("blocked") else "outranked_check")
-    FALLBACK_COUNTS["considered"] += 1
-    FALLBACK_COUNTS["considered_" + reason] += 1
-
-    d_u, md_u = stepped_design(model, chrom_seq, residue, spec, usage=usage,
-                               allowed_guides={rec["protospacer"]}, scores=scores,
-                               slide_range=slide_range, max_distance=max_distance,
-                               credit_pam_separated=False)
-    if d_u is None:
-        FALLBACK_COUNTS["unavailable"] += 1
-        return
-    alt = {"guide": rec["guide"], "protospacer": rec["protospacer"], "design": d_u,
-           "min_disruption_used": md_u, "quality": rec["quality"]}
-    alt["gap"] = gap_beside_cassette(d_u, window, ins)
-    if TWO_HURDLE_BLOCK:
-        alt["hazard_gap"], alt["n_hazard"] = hazard_gap(d_u, window, ins, spec.guide_length)
-        alt["blocked"] = hazard_blocked(d_u, window, ins, spec.guide_length)
+    chg = [ins - 1 - j for j, (a, b) in enumerate(zip(design.left_arm[::-1], nat_l[::-1])) if a != b]
+    chg += [ins + j for j, (a, b) in enumerate(zip(design.right_arm, nat_r)) if a != b]
+    if not chg:
+        return 0
+    right = [i for i in chg if i >= ins]
+    left = [i for i in chg if i < ins]
+    if design.cut_distance >= 0:
+        near = min(right) if right else None
+        span = set(range(ins, near)) if near is not None else set()
     else:
-        alt["blocked"] = is_blocked(d_u, alt["gap"])
-    alt["net_recoded"] = d_u.net_recoded
-    if d_c is None or rank_key(alt) < rank_key(rec):
-        alt["credit_fallback"] = True
-        rec.clear()
-        rec.update(alt)
-        FALLBACK_COUNTS["taken"] += 1
-        FALLBACK_COUNTS["taken_" + reason] += 1
-    else:
-        FALLBACK_COUNTS["kept_credited"] += 1
+        near = max(left) if left else None
+        span = set(range(near + 1, ins)) if near is not None else set()
+    if not span:
+        return 0
+    n = 0
+    for c in codons:
+        if c.is_split or not any(i in span for i in c.indices):
+            continue
+        cur = "".join(window[i] for i in c.indices).upper()
+        if cur in NO_SYN_CODONS or not [a for a in alternatives(cur, usage) if a != cur]:
+            n += 1
+    return n
 
 
-def stepped_design(model, chrom_seq, residue, spec, *, usage, allowed_guides, scores,
-                   slide_range, max_distance=MAX_DISTANCE, credit_pam_separated=False):
-    """`112` clause 3: design at min_disruption 4; if the result needs >= CLIFF codons, retry at 3
-    then 2 and take the first that clears the cliff. NOT a blanket relaxation -- `99`'s exchange
-    rate (1 codon ~ 1.4 disruption points) makes that a net loss; it only pays where it crosses the
-    cliff, which the linear rate does not price. Returns (design_or_None, min_disruption_used)."""
-    best, used = None, None
-    for md in MIN_DISRUPTION_STEPS:
-        d = design_oligo(model, chrom_seq, residue, spec, usage=usage, max_distance=max_distance,
-                         min_disruption=md, allowed_guides=allowed_guides, scores=scores,
-                         slide_range=slide_range, credit_pam_separated=credit_pam_separated)
-        if d is not None and best is None:
-            best, used = d, md
-        if d is not None and d.net_recoded < CLIFF:
-            return d, md
-    return best, used
+def design_variants(model, chrom_seq, residue, spec, *, usage, protospacer, scores, slide_range,
+                    max_distance=MAX_DISTANCE, allow_wm_bridge=False):
+    """EVERY design reachable for ONE guide, deduped by oligo.
 
-
-def evaluate_candidates(model, chrom_seq, residue, spec, *, usage, allowed_guides, scores,
-                        slide_range, max_distance=MAX_DISTANCE, flank=200,
-                        credit_pam_separated=False):
-    """Force each candidate guide in turn and return what each would actually produce.
-
-    Yields one record per candidate within `max_distance`, in `guides_near` order (proximity, then
-    strand, then PAM index) -- the order matters, because ranking ties are broken by it.
+    Replaces v1's `stepped_design`, which returned the FIRST min_disruption under the cliff and
+    threw the rest away. Nothing is filtered here -- filtering is what made a capability able to
+    make a position worse. Scoring happens in `design_position`.
     """
-    window, c_idx, _, _ = model.window_with_coords(
-        chrom_seq, model.cds_to_genomic(residue * 3), flank)
-    ins = c_idx + 1
-    out = []
-    for g in guides_near(window, ins, max_distance, guide_length=spec.guide_length):
-        p = g.protospacer
-        if allowed_guides is not None and p not in allowed_guides:
-            continue                                  # off-target screen: the precomputed set
-        d, md = stepped_design(model, chrom_seq, residue, spec, usage=usage,
-                               allowed_guides={p}, scores=scores, slide_range=slide_range,
-                               max_distance=max_distance,
-                               credit_pam_separated=credit_pam_separated)
-        rec = {"guide": g, "protospacer": p, "design": d, "min_disruption_used": md,
-               "quality": guide_quality(p, scores)}
-        if d is not None:
-            rec["gap"] = gap_beside_cassette(d, window, ins)
-            if TWO_HURDLE_BLOCK:
-                rec["hazard_gap"], rec["n_hazard"] = hazard_gap(d, window, ins, spec.guide_length)
-                rec["blocked"] = hazard_blocked(d, window, ins, spec.guide_length)
-            else:
-                rec["blocked"] = is_blocked(d, rec["gap"])
-            rec["net_recoded"] = d.net_recoded
-        # `627` (Kevin, 2026-08-22): UNCONDITIONAL both-ways comparison. The conditional form
-        # (only when the credited design is None or blocked) covered every regression that had
-        # actually OCCURRED, but `612` §6 was explicit that this shows the case did not occur, not
-        # that it cannot -- and `623` then produced one: YJL033W_HCA4_res537, where the credited
-        # design was neither None nor blocked, merely OUTRANKED after crediting reordered the
-        # candidates (efficacy 0.624 -> 0.255). Comparing both states for EVERY candidate makes
-        # `min(ON) <= min(OFF)` in `rank_key` hold by construction, which is the actual proof.
-        if GUIDE_LOCAL_FALLBACK and credit_pam_separated:
-            _glf_recover(rec, model, chrom_seq, residue, spec, usage, scores, slide_range,
-                         max_distance, window, ins)
-        out.append(rec)
-    return out, window, ins
-
-
-def rank_key(rec, lam=LAMBDA_DEFAULT):
-    """Arm F. Lower sorts better. Only call on records whose design is not None."""
-    q = rec["quality"]
-    q = 0.0 if q is None else q
-    return (bool(rec["blocked"]),
-            1 if rec["net_recoded"] >= CLIFF else 0,
-            -(q - lam * rec["net_recoded"]))
+    out, seen = [], set()
+    combos = [(c, md, jr)
+              for c in CREDIT_VARIANTS
+              for md in MIN_DISRUPTION_VARIANTS
+              for jr in JUNCTION_RECODE_VARIANTS]
+    if allow_wm_bridge:
+        combos = [(c, md, jr) for c in CREDIT_VARIANTS
+                  for md in MIN_DISRUPTION_VARIANTS for jr in (True,)]
+    for credit, md, jr in combos:
+        d = design_oligo(model, chrom_seq, residue, spec, usage=usage,
+                         max_distance=max_distance, min_disruption=md,
+                         allowed_guides={protospacer}, scores=scores, slide_range=slide_range,
+                         credit_pam_separated=credit, junction_recode=jr,
+                         wm_missense_bridge=(True if allow_wm_bridge else None))
+        if d is None or d.oligo in seen:
+            continue
+        seen.add(d.oligo)
+        out.append(Variant(design=d, protospacer=protospacer, guide=d.guide, credit=credit,
+                           min_disruption=md, junction_recode=jr,
+                           wm_missense_bridge=bool(allow_wm_bridge)))
+    return out
 
 
 def design_position(model, chrom_seq, residue, spec, *, usage, allowed_guides, scores,
-                    slide_range, max_distance=MAX_DISTANCE, lam=LAMBDA_DEFAULT, flank=200,
-                    return_candidates=False, credit_pam_separated=False):
-    """Design one position under the `118` arm-F policy.
+                    slide_range, max_distance=MAX_DISTANCE, flank=200,
+                    return_candidates=False, allow_wm_bridge=True):
+    """Design one position: argmax of `score.design_score` over guides x variants.
 
-    Returns (design, min_disruption_used) -- or (design, min_disruption_used, candidates, window,
-    ins) when `return_candidates` is set, which is what the `119` figures use to label every
-    candidate PAM with the design it would have given.
+    Returns (design, variant) -- or (design, variant, variants, window, ins) with
+    `return_candidates`, which is what the property test and the figures read.
     """
-    # 🔴 NOTE FOR POOLS 1/2: `rank_key` scores candidates partly by `net_recoded`, so crediting a
-    # PAM-separated guide does not merely shrink recoding -- it can REORDER the candidates and pick a
-    # different guide. That is a larger blast radius than the heterologous pools, where scores=None
-    # and ordering is pure proximity. Every changed oligo must therefore be audited, not assumed.
-    cands, window, ins = evaluate_candidates(
-        model, chrom_seq, residue, spec, usage=usage, allowed_guides=allowed_guides,
-        scores=scores, slide_range=slide_range, max_distance=max_distance, flank=flank,
-        credit_pam_separated=credit_pam_separated)
-    usable = [c for c in cands if c["design"] is not None]
-    # `sorted` is stable, so ties fall back to guides_near order -- deterministic, and the same
-    # order `118` measured.
-    usable.sort(key=lambda c: rank_key(c, lam))
-    best = usable[0] if usable else None
-    if best is not None:
-        best["chosen"] = True
-    design = None if best is None else best["design"]
-    used = None if best is None else best["min_disruption_used"]
+    window, c_idx, _, cds_pos = model.window_with_coords(
+        chrom_seq, model.cds_to_genomic(residue * 3), flank)
+    ins = c_idx + 1
+    codons = codons_in_window(cds_pos)
+
+    variants = []
+    for g in guides_near(window, ins, max_distance, guide_length=spec.guide_length):
+        if allowed_guides is not None and g.protospacer not in allowed_guides:
+            continue                                   # off-target screen: the precomputed set
+        variants.extend(design_variants(
+            model, chrom_seq, residue, spec, usage=usage, protospacer=g.protospacer,
+            scores=scores, slide_range=slide_range, max_distance=max_distance))
+
+    # LAST RESORT ONLY, and labelled: the W/M missense bridge is a different construct class.
+    if not variants and allow_wm_bridge:
+        for g in guides_near(window, ins, max_distance, guide_length=spec.guide_length):
+            if allowed_guides is not None and g.protospacer not in allowed_guides:
+                continue
+            variants.extend(design_variants(
+                model, chrom_seq, residue, spec, usage=usage, protospacer=g.protospacer,
+                scores=scores, slide_range=slide_range, max_distance=max_distance,
+                allow_wm_bridge=True))
+
+    for v in variants:
+        d = v.design
+        v.wm_in_gap = wm_in_gap(d, window, ins, codons, usage)
+        v.score = design_score(d.efficacy, d.sv_score, d.net_recoded, v.wm_in_gap)
+
+    best = None
+    if variants:
+        # TIE-BREAK: score first, then FEWEST recoded codons, then enumeration order.
+        #
+        # 🔴 The codon tie-break is not cosmetic. `P_tract` is FLAT through the knot, so a 1-codon
+        # and a 3-codon design at the same guide score IDENTICALLY -- and enumeration order alone
+        # would hand the win to whichever axis happened to come first (it picked the 3-codon one).
+        # Every recoded codon is a real edit whose risks the score does not fully see: off-target
+        # consequences, a partially-copied multi-SNV codon that need not stay synonymous (`86`),
+        # and simply more that can go wrong. Where the model is indifferent, do less.
+        # This is Kevin's call at MRD1 res554 / WBP1 res283, 2026-08-27: "the insertion alone is
+        # enough to disrupt this guide ... remove the syn codons altogether."
+        #
+        # `variants` is built in a fixed order (guides_near order, then the fixed combo order), so
+        # the final fallback is deterministic.
+        order = {id(v): i for i, v in enumerate(variants)}
+        best = min(variants, key=lambda v: (-v.score, v.design.net_recoded, order[id(v)]))
+        best.chosen = True
+    design = None if best is None else best.design
     if return_candidates:
-        for c in cands:
-            c.setdefault("chosen", False)
-        return design, used, cands, window, ins
-    return design, used
+        return design, best, variants, window, ins
+    return design, best

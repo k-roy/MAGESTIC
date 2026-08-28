@@ -954,6 +954,29 @@ def _strip_disallowed(window_list, codons, lo, hi, usage, recoded, ins=None, win
     return False
 
 
+def _design_oligo_with_wm(model, chrom_seq, residue, spec, genome, max_distance, usage, flank,
+                          max_offtargets, min_disruption, recode_cut_to_insertion, allowed_guides,
+                          scores, sv_weight, sv_max, require_score, distance_buckets, reasons,
+                          prefer_spanning, slide_range, protect_boundary_codons,
+                          credit_pam_separated, junction_recode, wm_missense_bridge):
+    """Run `design_oligo` with WM_MISSENSE_BRIDGE forced, restoring it unconditionally."""
+    global WM_MISSENSE_BRIDGE
+    _saved = WM_MISSENSE_BRIDGE
+    WM_MISSENSE_BRIDGE = bool(wm_missense_bridge)
+    try:
+        return design_oligo(
+            model, chrom_seq, residue, spec, genome=genome, max_distance=max_distance, usage=usage,
+            flank=flank, max_offtargets=max_offtargets, min_disruption=min_disruption,
+            recode_cut_to_insertion=recode_cut_to_insertion, allowed_guides=allowed_guides,
+            scores=scores, sv_weight=sv_weight, sv_max=sv_max, require_score=require_score,
+            distance_buckets=distance_buckets, reasons=reasons, prefer_spanning=prefer_spanning,
+            slide_range=slide_range, protect_boundary_codons=protect_boundary_codons,
+            credit_pam_separated=credit_pam_separated, junction_recode=junction_recode,
+            wm_missense_bridge=None)
+    finally:
+        WM_MISSENSE_BRIDGE = _saved
+
+
 def design_oligo(model, chrom_seq, residue, spec: OligoSpec, genome=None,
                  max_distance: int = 30, usage: dict = None, flank: int = 400,
                  max_offtargets: int = 1, min_disruption: int = 4,
@@ -968,13 +991,26 @@ def design_oligo(model, chrom_seq, residue, spec: OligoSpec, genome=None,
                  # (artifact 37). Do NOT widen further without re-checking that budget.
                  slide_range: tuple = (0, 3, -3, 6, -6, 9, -9, 12, -12),
                  protect_boundary_codons: bool = False,
-                 credit_pam_separated: bool = False):
+                 credit_pam_separated: bool = False,
+                 junction_recode: bool = None,
+                 wm_missense_bridge: bool = None):
     """
     Design one guide-donor oligo inserting the domain AFTER `residue`.
 
     Returns a DesignResult, or None if no guide within `max_distance` yields a clean donor.
     `genome` (dict of chromosome sequences) enables the exact off-target screen.
     """
+    # `_wm_bridge_alts` reads the module global from deep inside the recoding stack, so it cannot
+    # be threaded as a parameter without touching every frame between. Set it for the duration of
+    # this call and restore it in `finally` -- an exception must not leave the flag on for the next
+    # position, which is exactly how a global like this silently contaminates a batch.
+    if wm_missense_bridge is not None:
+        return _design_oligo_with_wm(
+            model, chrom_seq, residue, spec, genome, max_distance, usage, flank, max_offtargets,
+            min_disruption, recode_cut_to_insertion, allowed_guides, scores, sv_weight, sv_max,
+            require_score, distance_buckets, reasons, prefer_spanning, slide_range,
+            protect_boundary_codons, credit_pam_separated, junction_recode, wm_missense_bridge)
+
     center = model.cds_to_genomic(residue * 3)
     W, c_idx, coords, cds_pos = model.window_with_coords(chrom_seq, center, flank)
     ins = c_idx + 1                                  # junction just after the codon's last nt
@@ -1070,7 +1106,8 @@ def design_oligo(model, chrom_seq, residue, spec: OligoSpec, genome=None,
         # makes the fix purely additive (Kevin: "only after every donor slide has failed").
         _jr_shifts = sorted(_order, key=lambda sh: (-_score(sh), _order.index(sh)))
         _jr_plan = [(0, _sh) for _sh in _jr_shifts]
-        if JUNCTION_RECODE:
+        _jr_on = JUNCTION_RECODE if junction_recode is None else junction_recode
+        if _jr_on:
             _jr_plan += [(1, _sh) for _sh in _jr_shifts]
         for _jr_pass, shift in _jr_plan:
             wl = list(W)
