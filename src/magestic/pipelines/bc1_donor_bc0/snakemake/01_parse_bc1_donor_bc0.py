@@ -691,6 +691,12 @@ def process_files(
                     reads_msd_unparsed += 1
 
     elapsed = timeit.default_timer() - start_time
+    # A reader that yields zero records from a non-empty FASTQ must be an ERROR, not an empty table (under pysam
+    # 0.15.3 FastxFile read 0 records from an AVITI FASTQ that PASS 1's fallback reader sampled fine; the run then
+    # died only by accident, on a ZeroDivisionError in a log line -- planning 28_ Sec. 8).
+    if reads_processed == 0 and _pass1:
+        raise RuntimeError(f"read 0 records from {r1_path} / {r2_path} although PASS 1 sampled {len(_pass1):,} "
+                           f"reads (pysam={HAS_PYSAM}) -- reader failure, not an empty sample")
 
     # Log statistics
     logger.info(f"Processing complete: {elapsed:.2f}s")
