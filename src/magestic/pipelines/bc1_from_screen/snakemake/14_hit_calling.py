@@ -39,7 +39,6 @@ import pandas as pd
 
 from magestic.pipelines.bc1_from_screen.core.hit_calling import (
     calculate_z_scores,
-    call_hits_single_comparison,
     calculate_concordance,
 )
 from magestic.pipelines.bc1_from_screen.config import HitCallingConfig
@@ -107,6 +106,9 @@ def parse_args():
         "--use-synonymous-null", type=str, default="True",
         help="Use synonymous variants for null estimation (default: True)"
     )
+    parser.add_argument(
+        "--alpha", type=float, default=0.1,
+        help="FDR level for the padj half of the D-2 gate (default 0.1)")
     parser.add_argument(
         "--use-ihw", action="store_true",
         help="Use IHW for FDR control if available"
@@ -191,6 +193,24 @@ def main():
         tier_2_concordance_threshold=args.tier_2_concordance,
     )
 
+    # ---- multiple-testing correction FIRST, so the gate can use it (D-2) ----
+    # Order matters: the padj column the gate reads must already be the adjusted
+    # one. Previously IHW ran AFTER hits were called, so even a working IHW
+    # could not have affected a single call.
+    padj_col = "padj"
+    if args.use_ihw:
+        if not HAS_IHW:
+            logger.error("--use-ihw requested but IHW is unavailable. Refusing to "
+                         "silently fall back: install IHW or drop the flag.")
+            return 1
+        from magestic.pipelines.bc1_from_screen.core.ihw import apply_ihw_to_dataframe
+        df = apply_ihw_to_dataframe(df, pvalue_col="pvalue",
+                                    covariate_col="baseMean", alpha=args.alpha)
+        padj_col = "padj_ihw"
+    logger.info(f"  Significance gate: |z| >= tier threshold AND {padj_col} < {args.alpha}")
+    df["z_pass"] = False
+    df["padj_pass"] = False
+
     # Estimate null distribution and calculate z-scores PER TIER
     # This is critical because tiers have different variance characteristics
     logger.info("Estimating tier-specific null distributions...")
@@ -229,11 +249,24 @@ def main():
             df.loc[tier_mask, "null_mean"] = null_mean
             df.loc[tier_mask, "null_std"] = null_std
 
-            # Call significant hits
-            df.loc[tier_mask, "is_significant"] = df.loc[tier_mask, "z_score"].abs() >= z_threshold
+            # Call significant hits -- D-2 (Kevin, 2026-08-06): the gate is
+            # z AND padj. The per-tier synonymous-null z is a real improvement
+            # over the published era and is KEPT; multiple-testing control is
+            # restored ON TOP of it. Before this, the gate was z alone with no
+            # FDR anywhere, which made the modern pipeline strictly LESS
+            # conservative than the 2021 R pipeline it replaces (that one
+            # applied IHW -- its outputs carry a per-hypothesis `weight`).
+            # NaN padj compares False, so an untested BC1 is never a hit.
+            z_pass = df.loc[tier_mask, "z_score"].abs() >= z_threshold
+            q_pass = df.loc[tier_mask, padj_col] < args.alpha
+            df.loc[tier_mask, "z_pass"] = z_pass
+            df.loc[tier_mask, "padj_pass"] = q_pass
+            df.loc[tier_mask, "is_significant"] = z_pass & q_pass
 
             n_sig = df.loc[tier_mask, "is_significant"].sum()
-            logger.info(f"  [{tier_label}] {n_sig:,} significant / {n_tier:,} BC1s (z>={z_threshold})")
+            logger.info(f"  [{tier_label}] {n_sig:,} significant / {n_tier:,} BC1s "
+                        f"(z>={z_threshold} AND {padj_col}<{args.alpha}); "
+                        f"z-only would have been {int(z_pass.sum()):,}")
 
             # Track for overall stats
             if null_std_overall == 0:
@@ -251,18 +284,10 @@ def main():
         df["z_score"] = (df["log2FoldChange"] - null_mean) / null_std
         df["null_mean"] = null_mean
         df["null_std"] = null_std
-        df["is_significant"] = df["z_score"].abs() >= config.tier_1_z_threshold
+        df["z_pass"] = df["z_score"].abs() >= config.tier_1_z_threshold
+        df["padj_pass"] = df[padj_col] < args.alpha
+        df["is_significant"] = df["z_pass"] & df["padj_pass"]      # D-2: z AND padj
         df["tier"] = "abundance_high"
-
-    # Apply IHW if requested and available
-    if args.use_ihw and HAS_IHW:
-        logger.info("Applying IHW for FDR control...")
-        try:
-            from magestic.pipelines.bc1_from_screen.core.ihw import apply_ihw_to_dataframe
-            df = apply_ihw_to_dataframe(df, pvalue_col="pvalue", covariate_col="baseMean")
-            logger.info("  IHW applied successfully")
-        except Exception as e:
-            logger.warning(f"  IHW failed: {e}, using standard padj")
 
     # Collect statistics (support both naming conventions)
     if "tier" in df.columns:

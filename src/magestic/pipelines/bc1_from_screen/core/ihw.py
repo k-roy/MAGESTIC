@@ -357,3 +357,43 @@ def check_ihw_availability() -> dict:
         'statsmodels_available': HAS_STATSMODELS,
         'recommended_method': 'ihw' if HAS_IHW else ('bh' if HAS_STATSMODELS else 'none'),
     }
+
+
+def apply_ihw_to_dataframe(
+    df: pd.DataFrame,
+    pvalue_col: str = "pvalue",
+    covariate_col: str = "baseMean",
+    alpha: float = 0.1,
+    out_col: str = "padj_ihw",
+) -> pd.DataFrame:
+    """Apply IHW to a results DataFrame and return it with adjusted p-values.
+
+    🔴 2026-09-09: this function DID NOT EXIST. Both hit callers imported it
+    inside a try/except that logged a warning and continued, so ``--use-ihw``
+    was a swallowed no-op -- every run reported "IHW available: True, use IHW:
+    True" and then silently applied nothing. The 2021 R pipeline DID apply IHW
+    (its outputs carry a per-hypothesis ``weight`` column next to ``padj``), so
+    the modern pipeline was strictly LESS conservative than the era it replaces.
+
+    Adds ``out_col`` (IHW-adjusted p-values), ``ihw_weight`` and
+    ``ihw_significant``. Rows with a missing p-value or covariate keep NaN and
+    are never called significant. The original ``padj`` is left untouched so the
+    two are comparable.
+    """
+    if pvalue_col not in df.columns:
+        raise ValueError(f"p-value column '{pvalue_col}' not found")
+    out = df.copy()
+    if covariate_col not in out.columns:
+        logger.warning(f"Covariate '{covariate_col}' absent; IHW degenerates to BH")
+        cov = np.ones(len(out))
+    else:
+        cov = out[covariate_col].values
+    res = run_ihw(out[pvalue_col].values, cov, alpha=alpha)
+    out[out_col] = res.adjusted_pvalues
+    out["ihw_weight"] = res.weights
+    out["ihw_significant"] = res.rejections
+    logger.info(
+        f"  IHW: method={res.method}, covariate_used={res.covariate_used}, "
+        f"{res.n_rejections:,} rejections at alpha={alpha}"
+    )
+    return out

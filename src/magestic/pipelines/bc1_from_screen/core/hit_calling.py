@@ -149,6 +149,21 @@ def call_hits_single_comparison(
     """
     Call hits for a single comparison using abundance-tier-specific thresholds.
 
+    .. deprecated:: 2026-09-09
+        **NOT the production hit caller. Use snakemake/14_hit_calling.py.**
+        This function was imported by both 14_hit_calling.py and
+        pipeline/run_pipeline.py and CALLED BY NEITHER -- dead code that looked
+        live. It is kept only because its padj gate documents what production
+        was missing.
+
+        Do not simply swap it in: its z-score is GLOBAL
+        (``calculate_z_scores(results_filtered[lfc_col])``), whereas D-2 (Kevin,
+        2026-08-06) requires the PER-TIER SYNONYMOUS-NULL z, which is a real
+        improvement over the published era and is what 14_hit_calling.py
+        computes. Unifying onto this function would silently downgrade the
+        null model while appearing to add FDR control.
+        It also hardcodes ``padj < 0.1`` where production now takes ``--alpha``.
+
     Args:
         deseq_results: DESeq2 results DataFrame
         tier_mapping: BC1 to tier mapping

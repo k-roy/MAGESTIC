@@ -142,8 +142,7 @@ def run_hit_calling(config: BC1FromScreenConfig) -> bool:
     logger.info("Steps 14/15: Running hit calling...")
 
     from magestic.pipelines.bc1_from_screen.core.hit_calling import (
-        call_hits_single_comparison,
-        aggregate_hit_calls,
+            aggregate_hit_calls,
     )
 
     working_dir = config.get_working_dir("hit_calling_tiered")
