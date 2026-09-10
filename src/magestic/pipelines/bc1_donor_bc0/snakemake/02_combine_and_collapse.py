@@ -1,557 +1,413 @@
 #!/usr/bin/env python3
 """
-Combine and collapse bc1-donor-bc0 data across samples for a single sequencing run.
+Combine and collapse bc1-donor-bc0 data across samples -- and across sequencing runs.
 
-This script:
-1. Loads parsed bc1-donor-bc0 data from multiple samples
-2. Joins trafo_ID from mapping keyfile (if provided) for sublibrary tracking
-3. Aggregates counts across PCR replicates
-4. Collapses similar sequences using edit distance thresholds
-5. Calculates bc1 purity metrics
-6. Filters for reproducible bc1s (found in multiple PCR replicates)
+Rewritten 2026-09-10 for the 20210822 rebuild (planning ``28_``; Kevin's decisions in
+``27_`` Sec. 7). What changed, and why each change is load-bearing:
 
-Usage:
-    python 02_combine_and_collapse.py \\
-        --parsed-dir <dir> \\
-        --sample-key <file> \\
-        --plate-key <file> \\
-        --run-date <date> \\
-        --output-collapsed <file> \\
-        --output-purity <file> \\
-        [--trafo-key <file>] \\
-        [options]
+* **LABEL, never filter.** Every bc1-donor-bc0 link is retained. ``support_tier`` =
+  ``confident`` (>= ``--min-pcr-replicates`` distinct PCR replicates, default 2) or
+  ``provisional``. The old ``num_PCR_replicates >= 2`` row filter deleted the singleton
+  tier Kevin asked to see (measured on yL406 at 91.47% of links, ``21_``).
+* **Replicate support is an exact SET.** Identity is the approved composite
+  ``build_pcr_replicate_id`` (gDNA plate + inner + outer primers + polymerase +
+  condition + amplicon level + well; sequencing date EXCLUDED, so re-sequencing a
+  library is not new evidence). Sets are unioned through every collapse -- the old
+  code summed ``num_PCR_replicates`` across merged rows.
+* **One invocation spans every run** of a screen via ``--manifest`` (explicit parsed
+  path + replicate fields per sample). The legacy per-``--run-date`` mode remains, but
+  any missing input or an empty load is now an ERROR -- the old code printed
+  "No data files found!" and exited 0.
+* **Per-tier read counts** (``n_<tier>``, ``23_`` option b) are carried as additive
+  columns: ``counts == sum(n_<tier>)`` on every row.
+* **Cross-read-length reconciliation**: a 2x150 donor (~88 nt) is attached to the
+  2x300 donor (238 nt) it is a suffix of (``core.link_collapse.attach_short_donors``).
+* **SPS and donor_bc0_fragment survive** (from the top-count row); the old groupby
+  dropped them, leaving V_library assignable only for guide-linked bc1s.
+* Rows with no donor or bc0 are **set aside and counted**, not dropped by a groupby.
 
-trafo_ID Propagation (CRITICAL for yL437/yL442 and yL406):
-    For libraries with multiple trafos pooled together, V634 bc1s cannot be
-    distinguished between trafo_3 (SpG_NGG) and trafo_4 (SpCas9_NGG) from SPS alone.
+Usage (manifest mode -- the rebuild path):
+    python 02_combine_and_collapse.py --manifest manifest.tsv \\
+        --output-collapsed combined/bc1_donor_bc0_collapsed.tsv \\
+        --output-purity combined/bc1_purity.tsv [--n-jobs 32]
 
-    Solution: Use --trafo-key to provide sample→trafo mapping from individual trafo sequencing.
-    The trafo_key file should be TSV with columns: sample_number, trafo_ID
-    (and optionally: V_library, nuclease_PAM, yeast_sublibrary)
+Manifest columns: required ``sample_id parsed_path sequencing_date sample_number
+outer_primers``; replicate-identity fields ``gDNA_plate_name inner_primers
+plate_polymerase condition amplicon_level`` (absent -> "NA", warned); optional
+passthrough ``trafo_ID V_library nuclease_PAM yeast_sublibrary``.
 
-    This enables bc1s to be assigned to their correct yeast_sublibrary for DESeq2 analysis.
+Legacy mode (one run): --parsed-dir --sample-key --plate-key --run-date [--trafo-key].
 
 Author: Kevin Roy Lab
 """
 
 import argparse
+import hashlib
+import json
 import os
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-from Levenshtein import distance
-import multiprocessing
+import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
-from functools import partial
-from rapidfuzz.distance import Levenshtein as _rapidfuzz_lev
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from rapidfuzz.distance import Levenshtein as _lev
+
+from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS, BC1_ORIENTATION
+from magestic.pipelines.bc1_donor_bc0.readers.data_loader import (
+    PCR_REPLICATE_ID_FIELDS, build_pcr_replicate_id)
+from magestic.pipelines.bc1_donor_bc0.core.link_collapse import (
+    aggregate_links, collapse_links, attach_short_donors,
+    mask_columns, masks_for_codes, popcount_rows, decode_masks)
+
+TIER_COLS = list(TIER_COUNT_COLUMNS)
+SUM_COLS = ["counts", *TIER_COLS]
+LINK_KEY = ["bc1", "donor", "bc0"]
+SEQ_PRESERVE = ["SPS", "donor_bc0_fragment"]
+TRAFO_COLS = ["trafo_ID", "V_library", "nuclease_PAM", "yeast_sublibrary"]
+PARSED_REQUIRED = ["counts", "bc1", "donor", "bc0", "SPS", "donor_bc0_fragment", *TIER_COLS]
+MANIFEST_REQUIRED = ["sample_id", "parsed_path", "sequencing_date", "sample_number", "outer_primers"]
+ACCUMULATE_EVERY = 24   # default samples per incremental fold (sums/ORs are associative; preserved SPS/fragment come
+                        # from the top row of each fold, which is batch-order-dependent only on exact read-count ties)
+LIBRARY_COL = "yeast_library"   # manifest column -> per-link yeast_libraries_observed (WGS lane ask D.3)
 
 
-def _peel_off(seqs, cvs, threshold):
-    """Greedy top-by-count peel-off on plain lists.
-
-    Behavior-preserving reimplementation of the original pandas process_group inner
-    loop: repeatedly pick the highest-total-count surviving sequence, collapse every
-    surviving sequence within `threshold` edit distance of it, aggregate counts, repeat.
-    Uses rapidfuzz `score_cutoff` for early-exit distance. No pandas churn.
-
-    Args:
-        seqs: list[str | non-str(NaN)]   sequences in the group (original within-group order)
-        cvs:  list[tuple[int, ...]]      per-row count vector aligned to count cols
-        threshold: int                    max edit distance to collapse
-    Returns:
-        list of (rep_local_idx, summed_count_tuple) — one per output cluster
-    """
-    n = len(seqs)
-    alive = [True] * n
-    totals = [sum(cv) for cv in cvs]
-    ncc = len(cvs[0]) if n else 0
-    out = []
-    remaining = n
-    while remaining:
-        # top = FIRST surviving index with the max total (matches pandas idxmax tie-break)
-        top = -1
-        best = None
-        for i in range(n):
-            if alive[i] and (best is None or totals[i] > best):
-                best = totals[i]
-                top = i
-        ts = seqs[top]
-        agg = list(cvs[top])
-        alive[top] = False
-        remaining -= 1
-        ts_ok = isinstance(ts, str)  # NaN top (non-str) collapses only itself, as in the original
-        if ts_ok:
-            for i in range(n):
-                if alive[i]:
-                    si = seqs[i]
-                    if isinstance(si, str) and (
-                        si == ts or _rapidfuzz_lev.distance(si, ts, score_cutoff=threshold) <= threshold
-                    ):
-                        cv = cvs[i]
-                        for k in range(ncc):
-                            agg[k] += cv[k]
-                        alive[i] = False
-                        remaining -= 1
-        out.append((top, tuple(agg)))
-    return out
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def _collapse_payload(payload, group_cols, seq_col, cc, pcols, threshold):
-    """Worker: collapse one group given plain-python payload (no pandas/DataFrames).
-
-    payload = (gkey_values, seqs_list, count_vectors_list, preserve_values_list|None)
-    Returns a list of result-row dicts identical in shape to the original output.
-    """
-    gkey, seqs, cvs, pres = payload
-    base = {group_cols[k]: gkey[k] for k in range(len(group_cols))}
-    rows = []
-    for rep, agg in _peel_off(seqs, cvs, threshold):
-        row = dict(base)
-        row[seq_col] = seqs[rep]
-        for k in range(len(cc)):
-            row[cc[k]] = agg[k]
-        if pcols and pres is not None:
-            pr = pres[rep]
-            for k in range(len(pcols)):
-                row[pcols[k]] = pr[k]
-        rows.append(row)
-    return rows
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(2)
 
 
-def collapse_sequences(df, group_cols, seq_col, count_cols, edit_distance_threshold,
-                       show_progress=True, n_jobs=1, preserve_cols=None):
-    """
-    Collapse similar sequences within each group based on edit distance threshold.
+# -----------------------------------------------------------------------------
+# Inputs
+# -----------------------------------------------------------------------------
 
-    Args:
-        df: Input DataFrame
-        group_cols: Columns to group by
-        seq_col: Sequence column to collapse
-        count_cols: Count column(s) to aggregate
-        edit_distance_threshold: Maximum edit distance for collapsing
-        show_progress: Show progress bar
-        n_jobs: Number of parallel jobs
-        preserve_cols: Additional columns to preserve (take value from top-count row)
-
-    Returns:
-        DataFrame with collapsed sequences
-
-    OPTIMIZED 2026-06-02 (behavior-preserving vs the original greedy top-by-count
-    peel-off; validated row/count-equal on real data):
-      - SINGLETON FAST-PATH: size-1 groups (the large majority of bc1/donor groups)
-        skip ALL edit-distance work and dispatch.
-      - PURE-LIST peel-off (_peel_off): no per-iteration pandas .apply/.loc/.drop;
-        rapidfuzz Levenshtein with score_cutoff for early-exit.
-      - BATCHED PLAIN-TUPLE DISPATCH: workers receive small (lists) payloads, never
-        pickled per-group DataFrames (the old defect that pinned the parent on IPC
-        and starved workers, so --n-jobs gave ~no speedup). Workers are numpy/MKL-free
-        (AVX-512 safe); numpy is used only in the parent for factorize/argsort.
-    """
-    if preserve_cols is None:
-        preserve_cols = []
-    cc = count_cols if isinstance(count_cols, list) else [count_cols]
-    pcols = [c for c in preserve_cols if c in df.columns]
-    out_cols = list(group_cols) + [seq_col] + list(cc) + pcols
-
-    n = len(df)
-    if n == 0:
-        return pd.DataFrame(columns=out_cols)
-
-    # Factorize the group key, then stable-sort rows so each group is a contiguous slice
-    # (avoids materializing/pickling one pandas sub-DataFrame per group).
-    if len(group_cols) == 1:
-        codes, _ = pd.factorize(df[group_cols[0]], sort=False)
+def build_manifest(args) -> pd.DataFrame:
+    """The explicit per-sample input list. Fails loudly on anything missing."""
+    if args.manifest:
+        man = pd.read_csv(args.manifest, sep="\t", dtype=str, keep_default_na=False)
+        missing = [c for c in MANIFEST_REQUIRED if c not in man.columns]
+        if missing:
+            die(f"manifest lacks required columns {missing}")
     else:
-        codes, _ = pd.factorize(
-            pd.Series(list(zip(*[df[c].tolist() for c in group_cols])), index=df.index),
-            sort=False,
-        )
-    order = np.argsort(codes, kind="stable")
-    codes_s = codes[order]
-    seqs_all = df[seq_col].to_numpy(dtype=object)[order]
-    counts_all = df[list(cc)].to_numpy()[order]
-    gvals_all = df[list(group_cols)].to_numpy(dtype=object)[order]
-    pres_all = df[pcols].to_numpy(dtype=object)[order] if pcols else None
+        if not all([args.parsed_dir, args.sample_key, args.plate_key, args.run_date]):
+            die("give --manifest, or all of --parsed-dir --sample-key --plate-key --run-date")
+        plate_key = pd.read_csv(args.plate_key, sep="\t", dtype=str, keep_default_na=False)
+        sample_key = pd.read_csv(args.sample_key, sep="\t", dtype=str, keep_default_na=False)
+        plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
+        man = plate_key.merge(sample_key, how="cross")
+        man["sequencing_date"] = args.run_date
+        man["sample_id"] = (args.run_date + "_" + man["outer_primers"].astype(str)
+                            + "_" + man["sample_number"].astype(str))
+        man["parsed_path"] = [str(Path(args.parsed_dir) / f"{sid}_parsed.tsv") for sid in man["sample_id"]]
+    if len(man) == 0:
+        die("zero samples in the input definition")
+    # normalize: surrounding whitespace/CR, 'nan'/'None' spellings, zero-padded wells -- two rows of one library
+    # must produce the SAME replicate id (review REP-07)
+    for c in man.columns:
+        man[c] = man[c].astype(str).str.strip().replace({"nan": "", "None": "", "NaN": ""})
+    man["sample_number"] = man["sample_number"].str.replace(r"^sample_", "", regex=True).map(
+        lambda v: str(int(v)) if v.isdigit() else v)
+    if man["sample_id"].duplicated().any():
+        die(f"duplicate sample_id in manifest: {man.loc[man.sample_id.duplicated(), 'sample_id'].tolist()[:10]}")
+    if man["parsed_path"].duplicated().any():
+        # the same file twice = a fake second replicate + doubled reads (review F5)
+        die(f"the same parsed file is listed twice: {man.loc[man.parsed_path.duplicated(), 'parsed_path'].tolist()[:5]}")
 
-    bounds = np.flatnonzero(np.diff(codes_s)) + 1
-    starts = np.concatenate(([0], bounds)).tolist()
-    ends = np.concatenate((bounds, [n])).tolist()
+    # optional supplementary trafo key (sample_number -> trafo fields)
+    if args.trafo_key:
+        tk = pd.read_csv(args.trafo_key, sep="\t", dtype=str, keep_default_na=False)
+        if "sample_number" not in tk.columns:
+            die(f"--trafo-key lacks sample_number (has {list(tk.columns)})")
+        if tk["sample_number"].duplicated().any():
+            die("--trafo-key has duplicate sample_number rows")
+        cols = [c for c in TRAFO_COLS if c in tk.columns]
+        # OVERRIDE per sample where the trafo key has a value; keep the manifest's value
+        # elsewhere (review F4: a plain replace silently blanked unmatched samples).
+        sup = man[["sample_number"]].merge(tk[["sample_number", *cols]], on="sample_number", how="left")
+        for c in cols:
+            new = sup[c].fillna("").to_numpy()
+            old = man[c].to_numpy() if c in man.columns else [""] * len(man)
+            man[c] = [n if n != "" else o for n, o in zip(new, old)]
 
-    ngc = len(group_cols)
-    ncc = len(cc)
-    npc = len(pcols)
-    singleton_rows = []
-    payloads = []
-    for a, b in zip(starts, ends):
-        if b - a == 1:
-            row = {group_cols[k]: gvals_all[a][k] for k in range(ngc)}
-            row[seq_col] = seqs_all[a]
-            crow = counts_all[a]
-            for k in range(ncc):
-                v = crow[k]
-                row[cc[k]] = v.item() if hasattr(v, "item") else v
-            if npc:
-                pr = pres_all[a]
-                for k in range(npc):
-                    row[pcols[k]] = pr[k]
-            singleton_rows.append(row)
-        else:
-            gkey = [gvals_all[a][k] for k in range(ngc)]
-            seqs = list(seqs_all[a:b])
-            cvs = [tuple(int(counts_all[i][k]) for k in range(ncc)) for i in range(a, b)]
-            pres = ([[pres_all[i][k] for k in range(npc)] for i in range(a, b)] if npc else None)
-            payloads.append((gkey, seqs, cvs, pres))
+    absent = [f for f in PCR_REPLICATE_ID_FIELDS if f not in man.columns]
+    for f in absent:
+        man[f] = "NA"
+    if absent:
+        log(f"WARNING: replicate-identity fields absent from the input definition, set to NA: {absent}")
+    gd = man["gDNA_plate_name"].replace("", "NA")
+    if (gd == "NA").any():
+        # review F6: partial blanks were silent; two different preps sharing primers + well
+        # would then collapse to ONE replicate id.
+        log(f"WARNING: gDNA_plate_name unavailable for {int((gd == 'NA').sum())}/{len(man)} samples "
+            f"(e.g. {man.loc[gd == 'NA', 'sample_id'].tolist()[:5]}) -> the re-prep guard is inactive "
+            f"for them; an independent re-prep that reused the same primers would count as ONE replicate.")
+    man["pcr_replicate_id"] = man.apply(lambda r: build_pcr_replicate_id(
+        {k: (r[k] if r[k] != "" else None) for k in PCR_REPLICATE_ID_FIELDS}), axis=1)
 
-    worker = partial(_collapse_payload, group_cols=list(group_cols), seq_col=seq_col,
-                     cc=list(cc), pcols=pcols, threshold=edit_distance_threshold)
-    multi_rows = []
-    if payloads:
-        if n_jobs and n_jobs > 1 and len(payloads) > 1:
-            chunksize = max(1, len(payloads) // (n_jobs * 8))
-            with ProcessPoolExecutor(max_workers=n_jobs) as ex:
-                it = ex.map(worker, payloads, chunksize=chunksize)
-                if show_progress:
-                    it = tqdm(it, total=len(payloads), desc=f"Collapsing {seq_col}")
-                for rows in it:
-                    multi_rows.extend(rows)
-        else:
-            it = tqdm(payloads, desc=f"Collapsing {seq_col}") if show_progress else payloads
-            for p in it:
-                multi_rows.extend(worker(p))
+    missing_files = [p for p in man["parsed_path"] if not Path(p).is_file()]
+    if missing_files:
+        if not args.allow_missing:
+            die(f"{len(missing_files)} of {len(man)} parsed files missing (first: {missing_files[:5]}). "
+                f"Pass --allow-missing to proceed without them (they are then recorded as missing).")
+        log(f"WARNING: {len(missing_files)} parsed files missing -- proceeding (--allow-missing): "
+            f"{missing_files[:5]}")
+    man["present"] = [Path(p).is_file() for p in man["parsed_path"]]
+    return man
 
-    result = pd.DataFrame(singleton_rows + multi_rows)
-    return result[out_cols] if len(result) else pd.DataFrame(columns=out_cols)
 
+# -----------------------------------------------------------------------------
+# Per-sample: load, set aside unusable rows, collapse within sample (Steps 1-3)
+# -----------------------------------------------------------------------------
+
+def process_sample(task):
+    (sample_id, path, rep_code, n_ids, run_code, n_runs, lib_code, n_libs, trafo, thr) = task
+    df = pd.read_csv(path, sep="\t", dtype={"bc1": str, "donor": str, "bc0": str, "SPS": str,
+                                             "donor_bc0_fragment": str},
+                     keep_default_na=False, na_values=[""])
+    missing = [c for c in PARSED_REQUIRED if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path}: parsed file lacks {missing} -- produced by a pre-2026-09-10 "
+                         f"step 01? Re-parse; mixing schemas would silently lose the tier counts.")
+    aside = {"sample_id": sample_id, "rows_in": len(df), "reads_in": int(df["counts"].sum())}
+    for reason, mask in (("no_bc1", df["bc1"].isna()),
+                         ("no_donor", df["bc1"].notna() & df["donor"].isna()),
+                         ("no_bc0", df["bc1"].notna() & df["donor"].notna() & df["bc0"].isna())):
+        aside[f"rows_{reason}"] = int(mask.sum())
+        aside[f"reads_{reason}"] = int(df.loc[mask, "counts"].sum())
+    df = df[df["bc1"].notna() & df["donor"].notna() & df["bc0"].notna()]
+    for c in SEQ_PRESERVE:
+        df[c] = df[c].fillna("")
+    if len(df) == 0:
+        aside["rows_out"] = 0
+        return None, aside
+
+    df = aggregate_links(df, LINK_KEY, "counts", SUM_COLS, [], SEQ_PRESERVE)
+    # Step 1: similar donors within (bc1, bc0); Step 2: similar bc1 within (donor, bc0);
+    # Step 3: similar bc0 within (bc1, donor) -- all within this one sample.
+    df = collapse_links(df, ["bc1", "bc0"], "donor", "counts", SUM_COLS, [], SEQ_PRESERVE,
+                        threshold=thr["donor"])
+    df = collapse_links(df, ["donor", "bc0"], "bc1", "counts", SUM_COLS, [], SEQ_PRESERVE,
+                        threshold=thr["bc1"])
+    df = collapse_links(df, ["bc1", "donor"], "bc0", "counts", SUM_COLS, [], SEQ_PRESERVE,
+                        threshold=thr["bc0"])
+    rm = masks_for_codes(np.full(len(df), rep_code), n_ids)
+    for k, c in enumerate(mask_columns(n_ids)):
+        df[c] = rm[:, k]
+    um = masks_for_codes(np.full(len(df), run_code), n_runs)
+    for k, c in enumerate(run_mask_columns(n_runs)):
+        df[c] = um[:, k]
+    lm = masks_for_codes(np.full(len(df), lib_code), n_libs)
+    for k, c in enumerate(lib_mask_columns(n_libs)):
+        df[c] = lm[:, k]
+    for c, v in trafo.items():
+        df[c] = v
+    aside["rows_out"] = len(df)
+    return df, aside
+
+
+def run_mask_columns(n_runs):
+    return [c.replace("_repmask_", "_runmask_") for c in mask_columns(n_runs)]
+
+
+def lib_mask_columns(n_libs):
+    return [c.replace("_repmask_", "_libmask_") for c in mask_columns(n_libs)]
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Combine and collapse bc1-donor-bc0 data",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-trafo_ID Propagation:
-    For libraries like yL437/yL442 where V634 is shared between trafo_3 (SpG_NGG) and
-    trafo_4 (SpCas9_NGG), use --trafo-key to provide sample→trafo mapping.
-
-    trafo_key format (TSV):
-        sample_number   trafo_ID    V_library   nuclease_PAM
-        1               trafo_1     V629        SpG_NGNG
-        2               trafo_2     V631        SpG_NGNH
-        ...
-
-    This enables accurate yeast_sublibrary assignment for DESeq2 analysis.
-        """
-    )
-    parser.add_argument("--parsed-dir", required=True, help="Directory with parsed TSV files")
-    parser.add_argument("--sample-key", required=True, help="Sample key TSV file")
-    parser.add_argument("--plate-key", required=True, help="Plate key TSV file")
-    parser.add_argument("--run-date", required=True, help="Sequencing run date")
+    parser = argparse.ArgumentParser(description="Combine and collapse bc1-donor-bc0 data",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog=__doc__)
+    parser.add_argument("--manifest", help="Per-sample input definition TSV (rebuild path)")
+    parser.add_argument("--parsed-dir", help="[legacy] Directory with parsed TSV files")
+    parser.add_argument("--sample-key", help="[legacy] Sample key TSV file")
+    parser.add_argument("--plate-key", help="[legacy] Plate key TSV file")
+    parser.add_argument("--run-date", help="[legacy] Sequencing run date")
+    parser.add_argument("--trafo-key", help="Optional trafo mapping TSV (sample_number -> trafo_ID ...)")
     parser.add_argument("--output-collapsed", required=True, help="Output collapsed TSV")
     parser.add_argument("--output-purity", required=True, help="Output purity summary TSV")
-    parser.add_argument("--trafo-key", help="Optional trafo mapping TSV (sample_number → trafo_ID)")
     parser.add_argument("--donor-edit-distance", type=int, default=5)
     parser.add_argument("--bc1-edit-distance", type=int, default=1)
     parser.add_argument("--bc0-edit-distance", type=int, default=1)
-    parser.add_argument("--min-pcr-replicates", type=int, default=2)
+    parser.add_argument("--min-pcr-replicates", type=int, default=2,
+                        help="LABEL threshold for support_tier=confident (no row is dropped)")
+    parser.add_argument("--allow-missing", action="store_true",
+                        help="Proceed when some parsed files are absent (recorded, not silent)")
     parser.add_argument("--n-jobs", type=int, default=24)
-
+    parser.add_argument("--attach-dominance", type=float, default=3.0,
+                        help="attach a short donor to the top of several long candidates when it has >= this "
+                             "multiple of the runner-up's reads (inf = never; 29_)")
+    parser.add_argument("--accumulate-every", type=int, default=ACCUMULATE_EVERY,
+                        help="Samples per incremental fold (exact at any value; small values force the "
+                             "fold branch in a smoke test)")
     args = parser.parse_args()
+    t0 = time.time()
 
-    print(f"Processing run: {args.run_date}")
+    man = build_manifest(args)
+    present = man[man["present"]].reset_index(drop=True)
+    rep_ids = sorted(present["pcr_replicate_id"].unique())
+    rep_code = {r: i for i, r in enumerate(rep_ids)}
+    runs = sorted(present["sequencing_date"].unique())
+    run_code = {r: i for i, r in enumerate(runs)}
+    if LIBRARY_COL not in present.columns:
+        present[LIBRARY_COL] = "NA"
+    present[LIBRARY_COL] = present[LIBRARY_COL].replace("", "NA")
+    libs = sorted(present[LIBRARY_COL].unique())
+    lib_code = {r: i for i, r in enumerate(libs)}
+    mcols, ucols, lcols = mask_columns(len(rep_ids)), run_mask_columns(len(runs)), lib_mask_columns(len(libs))
+    log(f"{len(present)} samples present ({len(man) - len(present)} missing); "
+        f"{len(rep_ids)} distinct PCR replicates; {len(runs)} sequencing runs: {runs}")
+    trafo_present = [c for c in TRAFO_COLS if c in present.columns]
+    thr = {"donor": args.donor_edit_distance, "bc1": args.bc1_edit_distance, "bc0": args.bc0_edit_distance}
 
-    # Load keyfiles
-    plate_key = pd.read_csv(args.plate_key, sep="\t")
-    sample_key = pd.read_csv(args.sample_key, sep="\t")
+    tasks = [(r.sample_id, r.parsed_path, rep_code[r.pcr_replicate_id], len(rep_ids),
+              run_code[r.sequencing_date], len(runs), lib_code[r[LIBRARY_COL]], len(libs),
+              {c: r[c] for c in trafo_present}, thr) for _, r in present.iterrows()]
 
-    # Filter for bc1-donor-bc0 amplicons + build the combined key BEFORE any
-    # trafo-detection that inspects combined_key (fixes UnboundLocalError where
-    # combined_key was referenced ~25 lines before its assignment).
-    plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
-    combined_key = plate_key.merge(sample_key, how="cross")
-    combined_key["sequencing_date"] = args.run_date
+    # --- per-sample collapse (parallel) + incremental cross-sample aggregation ---
+    acc, pending, asides = None, [], []
+    preserve_x = SEQ_PRESERVE + trafo_present
+    or_cols = mcols + ucols + lcols
 
-    # Check for trafo_ID in various sources:
-    # 1. From sample_key (via combined_key merge) - preferred
-    # 2. From separate --trafo-key file - for supplementation/override
-    trafo_key = None
-    has_trafo_in_sample_key = "trafo_ID" in combined_key.columns or "trafo_id" in combined_key.columns
-    trafo_col_name = "trafo_ID" if "trafo_ID" in combined_key.columns else ("trafo_id" if "trafo_id" in combined_key.columns else None)
+    def fold(acc, frames):
+        stack = frames if acc is None else [acc, *frames]
+        return aggregate_links(pd.concat(stack, ignore_index=True), LINK_KEY, "counts",
+                               SUM_COLS, or_cols, preserve_x)
 
-    if has_trafo_in_sample_key:
-        print(f"trafo_ID found in sample_key (column: {trafo_col_name})")
-        print(f"  trafo_ID distribution: {combined_key[trafo_col_name].value_counts().to_dict()}")
+    done = 0
+    with ProcessPoolExecutor(max_workers=max(1, args.n_jobs)) as ex:
+        for df, aside in ex.map(process_sample, tasks, chunksize=1):
+            asides.append(aside)
+            done += 1
+            if df is not None:
+                pending.append(df)
+            if len(pending) >= args.accumulate_every:
+                acc, pending = fold(acc, pending), []
+                log(f"  {done}/{len(tasks)} samples folded; {len(acc):,} links so far")
+    if pending:
+        acc = fold(acc, pending)
+    if acc is None or len(acc) == 0:
+        die("no usable bc1-donor-bc0 rows in any sample")
+    zero = [a["sample_id"] for a in asides if a.get("rows_out", 0) == 0]
+    if zero:
+        log(f"WARNING: {len(zero)} samples contributed ZERO usable links (e.g. {zero[:5]}); see .setaside.tsv")
+    n_links_agg = len(acc)
+    log(f"cross-sample aggregation: {n_links_agg:,} links, {acc['bc1'].nunique():,} bc1")
 
-    # Load additional trafo_key if provided (for supplementation or when sample_key lacks trafo_ID)
-    if args.trafo_key:
-        trafo_key = pd.read_csv(args.trafo_key, sep="\t")
-        # Ensure sample_number is the join key
-        if "sample_number" not in trafo_key.columns:
-            print(f"WARNING: trafo_key missing 'sample_number' column. Available: {list(trafo_key.columns)}")
-            trafo_key = None
-        else:
-            print(f"Loaded supplementary trafo_key with {len(trafo_key)} entries")
-            if "trafo_ID" in trafo_key.columns:
-                print(f"  trafo_ID distribution: {trafo_key['trafo_ID'].value_counts().to_dict()}")
+    # --- within-length collapses FIRST, so each long parent is unique before attach
+    #     (review F2/F3 2026-09-10: attaching first let a sequencing-error variant of the
+    #     238-nt parent -- or of its bc0 -- make the 88-nt donor "ambiguous", leaving the
+    #     link split across eras). Short and long donors cannot merge here (length gap). ---
+    acc = collapse_links(acc, ["bc1", "bc0"], "donor", "counts", SUM_COLS, or_cols, preserve_x,
+                         threshold=args.donor_edit_distance, n_jobs=args.n_jobs)
+    acc = collapse_links(acc, ["bc1", "donor"], "bc0", "counts", SUM_COLS, or_cols, preserve_x,
+                         threshold=args.bc0_edit_distance, n_jobs=args.n_jobs)
 
-    print(f"Loading data from {len(combined_key)} sample files...")
+    # --- cross-read-length reconciliation (88-nt 2x150 donors -> their 238-nt parents) ---
+    acc, attach_stats = attach_short_donors(acc, "donor", "counts", SUM_COLS, or_cols,
+                                            max_mismatch=args.donor_edit_distance,
+                                            bc0_max_edit=args.bc0_edit_distance,
+                                            dominance=args.attach_dominance)
+    log(f"suffix-attach: {attach_stats}; {len(acc):,} links remain")
 
-    # Load all parsed files
-    dfs = []
-    for _, row in tqdm(combined_key.iterrows(), total=len(combined_key), desc="Loading samples"):
-        # parse_01 writes <prefix>_parsed.tsv (matches the combine_02 rule input);
-        # was _parsed_bc1_donor_bc0.tsv (legacy per-screen name) -> found zero files.
-        fname = f"{args.run_date}_{row['outer_primers']}_{row['sample_number']}_parsed.tsv"
-        filepath = Path(args.parsed_dir) / fname
+    # --- Step 4: collapse across all samples, replicate sets UNIONED ---
+    px = preserve_x + ["donor_suffix_ambiguous", "donor_lengths_observed"]
+    acc = collapse_links(acc, ["bc1", "bc0"], "donor", "counts", SUM_COLS, or_cols, px,
+                         threshold=args.donor_edit_distance, n_jobs=args.n_jobs)
+    acc = collapse_links(acc, ["donor", "bc0"], "bc1", "counts", SUM_COLS, or_cols, px,
+                         threshold=args.bc1_edit_distance, n_jobs=args.n_jobs)
+    acc = collapse_links(acc, ["bc1", "donor"], "bc0", "counts", SUM_COLS, or_cols, px,
+                         threshold=args.bc0_edit_distance, n_jobs=args.n_jobs)
+    log(f"after Step-4 collapses: {len(acc):,} links, {acc['bc1'].nunique():,} bc1")
 
-        if filepath.exists():
-            df = pd.read_csv(filepath, sep="\t")
-            df["sample_number"] = row["sample_number"]
-            df["outer_primers"] = row["outer_primers"]
+    # --- replicate support: exact, labeled ---
+    masks = acc[mcols].to_numpy(dtype=np.uint64)
+    acc["num_PCR_replicates"] = popcount_rows(masks)
+    acc["pcr_replicate_ids"] = decode_masks(masks, rep_ids)
+    acc["runs_observed"] = decode_masks(acc[ucols].to_numpy(dtype=np.uint64), runs)
+    acc["yeast_libraries_observed"] = decode_masks(acc[lcols].to_numpy(dtype=np.uint64), libs)
+    acc = acc.drop(columns=or_cols)
+    acc["support_tier"] = np.where(acc["num_PCR_replicates"] >= args.min_pcr_replicates,
+                                   "confident", "provisional")
+    if not (acc["counts"] == acc[TIER_COLS].sum(axis=1)).all():   # explicit: survives python -O
+        die("tier invariant broken: counts != sum(n_<tier>) on "
+            f"{int((acc['counts'] != acc[TIER_COLS].sum(axis=1)).sum())} links")
 
-            # Join trafo_ID from sample_key (via combined_key) if available
-            trafo_cols_to_join = ["trafo_ID", "trafo_id", "V_library", "nuclease_PAM", "yeast_sublibrary"]
-            for col in trafo_cols_to_join:
-                if col in row.index and pd.notna(row[col]):
-                    # Normalize trafo_ID column name
-                    target_col = "trafo_ID" if col == "trafo_id" else col
-                    df[target_col] = row[col]
+    # --- top link per bc1, purity (over ALL links; nothing filtered) ---
+    acc = acc.sort_values(["counts", "bc1", "donor", "bc0"], ascending=[False, True, True, True],
+                          kind="mergesort").reset_index(drop=True)
+    top = acc.drop_duplicates(subset=["bc1"], keep="first")[
+        ["bc1", "donor", "bc0", "counts", "num_PCR_replicates"]].rename(columns={
+            "donor": "top_donor", "bc0": "top_bc0", "counts": "top_counts",
+            "num_PCR_replicates": "top_num_PCR_replicates"})
+    acc = acc.merge(top, on="bc1", how="left")
+    acc["total_bc1_counts"] = acc.groupby("bc1")["counts"].transform("sum")
+    acc["bc1_purity"] = acc["counts"] / acc["total_bc1_counts"]
+    acc["num_distinct_donors"] = acc.groupby("bc1")["donor"].transform("nunique")
+    acc["edit_distance_to_top"] = [_lev.distance(a, b) for a, b in zip(acc["donor"], acc["top_donor"])]
+    acc["bc1_orientation"] = BC1_ORIENTATION
+    acc["donor_suffix_ambiguous"] = acc["donor_suffix_ambiguous"].astype(bool)
 
-            # Supplement/override from separate trafo_key if provided
-            if trafo_key is not None:
-                sample_trafo = trafo_key[trafo_key["sample_number"] == row["sample_number"]]
-                if len(sample_trafo) == 1:
-                    for col in ["trafo_ID", "V_library", "nuclease_PAM", "yeast_sublibrary"]:
-                        if col in sample_trafo.columns:
-                            df[col] = sample_trafo[col].iloc[0]
-                elif len(sample_trafo) > 1:
-                    print(f"WARNING: Multiple trafo entries for sample {row['sample_number']}")
+    lead = ["bc1", "donor", "bc0", "SPS", "donor_bc0_fragment", "counts", *TIER_COLS,
+            "num_PCR_replicates", "support_tier", "pcr_replicate_ids", "runs_observed",
+            "yeast_libraries_observed",
+            "total_bc1_counts", "bc1_purity", "num_distinct_donors", "edit_distance_to_top",
+            "top_donor", "top_bc0", "top_counts", "top_num_PCR_replicates",
+            "donor_suffix_ambiguous", "donor_lengths_observed", "bc1_orientation", *trafo_present]
+    acc = acc[lead]
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_collapsed)), exist_ok=True)
+    acc.to_csv(args.output_collapsed, sep="\t", index=False)
+    log(f"saved {len(acc):,} links -> {args.output_collapsed}")
 
-            dfs.append(df)
+    purity = acc.groupby("bc1").agg(total_counts=("counts", "sum"),
+                                    max_PCR_replicates=("num_PCR_replicates", "max"),
+                                    max_purity=("bc1_purity", "max"),
+                                    num_donors=("num_distinct_donors", "first")).reset_index()
+    purity.to_csv(args.output_purity, sep="\t", index=False)
 
-    if not dfs:
-        print("No data files found!")
-        return
-
-    combined_df = pd.concat(dfs, ignore_index=True)
-    print(f"Loaded {len(combined_df)} total rows")
-
-    # Report trafo_ID coverage if applicable
-    if has_trafo_in_sample_key and "trafo_ID" in combined_df.columns:
-        trafo_coverage = combined_df["trafo_ID"].notna().sum() / len(combined_df) * 100
-        print(f"trafo_ID coverage: {trafo_coverage:.1f}%")
-        print(f"trafo_ID distribution: {combined_df['trafo_ID'].value_counts().to_dict()}")
-
-    # Determine columns based on read type (2x300 has 'donor', 2x150 has 'donor_bc0_fragment')
-    has_full_donor = "donor" in combined_df.columns
-    seq_col = "donor" if has_full_donor else "donor_bc0_fragment"
-
-    # Identify trafo columns to preserve through collapsing
-    trafo_cols = ["trafo_ID", "V_library", "nuclease_PAM", "yeast_sublibrary"]
-    trafo_cols_present = [col for col in trafo_cols if col in combined_df.columns]
-
-    print(f"Using sequence column: {seq_col}")
-    print(f"Unique bc1s before collapsing: {combined_df['bc1'].nunique()}")
-    if trafo_cols_present:
-        print(f"trafo columns to preserve: {trafo_cols_present}")
-
-    # Aggregate counts per bc1-donor-bc0 combination within each sample
-    group_cols = ["sample_number", "outer_primers", "bc1", seq_col]
-    if "bc0" in combined_df.columns and has_full_donor:
-        group_cols.append("bc0")
-
-    combined_df = combined_df.groupby(group_cols)["counts"].sum().reset_index()
-
-    # Step 1: Collapse similar donors within each sample
-    print("\nStep 1: Collapsing similar donors within samples...")
-    collapse_group_cols = ["sample_number", "outer_primers", "bc1"]
-    if "bc0" in combined_df.columns and has_full_donor:
-        collapse_group_cols.append("bc0")
-
-    collapsed_donors = collapse_sequences(
-        combined_df,
-        group_cols=collapse_group_cols,
-        seq_col=seq_col,
-        count_cols="counts",
-        edit_distance_threshold=args.donor_edit_distance,
-        n_jobs=args.n_jobs,
-        preserve_cols=trafo_cols_present
-    )
-
-    # Step 2: Collapse similar bc1s within each sample
-    print("\nStep 2: Collapsing similar bc1s within samples...")
-    bc1_group_cols = ["sample_number", "outer_primers", seq_col]
-    if "bc0" in combined_df.columns and has_full_donor:
-        bc1_group_cols.append("bc0")
-
-    collapsed_bc1 = collapse_sequences(
-        collapsed_donors,
-        group_cols=bc1_group_cols,
-        seq_col="bc1",
-        count_cols="counts",
-        edit_distance_threshold=args.bc1_edit_distance,
-        n_jobs=args.n_jobs,
-        preserve_cols=trafo_cols_present
-    )
-
-    # Step 3: Collapse similar bc0s within each sample (if present)
-    if "bc0" in collapsed_bc1.columns and has_full_donor:
-        print("\nStep 3: Collapsing similar bc0s within samples...")
-        collapsed_bc0 = collapse_sequences(
-            collapsed_bc1,
-            group_cols=["sample_number", "outer_primers", "bc1", seq_col],
-            seq_col="bc0",
-            count_cols="counts",
-            edit_distance_threshold=args.bc0_edit_distance,
-            n_jobs=args.n_jobs,
-            preserve_cols=trafo_cols_present
-        )
-    else:
-        collapsed_bc0 = collapsed_bc1
-
-    # Create PCR replicate ID
-    collapsed_bc0["PCR_replicate_id"] = (
-        collapsed_bc0["sample_number"].astype(str) + "_" + collapsed_bc0["outer_primers"]
-    )
-
-    # Aggregate across all samples
-    print("\nAggregating across samples...")
-    agg_group_cols = ["bc1", seq_col]
-    if "bc0" in collapsed_bc0.columns and has_full_donor:
-        agg_group_cols.append("bc0")
-
-    # Build aggregation dict
-    agg_dict = {
-        "counts": "sum",
-        "PCR_replicate_id": "nunique"
+    # --- accounting / provenance sidecars ---
+    aside_df = pd.DataFrame(asides)
+    aside_df.to_csv(f"{args.output_collapsed}.setaside.tsv", sep="\t", index=False)
+    rep_legend = present.groupby("pcr_replicate_id").agg(
+        n_samples=("sample_id", "size"), sample_ids=("sample_id", lambda s: ";".join(sorted(s))),
+        sequencing_dates=("sequencing_date", lambda s: ";".join(sorted(set(s))))).reset_index()
+    rep_legend.to_csv(f"{args.output_collapsed}.replicate_ids.tsv", sep="\t", index=False)
+    tier_counts = acc["support_tier"].value_counts().to_dict()
+    stats = {
+        "argv": sys.argv, "manifest": args.manifest,
+        "manifest_md5": hashlib.md5(Path(args.manifest).read_bytes()).hexdigest() if args.manifest else None,
+        "samples_defined": int(len(man)), "samples_present": int(len(present)),
+        "samples_missing": man.loc[~man["present"], "sample_id"].tolist(),
+        "pcr_replicate_ids": len(rep_ids), "sequencing_runs": runs,
+        "support_threshold": args.min_pcr_replicates, "support_tier_links": tier_counts,
+        "support_tier_bc1": acc.drop_duplicates("bc1")["support_tier"].value_counts().to_dict(),
+        "links_after_aggregation": n_links_agg, "suffix_attach": attach_stats,
+        "links_out": int(len(acc)), "bc1_out": int(acc["bc1"].nunique()),
+        "reads_in": int(aside_df["reads_in"].sum()),
+        "reads_set_aside": {k: int(aside_df[k].sum()) for k in aside_df.columns if k.startswith("reads_no_")},
+        "reads_out": int(acc["counts"].sum()),
+        "bc1_orientation": BC1_ORIENTATION, "tier_columns": TIER_COLS,
+        "edit_distances": thr, "attach_dominance": args.attach_dominance,
+        "zero_link_samples": [a["sample_id"] for a in asides if a.get("rows_out", 0) == 0],
+        "elapsed_s": round(time.time() - t0, 1),
     }
-
-    # Include trafo columns in aggregation if present (take first non-null value per bc1)
-    # trafo_ID should be consistent within each bc1, so first() is appropriate
-    trafo_cols_in_collapsed = [col for col in trafo_cols_present if col in collapsed_bc0.columns]
-    for col in trafo_cols_in_collapsed:
-        agg_dict[col] = "first"
-
-    all_samples_df = collapsed_bc0.groupby(agg_group_cols).agg(agg_dict).reset_index()
-    all_samples_df = all_samples_df.rename(columns={"PCR_replicate_id": "num_PCR_replicates"})
-
-    if trafo_cols_in_collapsed:
-        print(f"trafo columns propagated: {trafo_cols_in_collapsed}")
-
-    # Step 4: Collapse similar sequences across all samples
-    print("\nStep 4: Collapsing across all samples...")
-
-    # Determine which trafo columns to preserve
-    trafo_cols_to_preserve = [col for col in trafo_cols_in_collapsed if col in all_samples_df.columns]
-
-    collapsed_all_donors = collapse_sequences(
-        all_samples_df,
-        group_cols=["bc1"] + (["bc0"] if "bc0" in agg_group_cols else []),
-        seq_col=seq_col,
-        count_cols=["counts", "num_PCR_replicates"],
-        edit_distance_threshold=args.donor_edit_distance,
-        n_jobs=args.n_jobs,
-        preserve_cols=trafo_cols_to_preserve
-    )
-
-    collapsed_all_bc1 = collapse_sequences(
-        collapsed_all_donors,
-        group_cols=[seq_col] + (["bc0"] if "bc0" in agg_group_cols else []),
-        seq_col="bc1",
-        count_cols=["counts", "num_PCR_replicates"],
-        edit_distance_threshold=args.bc1_edit_distance,
-        n_jobs=args.n_jobs,
-        preserve_cols=trafo_cols_to_preserve
-    )
-
-    if "bc0" in agg_group_cols:
-        collapsed_final = collapse_sequences(
-            collapsed_all_bc1,
-            group_cols=["bc1", seq_col],
-            seq_col="bc0",
-            count_cols=["counts", "num_PCR_replicates"],
-            edit_distance_threshold=args.bc0_edit_distance,
-            n_jobs=args.n_jobs,
-            preserve_cols=trafo_cols_to_preserve
-        )
-    else:
-        collapsed_final = collapsed_all_bc1
-
-    # Sort by counts
-    collapsed_final = collapsed_final.sort_values("counts", ascending=False)
-
-    # Identify top donor per bc1
-    top_per_bc1 = collapsed_final.drop_duplicates(subset=["bc1"], keep="first").copy()
-    top_per_bc1 = top_per_bc1.rename(columns={
-        seq_col: f"top_{seq_col}",
-        "counts": "top_counts",
-        "num_PCR_replicates": "top_num_PCR_replicates"
-    })
-    if "bc0" in top_per_bc1.columns:
-        top_per_bc1 = top_per_bc1.rename(columns={"bc0": "top_bc0"})
-
-    # Merge top info back
-    merge_cols = ["bc1", f"top_{seq_col}", "top_counts", "top_num_PCR_replicates"]
-    if "top_bc0" in top_per_bc1.columns:
-        merge_cols.append("top_bc0")
-    collapsed_final = collapsed_final.merge(top_per_bc1[merge_cols], on="bc1", how="left")
-
-    # Filter for reproducible bc1s
-    filtered_df = collapsed_final[
-        collapsed_final["num_PCR_replicates"] >= args.min_pcr_replicates
-    ].copy()
-
-    print(f"\nFiltering for >= {args.min_pcr_replicates} PCR replicates:")
-    print(f"  Before: {collapsed_final['bc1'].nunique()} unique bc1s")
-    print(f"  After: {filtered_df['bc1'].nunique()} unique bc1s")
-
-    # Add purity metrics
-    filtered_df["total_bc1_counts"] = filtered_df.groupby("bc1")["counts"].transform("sum")
-    filtered_df["bc1_purity"] = filtered_df["counts"] / filtered_df["total_bc1_counts"]
-    filtered_df["num_distinct_donors"] = filtered_df.groupby("bc1")[seq_col].transform("nunique")
-
-    # Calculate edit distance to top
-    top_col = f"top_{seq_col}"
-    filtered_df["edit_distance_to_top"] = filtered_df.apply(
-        lambda row: distance(str(row[seq_col]), str(row[top_col]))
-        if pd.notna(row[seq_col]) and pd.notna(row[top_col]) else None,
-        axis=1
-    )
-
-    # Save collapsed data
-    os.makedirs(os.path.dirname(args.output_collapsed), exist_ok=True)
-    filtered_df.to_csv(args.output_collapsed, sep="\t", index=False)
-    print(f"\nSaved collapsed data to: {args.output_collapsed}")
-
-    # Generate purity summary
-    purity_summary = filtered_df.groupby("bc1").agg({
-        "counts": "sum",
-        "num_PCR_replicates": "max",
-        "bc1_purity": "max",
-        "num_distinct_donors": "first"
-    }).reset_index()
-    purity_summary.columns = ["bc1", "total_counts", "max_PCR_replicates", "max_purity", "num_donors"]
-
-    purity_summary.to_csv(args.output_purity, sep="\t", index=False)
-    print(f"Saved purity summary to: {args.output_purity}")
-
-    # Print summary statistics
-    print("\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"Total unique bc1s: {filtered_df['bc1'].nunique()}")
-    print(f"Total rows: {len(filtered_df)}")
-    print(f"Total counts: {filtered_df['counts'].sum()}")
-    print(f"BC1s with single donor: {(purity_summary['num_donors'] == 1).sum()}")
-    print(f"BC1s with multiple donors: {(purity_summary['num_donors'] > 1).sum()}")
-    print(f"Mean purity: {purity_summary['max_purity'].mean():.3f}")
-    print(f"Median purity: {purity_summary['max_purity'].median():.3f}")
-
-    # Report trafo_ID distribution if present
-    if "trafo_ID" in filtered_df.columns:
-        print("\ntrafo_ID distribution:")
-        trafo_counts = filtered_df.groupby("trafo_ID")["bc1"].nunique()
-        for trafo_id, count in trafo_counts.items():
-            print(f"  {trafo_id}: {count} unique bc1s")
+    with open(f"{args.output_collapsed}.stats.json", "w") as fh:
+        json.dump(stats, fh, indent=1, default=str)
+    set_aside = sum(stats["reads_set_aside"].values())
+    if stats["reads_in"] != stats["reads_out"] + set_aside:
+        die(f"read accounting broken: in {stats['reads_in']} != out {stats['reads_out']} + "
+            f"set aside {set_aside}")
+    log(f"support_tier (links): {tier_counts}; reads in {stats['reads_in']:,} = out "
+        f"{stats['reads_out']:,} + set aside {set_aside:,}")
+    log("done")
 
 
 if __name__ == "__main__":
