@@ -40,6 +40,27 @@ UNIVERSAL_DOWNSTREAM = "CGTGCATAAC"     # 10-mer; 8 hits genome-wide (~= the 12-
 DOWNSTREAM_FALLBACK = "CGTGCATA"        # 8-mer; 185 hits (26x) -- OFFSET-CONSTRAINED USE ONLY
 BC1_LENGTH = 20
 
+#: The anchor-tier vocabulary, in decreasing order of evidence. SINGLE SOURCE
+#: OF TRUTH -- every consumer must iterate this rather than an inline literal.
+#: A hardcoded 5-tuple in 02_parse_bc1_reads.py made the four tiers added on
+#: 2026-09-09 invisible in the log, with printed percentages that did not sum
+#: to 100%. Adding a tier must not require finding every list that names them.
+ANCHOR_TIERS = (
+    "confirmed",                     # full 10-mer, exact, in the window
+    "confirmed_mismatch",            # full 10-mer, <=1 substitution, at the offset
+    "confirmed_truncated",           # read ends mid-anchor; fitting prefix exact
+    "confirmed_truncated_mismatch",  # truncated AND <=1 substitution
+    "confirmed_indel",               # <=1 indel, offset-constrained
+    "offset_fallback",               # 8-mer at the established offset
+    "prefix_only",                   # upstream verified, no downstream confirmation
+    "length_mismatch",               # read too short for a full barcode
+    "none",                          # no upstream anchor within k on either strand
+)
+
+#: Tiers that yield a usable bc1. The other two return bc1=None by construction,
+#: so they can never appear as a row in a bc1-keyed table.
+EMITTING_TIERS = ANCHOR_TIERS[:6]
+
 #: observed universal-anchor offset -> layout label
 LAYOUT_BY_OFFSET: Dict[int, str] = {18: "A_1.0/2.5", 1: "B_no_spacer", 10: "C_3.0"}
 #: widest window in which the universal anchor may sit (max offset + its length)
