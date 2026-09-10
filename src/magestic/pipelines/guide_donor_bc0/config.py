@@ -122,7 +122,7 @@ class GuideDonorBC0Config:
     Leave empty to skip missing-oligo filling."""
 
     # Oligo-design source for Step 03 matching
-    use_harmonized_table: bool = False
+    use_harmonized_table: bool = True
     """Match against the harmonized QTL oligo table (per-nuclease guide/donor)
     instead of slicing the raw 200mer at fixed SpCas9/SpG offsets. Required for
     LbCas12a libraries (the fixed slice mis-extracts their guide/donor)."""
