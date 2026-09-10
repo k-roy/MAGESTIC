@@ -77,6 +77,9 @@ from collections import defaultdict
 import re
 from typing import Dict, List, Optional, Tuple
 import logging
+import json
+import subprocess
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -520,8 +523,16 @@ Examples:
 
     # Load primary bc1-donor-bc0 data
     logger.info("Loading mapped bc1-donor-bc0 data...")
-    df = pd.read_csv(args.input, sep="\t")
+    df = pd.read_csv(args.input, sep="\t", low_memory=False)
     logger.info(f"Loaded {len(df)} rows with {df['bc1'].nunique()} unique bc1s")
+    n_input_rows, n_input_bc1 = len(df), df["bc1"].nunique()
+    link_key = [c for c in ("bc1", "donor", "bc0") if c in df.columns]
+    if len(link_key) == 3 and df.duplicated(subset=link_key).any():
+        raise SystemExit(
+            f"ERROR: {int(df.duplicated(subset=link_key).sum())} duplicated (bc1, donor, bc0) links in "
+            f"{args.input}. This is what per-run step-02 tables concatenated at step 04 look like "
+            f"(review F2, 2026-09-10): the top link would come from ONE run. Run step 02 once over "
+            f"every run with --manifest.")
 
     # Load SPS mapping
     logger.info(f"Loading SPS mapping from: {mapping_file}")
@@ -650,10 +661,34 @@ Examples:
     # Find counts column
     count_col = "counts" if "counts" in df.columns else "total_counts"
 
-    # Keep top donor per bc1 for reference table
-    bc1_reference = df.sort_values(count_col, ascending=False).drop_duplicates(
-        subset=["bc1"], keep="first"
-    ).copy()
+    # 2026-09-10: barcode<->donor UNCOUPLING, visible rather than silently first-wins
+    # (the WGS lane's ask; QK-011 measured ~4.5x more uncoupling with Q5 than KAPA).
+    # Distinct designed oligos over ALL of the bc1's links, computed BEFORE the
+    # one-row-per-bc1 reduction below discards the minority links.
+    if "oligo_name" in df.columns:
+        df["maps_to_n_variants"] = df.groupby("bc1")["oligo_name"].transform("nunique").astype("int64")
+        # maps_to_n_variants counts EVERY link, including 1-read error/chimera links, so on the 20210822 smoke it
+        # was >= 2 for ~34% of bc1 -- too noisy to exclude on. Two better-behaved companions (29_):
+        #   top_oligo_read_share: share of the bc1's reads on links naming the same oligo as its top link;
+        #   maps_to_n_variants_confident: distinct oligos among links with >= 2 distinct PCR replicates.
+        _cnt = "counts" if "counts" in df.columns else "total_counts"
+        _top = df.sort_values([_cnt], ascending=False, kind="mergesort").drop_duplicates("bc1").set_index("bc1")["oligo_name"]
+        _on_top = df["oligo_name"].notna() & (df["oligo_name"] == df["bc1"].map(_top))
+        _tot = df.groupby("bc1")[_cnt].transform("sum")
+        df["top_oligo_read_share"] = (df[_cnt].where(_on_top, 0).groupby(df["bc1"]).transform("sum")
+                                      / _tot.where(_tot > 0)).round(4).where(df["bc1"].map(_top).notna())
+        # (undefined -- NaN, not 0 -- when the bc1's top link maps to no designed oligo)
+        if "support_tier" in df.columns:
+            _conf = df["oligo_name"].where(df["support_tier"] == "confident")
+            df["maps_to_n_variants_confident"] = _conf.groupby(df["bc1"]).transform("nunique").astype("int64")
+    df["n_links"] = df.groupby("bc1")["bc1"].transform("size").astype("int64")
+
+    # Keep top donor per bc1 for reference table. Deterministic on ties (the old
+    # default quicksort was not stable, so a tie could pick a different link per run).
+    tie_order = {count_col: False, "num_PCR_replicates": False, "donor": True, "bc0": True}
+    tie_cols = [c for c in tie_order if c in df.columns]
+    bc1_reference = df.sort_values(tie_cols, ascending=[tie_order[c] for c in tie_cols],
+                                   kind="mergesort").drop_duplicates(subset=["bc1"], keep="first").copy()
 
     # Select columns for reference table
     ref_cols = ["bc1"]
@@ -673,15 +708,39 @@ Examples:
                 "sublibrary_purity", "sublibrary_source", "sublibrary_confidence",
                 "library_ID",  # Legacy
                 "oligo_name", "guide", count_col,
-                "num_PCR_replicates", "bc1_purity", "num_distinct_donors"]:
+                "num_PCR_replicates", "bc1_purity", "num_distinct_donors",
+                # 2026-09-10 (planning 28_ Sec. 1e). The allow-list is why these must be
+                # named: an unlisted column is dropped here silently.
+                *TIER_COUNT_COLUMNS_05, "support_tier", "pcr_replicate_ids", "runs_observed",
+                "yeast_libraries_observed",
+                "total_bc1_counts", "maps_to_n_variants", "maps_to_n_variants_confident",
+                "top_oligo_read_share", "n_links",
+                "donor_suffix_ambiguous", "donor_lengths_observed",
+                "guide_link_counts", "guide_link_n_guides", "bc1_orientation"]:
         if col in bc1_reference.columns and col not in ref_cols:
             ref_cols.append(col)
 
     bc1_reference = bc1_reference[ref_cols]
+    missing_contract = [c for c in ("support_tier", "bc1_orientation", *TIER_COUNT_COLUMNS_05)
+                        if c not in bc1_reference.columns]
+    if missing_contract:
+        logger.warning(f"Reference table lacks contract columns {missing_contract} -- input predates "
+                       f"the 2026-09-10 step 01/02 (tier counts / support_tier / orientation).")
+    if all(c in bc1_reference.columns for c in TIER_COUNT_COLUMNS_05) and count_col in bc1_reference.columns:
+        bad = int((bc1_reference[count_col] != bc1_reference[list(TIER_COUNT_COLUMNS_05)].sum(axis=1)).sum())
+        if bad:
+            raise SystemExit(f"ERROR: {bad} reference rows violate counts == sum(n_<tier>)")
+
+    # Schema fidelity: the reference table has always called the top link's read count
+    # ``total_counts`` (its 2026-05-27 build came via 02_simple_combine). The rebuilt
+    # step 02 emits ``counts``; restore the established name so no consumer breaks.
+    if count_col == "counts" and "total_counts" not in bc1_reference.columns:
+        bc1_reference = bc1_reference.rename(columns={"counts": "total_counts"})
 
     # Save reference table
     bc1_reference.to_csv(args.output_reference, sep="\t", index=False)
     logger.info(f"\nSaved bc1 reference table ({len(bc1_reference)} bc1s) to: {args.output_reference}")
+    _write_provenance(args, bc1_reference, n_input_rows, n_input_bc1)
 
     # Generate purity summary
     group_col = "yeast_sublibrary" if df["yeast_sublibrary"].notna().any() else "V_library"
@@ -744,6 +803,42 @@ Examples:
             logger.info(f"  {name}: {len(source)} bc1s")
         if bc1_trafo_sources:
             logger.info(f"  Merged total: {len(bc1_to_trafo)} bc1s")
+
+
+# Imported unconditionally: a silent fallback to () would drop all seven tier columns
+# through the allow-list and turn the invariant check into a false alarm (review F3).
+from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS as TIER_COUNT_COLUMNS_05, BC1_ORIENTATION
+
+
+def _git_state():
+    here = Path(__file__).resolve().parent
+    try:
+        head = subprocess.run(["git", "-C", str(here), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, timeout=30).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(here), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=30).stdout.strip()
+        return {"git_head": head or None, "git_tracked_dirty": bool(dirty)}
+    except Exception as e:  # never fail a build for provenance
+        return {"git_head": None, "git_error": str(e)}
+
+
+def _write_provenance(args, ref, n_input_rows, n_input_bc1):
+    """<output_reference>.provenance.json -- what built this table, and its conventions."""
+    prov = {
+        "step": "05_assign_sublibrary", "argv": sys.argv, **_git_state(),
+        "input": args.input, "input_rows": int(n_input_rows), "input_bc1": int(n_input_bc1),
+        "output_reference": args.output_reference, "rows": int(len(ref)),
+        "unique_bc1": int(ref["bc1"].nunique()), "columns": list(ref.columns),
+        "bc1_orientation": BC1_ORIENTATION,
+        "bc1_orientation_meaning": ("bc1 string = the 20 nt read 5'->3' immediately downstream of "
+                                    "CAGGTCATGCTC on whichever read strand carried it (the CATGCTC-[N20] "
+                                    "read structure). Genome(+) holds the reverse complement. Join "
+                                    "screen/WGS barcodes in THIS orientation or the join returns zero rows."),
+        "support_tier_bc1": ref["support_tier"].value_counts().to_dict() if "support_tier" in ref.columns else None,
+        "maps_to_n_variants_gt1": int((ref["maps_to_n_variants"] > 1).sum()) if "maps_to_n_variants" in ref.columns else None,
+    }
+    with open(f"{args.output_reference}.provenance.json", "w") as fh:
+        json.dump(prov, fh, indent=1, default=str)
 
 
 if __name__ == "__main__":
