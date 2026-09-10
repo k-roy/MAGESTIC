@@ -2,6 +2,14 @@
 Snakemake Rules: BC1-Donor-BC0 Pipeline
 =======================================
 
+!! 2026-09-10 (planning 27_/28_): DO NOT use these rules for a screen sequenced on more
+!! than one run. combine_02 runs per {run_date} and the per-run tables are concatenated
+!! at step 04, so step 05 would take each bc1's top link from ONE run, replicate support
+!! would never union across runs, and cross-read-length (2x150 -> 2x300) donors would never
+!! reconcile. Step 05 now refuses duplicated (bc1, donor, bc0) links for exactly this
+!! reason. Run 02_combine_and_collapse.py ONCE with --manifest over every run instead
+!! (see the 20210822 rebuild driver, bc1_donor_bc0_REBUILD_20260910/scripts/run02_05.sbatch).
+
 Reusable rules for processing MAGESTIC bc1-donor-bc0 amplicon data.
 
 Pipeline Steps:

@@ -100,6 +100,22 @@ Examples:
     )
 
     parser.add_argument(
+        '--gdb-dir',
+        type=Path,
+        default=None,
+        help='Guide-donor-bc0 table directory, EXPLICIT (overrides auto-detection). '
+             'Auto-detection points at <project>/processed_data/guide_donor_bc0, whose '
+             'top level holds no tables for some screens (0 files -> formerly a silent '
+             'empty gdb) and whose subdirectory may hold SUPERSEDED tables (G3, 27_).'
+    )
+
+    parser.add_argument(
+        '--no-gdb',
+        action='store_true',
+        help='Run explicitly WITHOUT guide-donor-bc0 data'
+    )
+
+    parser.add_argument(
         '--debug',
         action='store_true',
         help='Run in debug mode with limited data'
@@ -451,9 +467,13 @@ def aggregate_and_filter(
         agg_df = agg_df[agg_df['counts'] >= min_reads]
         logger.info(f"  After min reads filter: {len(agg_df)} rows")
 
+    # LABEL, never filter (Kevin 2026-09-10; 21_). The threshold names the tier.
     if 'num_PCR_replicates' in agg_df.columns and min_pcr_replicates > 0:
-        agg_df = agg_df[agg_df['num_PCR_replicates'] >= min_pcr_replicates]
-        logger.info(f"  After min PCR replicates filter: {len(agg_df)} rows")
+        agg_df['support_tier'] = np.where(agg_df['num_PCR_replicates'] >= min_pcr_replicates,
+                                          'confident', 'provisional')
+        logger.info(f"  support_tier at >= {min_pcr_replicates} PCR replicates (no row dropped by replicates; "
+                    f"the min_reads={min_reads} filter above is separate): "
+                    f"{agg_df['support_tier'].value_counts().to_dict()}")
 
     # Calculate bc1 purity metrics
     if 'bc1' in agg_df.columns and 'counts' in agg_df.columns:
@@ -568,6 +588,16 @@ def run_pipeline(args):
     config.min_reads = args.min_reads
     config.min_pcr_replicates = args.min_pcr_replicates
 
+    if args.gdb_dir and args.no_gdb:
+        logger.error("Give --gdb-dir or --no-gdb, not both.")
+        return None
+    if args.gdb_dir:
+        config.gdb_dir = Path(args.gdb_dir)
+        config.has_gdb_data = True
+    elif args.no_gdb:
+        config.gdb_dir = None
+        config.has_gdb_data = False
+
     # Validate configuration
     errors = config.validate()
     if errors:
@@ -598,6 +628,12 @@ def run_pipeline(args):
         debug_mode=args.debug,
         debug_n_samples=args.debug_n_samples
     )
+    # G3 (27_): a gdb directory that yields ZERO tables used to be a warning and an
+    # empty frame -- the run then "succeeded" with no guide disambiguation at all.
+    if config.has_gdb_data and 'gdb' not in data_sources:
+        logger.error(f"gdb directory {config.gdb_dir} yielded no guide-donor-bc0 tables. Pass "
+                     f"--gdb-dir <dir with the tables> or --no-gdb to run without them explicitly.")
+        return None
 
     if not data_sources:
         logger.error("No data loaded from any source")

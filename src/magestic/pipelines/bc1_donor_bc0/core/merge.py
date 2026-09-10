@@ -15,6 +15,7 @@ that can link 2x150 fragments to 2x300 complete sequences.
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
+import numpy as np
 import pandas as pd
 import logging
 
@@ -605,10 +606,18 @@ def filter_by_quality(
     min_reads: int = 2,
     min_pcr_replicates: int = 1,
     min_purity: Optional[float] = None,
-    purity_column: Optional[str] = None
+    purity_column: Optional[str] = None,
+    mode: str = "label",
 ) -> pd.DataFrame:
     """
     Filter merged data by quality thresholds.
+
+    2026-09-10 (21_ guard): ``mode="label"`` (DEFAULT) applies the PCR-replicate
+    threshold as a ``support_tier`` label and drops nothing on replicates; the
+    read and purity thresholds still filter. ``mode="filter"`` is the old
+    row-dropping behaviour and must be asked for by name. This function had zero
+    callers while armed at 2 by config -- wiring it in would have silently deleted
+    the singleton tier.
 
     Args:
         df: Merged DataFrame from merge_data_sources
@@ -626,8 +635,14 @@ def filter_by_quality(
     df = df[df['total_counts'] >= min_reads]
     logger.info(f"After min_reads={min_reads} filter: {len(df)} records (removed {initial_count - len(df)})")
 
-    # Filter by PCR replicates
-    if min_pcr_replicates > 1:
+    # PCR replicates: label (default) or filter (explicit)
+    if mode not in ("label", "filter"):
+        raise ValueError(f"mode must be 'label' or 'filter', got {mode!r}")
+    if mode == "label":
+        df = df.copy()
+        df['support_tier'] = np.where(df['total_pcr_replicates'] >= max(min_pcr_replicates, 1),
+                                      'confident', 'provisional')
+    elif min_pcr_replicates > 1:
         before = len(df)
         df = df[df['total_pcr_replicates'] >= min_pcr_replicates]
         logger.info(f"After min_pcr_replicates={min_pcr_replicates} filter: {len(df)} records (removed {before - len(df)})")

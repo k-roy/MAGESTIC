@@ -249,48 +249,66 @@ def main():
     combined = combined[combined["donor"].notna()].copy()
     print(f"After filtering for full donor: {combined['bc1'].nunique()} unique bc1s")
 
-    # Aggregate
-    agg_df = combined.groupby(["bc1", "donor", "bc0"]).agg({
-        "counts": "sum",
-        "num_PCR_replicates": "sum",
-        "source_file": lambda x: ",".join(sorted(set(x)))
-    }).reset_index()
+    # 2026-09-10 (planning 28_ e6): replicate support is a SET unioned across runs --
+    # summing num_PCR_replicates across runs counted a re-sequenced library twice, and
+    # the >= min_pcr_replicates FILTER deleted the singleton tier. Now: exact union when
+    # every input carries pcr_replicate_ids (step 02 >= 2026-09-10), a loudly-flagged
+    # upper bound otherwise; and a support_tier LABEL instead of a filter.
+    from magestic.pipelines.bc1_donor_bc0.core.link_collapse import (
+        aggregate_links, collapse_links, mask_columns, masks_for_codes, popcount_rows, decode_masks)
+    try:
+        from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS
+    except ImportError:
+        TIER_COUNT_COLUMNS = ()
+    tier_cols = [c for c in TIER_COUNT_COLUMNS if c in combined.columns]
+    if tier_cols and combined[tier_cols].isna().any().any():
+        # mixed-schema inputs (some pre-2026-09-10): NaN would be cast to INT64_MIN (review F3)
+        print("WARNING: tier columns missing for some inputs -- dropping n_<tier> from the output")
+        combined = combined.drop(columns=tier_cols)
+        tier_cols = []
+    sum_cols = ["counts", *tier_cols]
+    exact = "pcr_replicate_ids" in combined.columns and combined["pcr_replicate_ids"].notna().all()
+    if exact:
+        combined = combined.reset_index(drop=True)
+        ex = combined["pcr_replicate_ids"].astype(str).str.split(";").explode()
+        ex = ex[ex != ""]
+        universe = sorted(set(ex))
+        code = {r: k for k, r in enumerate(universe)}
+        or_cols = mask_columns(len(universe))
+        m = np.zeros((len(combined), len(or_cols)), dtype=np.uint64)
+        np.bitwise_or.at(m, ex.index.to_numpy(), masks_for_codes(ex.map(code).to_numpy(), len(universe)))
+        for k, c in enumerate(or_cols):
+            combined[c] = m[:, k]
+        print(f"Replicate support: EXACT union over {len(universe)} replicate ids")
+    else:
+        or_cols = []
+        sum_cols.append("num_PCR_replicates")
+        print("WARNING: inputs lack pcr_replicate_ids (pre-2026-09-10 step 02) -- num_PCR_replicates "
+              "is SUMMED across runs and is an UPPER BOUND (a re-sequenced library counts twice).")
+    combined["source_file"] = combined["source_file"].astype(str)
+    agg_df = aggregate_links(combined, ["bc1", "donor", "bc0"], "counts", sum_cols, or_cols, [])
+    src = combined.groupby(["bc1", "donor", "bc0"])["source_file"].agg(lambda x: ",".join(sorted(set(x))))
+    agg_df = agg_df.merge(src.rename("source_file").reset_index(), on=["bc1", "donor", "bc0"], how="left")
 
     print(f"\nAfter aggregation: {len(agg_df)} rows")
 
-    # Collapse similar sequences
-    print("\nCollapsing similar donors...")
-    collapsed_donors = collapse_sequences(
-        agg_df,
-        group_cols=["bc1", "bc0"],
-        seq_col="donor",
-        count_cols=["counts", "num_PCR_replicates"],
-        edit_distance_threshold=args.donor_edit_distance,
-        n_jobs=args.n_jobs
-    )
+    print("\nCollapsing similar donors / bc1s / bc0s (replicate sets unioned)...")
+    collapsed_bc0 = collapse_links(agg_df, ["bc1", "bc0"], "donor", "counts", sum_cols, or_cols,
+                                   ["source_file"], threshold=args.donor_edit_distance, n_jobs=args.n_jobs)
+    collapsed_bc0 = collapse_links(collapsed_bc0, ["bc0", "donor"], "bc1", "counts", sum_cols, or_cols,
+                                   ["source_file"], threshold=args.bc1_edit_distance, n_jobs=args.n_jobs)
+    collapsed_bc0 = collapse_links(collapsed_bc0, ["bc1", "donor"], "bc0", "counts", sum_cols, or_cols,
+                                   ["source_file"], threshold=1, n_jobs=args.n_jobs)
+    if exact:
+        mm = collapsed_bc0[or_cols].to_numpy(dtype=np.uint64)
+        collapsed_bc0["num_PCR_replicates"] = popcount_rows(mm)
+        collapsed_bc0["pcr_replicate_ids"] = decode_masks(mm, universe)
+        collapsed_bc0 = collapsed_bc0.drop(columns=or_cols)
+    collapsed_bc0["num_PCR_replicates_is_upper_bound"] = not exact
 
-    print("\nCollapsing similar bc1s...")
-    collapsed_bc1 = collapse_sequences(
-        collapsed_donors,
-        group_cols=["bc0", "donor"],
-        seq_col="bc1",
-        count_cols=["counts", "num_PCR_replicates"],
-        edit_distance_threshold=args.bc1_edit_distance,
-        n_jobs=args.n_jobs
-    )
-
-    print("\nCollapsing similar bc0s...")
-    collapsed_bc0 = collapse_sequences(
-        collapsed_bc1,
-        group_cols=["bc1", "donor"],
-        seq_col="bc0",
-        count_cols=["counts", "num_PCR_replicates"],
-        edit_distance_threshold=1,
-        n_jobs=args.n_jobs
-    )
-
-    # Sort and get top per bc1
-    collapsed_bc0 = collapsed_bc0.sort_values("counts", ascending=False)
+    # Sort and get top per bc1 (deterministic on ties)
+    collapsed_bc0 = collapsed_bc0.sort_values(["counts", "bc1", "donor", "bc0"],
+                                              ascending=[False, True, True, True], kind="mergesort")
 
     top_per_bc1 = collapsed_bc0.drop_duplicates(subset=["bc1"], keep="first").copy()
     top_per_bc1 = top_per_bc1.rename(columns={
@@ -306,10 +324,12 @@ def main():
         how="left"
     )
 
-    # Filter
-    filtered = result[result["num_PCR_replicates"] >= args.min_pcr_replicates].copy()
-    print(f"\nAfter filtering for >= {args.min_pcr_replicates} PCR replicates:")
-    print(f"  {filtered['bc1'].nunique()} unique bc1s")
+    # LABEL, never filter (Kevin 2026-09-10: N=2 as a label; every link retained)
+    filtered = result.copy()
+    filtered["support_tier"] = np.where(filtered["num_PCR_replicates"] >= args.min_pcr_replicates,
+                                        "confident", "provisional")
+    print(f"\nsupport_tier at >= {args.min_pcr_replicates} PCR replicates (no row dropped): "
+          f"{filtered.drop_duplicates('bc1')['support_tier'].value_counts().to_dict()} bc1s")
 
     # Add metrics
     filtered["total_bc1_counts"] = filtered.groupby("bc1")["counts"].transform("sum")
