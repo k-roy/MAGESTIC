@@ -248,7 +248,7 @@ def _scan_downstream(tail: str, established_offset: Optional[int]) -> Tuple[Opti
 def extract_bc1(
     seq: str,
     k: int = 1,
-    protect: int = 1,
+    protect: int = 0,
     bc1_length: int = BC1_LENGTH,
     established_offset: Optional[int] = None,
     search_both_strands: bool = True,
@@ -258,7 +258,18 @@ def extract_bc1(
     Args:
         k: mismatch budget for the upstream anchor. 1 = PCR amplicons,
            0 = WGS (no amplification error to recover). Recorded on the row.
-        protect: 3'-most anchor bases required to match exactly.
+        protect: 3'-most anchor bases required to match EXACTLY. Default 0.
+           This was 1 on the reasoning that "a mismatch adjacent to the barcode
+           can shift its start". That is true of an INDEL and false of a
+           SUBSTITUTION -- and k only ever admits substitutions, so the guard
+           was aimed at a failure mode it could not encounter, while rejecting
+           real reads. Measured 2026-09-09: dropping it recovers +0.05 to
+           +0.27% of reads, of which 94-100% are DOWNSTREAM-CONFIRMED (i.e. the
+           barcode start was independently verified by the universal anchor at
+           its established offset), and ZERO barcodes changed for reads both
+           settings extracted. The downstream anchor is the real guard against a
+           shifted start; ``protect`` was a weaker proxy for it. Set protect=1
+           when running WITHOUT downstream confirmation.
         established_offset: this sample's modal universal-anchor offset, if
            known. Enables the 8-mer fallback for reads whose tail is too short
            for the 10-mer (layout D). Omit to disable the fallback entirely.

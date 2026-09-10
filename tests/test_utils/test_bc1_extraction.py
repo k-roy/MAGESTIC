@@ -55,7 +55,7 @@ chk("k=0 rejects 1 mismatch",
 print("\n== protected 3' base (a mismatch there would shift the barcode start) ==")
 bad = UPSTREAM_ANCHOR[:-1] + ("A" if UPSTREAM_ANCHOR[-1]!="A" else "T")
 r = extract_bc1("GAGCTCCTACGACGTCGA"+bad+BC+TAILS["A_1.0/2.5"][0]+UNIVERSAL_DOWNSTREAM, k=1, protect=1)
-chk("mismatch at the barcode-adjacent base is refused", r.bc1 is None, f"got tier={r.anchor_tier}")
+chk("protect=1 refuses a mismatch at the barcode-adjacent base", r.bc1 is None, f"got tier={r.anchor_tier}")
 
 print("\n== pigeonhole seeding is COMPLETE (never misses a <=k match) ==")
 miss=0
@@ -162,4 +162,16 @@ chk("N-containing contexts never count as variants",
 chk("coverage_report flags a shallow catalog",
     PrefixCatalog().coverage_report()["barcodes"]==0)
 
+
+print("\n== protect: the downstream anchor is the guard, not the adjacent base ==")
+_bad_last = UPSTREAM_ANCHOR[:-1] + ("A" if UPSTREAM_ANCHOR[-1] != "A" else "T")
+_r = "GAGCTCCTACGACGTCGA" + _bad_last + BC + "ATAACAGGGTAATGGAAA" + UNIVERSAL_DOWNSTREAM
+chk("mismatch at the barcode-adjacent base IS accepted by default (k=1)",
+    extract_bc1(_r, k=1).bc1 == BC, f"got {extract_bc1(_r,k=1).anchor_tier}")
+chk("...and it is downstream-confirmed, so the start was verified",
+    extract_bc1(_r, k=1).anchor_tier == "confirmed")
+chk("protect=1 still available and still refuses it",
+    extract_bc1(_r, k=1, protect=1).bc1 is None)
+chk("k=0 is unaffected by protect (no mismatches admitted at all)",
+    extract_bc1(_r, k=0).bc1 is None)
 print(f"\n{P} passed, {F} failed")
