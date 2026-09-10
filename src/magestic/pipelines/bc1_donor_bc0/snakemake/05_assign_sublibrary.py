@@ -716,7 +716,11 @@ Examples:
                 "total_bc1_counts", "maps_to_n_variants", "maps_to_n_variants_confident",
                 "top_oligo_read_share", "n_links",
                 "donor_suffix_ambiguous", "donor_lengths_observed",
-                "guide_link_counts", "guide_link_n_guides", "bc1_orientation"]:
+                "guide_link_counts", "guide_link_n_guides", "bc1_orientation",
+                # 2026-09-10 (planning 30_ arm_bdb-F1): the top link's match flags. oligo_name of an ambiguous
+                # match is the sorted-first candidate; without these a wrong-edit row looks like a perfect one.
+                "match_method", "is_unambiguous", "num_candidates", "num_candidate_variants", "variant",
+                "candidate_oligos", "perfect_donor", "guide_match"]:
         if col in bc1_reference.columns and col not in ref_cols:
             ref_cols.append(col)
 

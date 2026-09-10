@@ -655,9 +655,26 @@ def _match_row(args):
     return match_sequence(donor, guide if pd.notna(guide) else None, tables)
 
 
+CANDIDATE_LIST_CAP = 50
+
+
+def format_candidates(candidates, n_variants: int) -> Optional[str]:
+    """';'-joined candidate oligo_names for a VARIANT-ambiguous match (n_variants > 1), else None.
+
+    The reported oligo_name of an ambiguous match is only the sorted-first candidate (_resolve_candidates), so
+    the candidates must ship with the row for a consumer to see that other edits were equally consistent with
+    the read (planning 30_ arm_bdb-F1). Capped at CANDIDATE_LIST_CAP names plus a '+N_more' token."""
+    if n_variants <= 1 or not candidates:
+        return None
+    c = sorted(set(candidates))
+    if len(c) > CANDIDATE_LIST_CAP:
+        return ";".join(c[:CANDIDATE_LIST_CAP]) + f";+{len(c) - CANDIDATE_LIST_CAP}_more"
+    return ";".join(c)
+
+
 def _get_perfect_result_map(tables: OligoLookupTables) -> Dict[str, tuple]:
     """donor -> (oligo_name, is_unambiguous, variant, num_candidate_oligos,
-    num_candidate_variants, match_method) for the perfect-donor, NO-guide case.
+    num_candidate_variants, match_method, candidate_oligos) for the perfect-donor, NO-guide case.
 
     Precomputes _resolve_candidates' variant-level collapse ONCE per `tables`
     (cached on the object) so match_dataframe's vectorized fast path can .map()
@@ -680,6 +697,7 @@ def _get_perfect_result_map(tables: OligoLookupTables) -> Dict[str, tuple]:
             len(cands),
             nv,
             "perfect" if nv == 1 else "perfect_ambiguous",
+            format_candidates(cands, nv),
         )
     try:
         tables._perfect_result_map = m
@@ -708,6 +726,9 @@ def match_dataframe(
     - {prefix}guide_match: True if guide contributed to match
     - {prefix}is_unambiguous: True if match is unambiguous
     - {prefix}match_method: Description of how match was made
+    - {prefix}num_candidates / {prefix}num_candidate_variants: candidate oligos / distinct installed variants
+    - {prefix}variant: installed variant id when unambiguous
+    - {prefix}candidate_oligos: ';'-joined candidates when num_candidate_variants > 1, else None
 
     PERFORMANCE: Supports parallel processing with n_jobs > 1 and
     processes in chunks for memory efficiency.
@@ -744,6 +765,7 @@ def match_dataframe(
     ncand = [0] * n
     ncandv = [0] * n
     var = [None] * n
+    cands = [None] * n
 
     # ---------------------------------------------------------------------
     # VECTORIZED FAST PATH (2026-06-02) — the perfect-donor majority.
@@ -777,10 +799,10 @@ def match_dataframe(
         fast_mask = mapped.notna().to_numpy(dtype=bool) & (~g_block)
         mapped_vals = mapped.to_numpy()
         for i in np.flatnonzero(fast_mask):
-            t = mapped_vals[i]  # (oligo, is_unambiguous, variant, n_oligo, n_var, method)
+            t = mapped_vals[i]  # (oligo, is_unambiguous, variant, n_oligo, n_var, method, candidates)
             oligo[i] = t[0]; pdon[i] = True; pmid[i] = True
             unamb[i] = bool(t[1]); var[i] = t[2]
-            ncand[i] = int(t[3]); ncandv[i] = int(t[4]); method[i] = t[5]
+            ncand[i] = int(t[3]); ncandv[i] = int(t[4]); method[i] = t[5]; cands[i] = t[6]
 
     # ---------------------------------------------------------------------
     # FALLBACK — unchanged per-row match_sequence for every non-fast row.
@@ -802,6 +824,7 @@ def match_dataframe(
         oligo[i] = r.oligo_name; pdon[i] = r.perfect_donor; pmid[i] = r.perfect_middle_region
         gmatch[i] = r.guide_match; unamb[i] = r.is_unambiguous; method[i] = r.match_method
         ncand[i] = r.num_candidate_oligos; ncandv[i] = r.num_candidate_variants; var[i] = r.variant
+        cands[i] = format_candidates(r.candidate_oligos, r.num_candidate_variants)
 
     # Single vectorized writeback
     df[f'{prefix}oligo_name'] = oligo
@@ -813,6 +836,7 @@ def match_dataframe(
     df[f'{prefix}num_candidates'] = ncand
     df[f'{prefix}num_candidate_variants'] = ncandv
     df[f'{prefix}variant'] = var
+    df[f'{prefix}candidate_oligos'] = cands
 
     n_matched = sum(1 for o in oligo if o is not None)
     n_perfect = sum(1 for x in pdon if x)

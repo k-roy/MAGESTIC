@@ -111,6 +111,10 @@ COLUMNS_BC1_DONOR_BC0 = [
     "codon_variant_type",
     "systematic_gene_name_locus",
     "common_gene_name_locus",
+    # The matcher's variant identity (core/matching.py VARIANT_COLUMN). Without it the matcher silently falls back
+    # to the donor SEQUENCE, which splits one edit ~2.67 ways and flips is_unambiguous on 18% of 20210822 fixture
+    # links (planning 30_ IO-XF1).
+    "individual_variants",
 ]
 
 
