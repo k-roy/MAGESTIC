@@ -33,6 +33,7 @@ Nothing is ever silently dropped, normalized or padded. Every read gets a tier.
 
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Tuple, Dict
+from collections import Counter as _Counter
 
 # --- the canonical anchors -------------------------------------------------
 UPSTREAM_ANCHOR = "CAGGTCATGCTC"        # 12-mer; 7 hits genome-wide
@@ -57,9 +58,27 @@ ANCHOR_TIERS = (
     "none",                          # no upstream anchor within k on either strand
 )
 
-#: Tiers that yield a usable bc1. The other two return bc1=None by construction,
-#: so they can never appear as a row in a bc1-keyed table.
-EMITTING_TIERS = ANCHOR_TIERS[:6]
+#: Tiers that yield a usable bc1 -- SEVEN of them. ``length_mismatch`` and ``none``
+#: return bc1=None by construction, so they can never appear as a row in a
+#: bc1-keyed table; every other tier, INCLUDING ``prefix_only``, returns a barcode.
+#: (Was ``ANCHOR_TIERS[:6]`` until 2026-09-10, which silently omitted
+#: ``prefix_only`` -- harmless while its one caller excluded prefix_only by name,
+#: but a per-tier count table built from it would have broken
+#: ``counts == sum(n_<tier>)`` on every prefix_only read.)
+EMITTING_TIERS = ANCHOR_TIERS[:7]
+NON_EMITTING_TIERS = ANCHOR_TIERS[7:]
+
+#: Column name for a per-tier read count, in EMITTING_TIERS order. Tables emit
+#: all seven, always, even when zero, so files stay joinable across runs.
+TIER_COUNT_COLUMNS = tuple(f"n_{t}" for t in EMITTING_TIERS)
+
+#: The orientation convention of every bc1 STRING this module returns: the 20 nt
+#: read 5'->3' immediately downstream of UPSTREAM_ANCHOR on whichever strand of
+#: the read carried the anchor (``Bc1Call.orientation`` records that strand).
+#: Genome(+) holds the reverse complement (the WGS lane: chrII 638,845-638,864 in
+#: the v11 background). A join between two tables whose bc1 strings follow
+#: different conventions returns ZERO rows -- which reads as a biological null.
+BC1_ORIENTATION = "anchor_fwd"
 
 #: observed universal-anchor offset -> layout label
 LAYOUT_BY_OFFSET: Dict[int, str] = {18: "A_1.0/2.5", 1: "B_no_spacer", 10: "C_3.0"}
@@ -336,6 +355,36 @@ def extract_bc1(
         return best_miss
     return Bc1Call(None, "none", None, None, None, None, None, None, None, None,
                    "upstream anchor not found within k on either strand")
+
+
+def modal_offset_from_seqs(seqs, k: int = 1, bc1_length: int = BC1_LENGTH,
+                           cap: int = 20000) -> Tuple[Optional[int], float]:
+    """PASS 1 of two-pass extraction: this sample's modal universal-anchor offset.
+
+    Counted over STRICTLY ``confirmed`` reads only, so the call cannot be pulled
+    by the offset-constrained tiers it is about to enable. Returns
+    ``(offset, purity)`` where purity = modal share of confirmed reads, or
+    ``(None, 0.0)`` when no read is confirmed -- in which case callers must pass
+    ``established_offset=None`` and the offset-constrained tiers stay disabled.
+
+    Same algorithm as ``bc1_from_screen/02_parse_bc1_reads._modal_offset``
+    (sweep-wide median purity 0.974 over 23,217 samples, ``26_``), taking an
+    iterable of sequences so paired-end callers can feed whichever read carries
+    the barcode.
+    """
+    offs = _Counter()
+    n = 0
+    for seq in seqs:
+        c = extract_bc1(seq, k=k, bc1_length=bc1_length)
+        if c.anchor_tier == "confirmed":
+            offs[c.anchor_offset] += 1
+        n += 1
+        if n >= cap:
+            break
+    if not offs:
+        return None, 0.0
+    off, hits = offs.most_common(1)[0]
+    return off, hits / sum(offs.values())
 
 
 # =============================================================================

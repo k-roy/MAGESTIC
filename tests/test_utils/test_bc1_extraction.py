@@ -174,4 +174,70 @@ chk("protect=1 still available and still refuses it",
     extract_bc1(_r, k=1, protect=1).bc1 is None)
 chk("k=0 is unaffected by protect (no mismatches admitted at all)",
     extract_bc1(_r, k=0).bc1 is None)
+
+
+print("\n== tier partition: 7 emitting, 2 non-emitting (2026-09-10) ==")
+from magestic.utils.bc1_extraction import (ANCHOR_TIERS, EMITTING_TIERS, NON_EMITTING_TIERS,
+                                           TIER_COUNT_COLUMNS, BC1_ORIENTATION, modal_offset_from_seqs)
+chk("partition is exact and disjoint",
+    set(EMITTING_TIERS) | set(NON_EMITTING_TIERS) == set(ANCHOR_TIERS)
+    and not (set(EMITTING_TIERS) & set(NON_EMITTING_TIERS)))
+chk("seven emitting tiers, prefix_only among them",
+    len(EMITTING_TIERS) == 7 and "prefix_only" in EMITTING_TIERS, f"got {EMITTING_TIERS}")
+chk("non-emitting are exactly length_mismatch and none",
+    tuple(NON_EMITTING_TIERS) == ("length_mismatch", "none"), f"got {NON_EMITTING_TIERS}")
+chk("count columns follow EMITTING_TIERS order",
+    TIER_COUNT_COLUMNS == tuple("n_" + t for t in EMITTING_TIERS))
+chk("orientation convention is named", BC1_ORIENTATION == "anchor_fwd")
+_po = extract_bc1("GAGCTCCTACGACGTCGA" + UPSTREAM_ANCHOR + BC + "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT")
+chk("prefix_only returns a bc1 AND is an emitting tier",
+    _po.anchor_tier == "prefix_only" and _po.bc1 == BC and _po.anchor_tier in EMITTING_TIERS,
+    f"got {_po.anchor_tier} {_po.bc1}")
+
+# property: bc1 is not None  <=>  tier is emitting, over a broad random read population
+_rng = random.Random(20260910)
+_viol = []
+_seen = set()
+for _i in range(4000):
+    _lay = _rng.choice(list(TAILS))
+    _bc = "".join(_rng.choice("ACGT") for _ in range(20))
+    _read, _off = build(_lay, bc=_bc)
+    # degrade: truncate, substitute, or drop the anchor entirely
+    _op = _rng.random()
+    if _op < 0.25:
+        _read = _read[:_rng.randint(10, len(_read))]
+    elif _op < 0.5:
+        _j = _rng.randrange(len(_read)); _read = _read[:_j] + _rng.choice("ACGT") + _read[_j+1:]
+    elif _op < 0.6:
+        _read = "".join(_rng.choice("ACGT") for _ in range(len(_read)))
+    if _rng.random() < 0.3:
+        _read = reverse_complement(_read)
+    _eo = _off if _rng.random() < 0.5 else None
+    _c = extract_bc1(_read, established_offset=_eo)
+    _seen.add(_c.anchor_tier)
+    if (_c.bc1 is not None) != (_c.anchor_tier in EMITTING_TIERS):
+        _viol.append((_c.anchor_tier, _c.bc1))
+chk("bc1 is not None  <=>  anchor_tier in EMITTING_TIERS (4,000 degraded reads)",
+    not _viol, f"{len(_viol)} violations, e.g. {_viol[:3]}")
+chk("the property test actually exercised both emitting and non-emitting tiers",
+    bool(_seen & set(EMITTING_TIERS)) and bool(_seen & set(NON_EMITTING_TIERS)), f"saw {_seen}")
+
+print("\n== modal_offset_from_seqs: shared PASS-1 helper ==")
+for _lay, (_, _exp) in TAILS.items():
+    _seqs = [build(_lay, bc="".join(_rng.choice("ACGT") for _ in range(20)))[0] for _ in range(200)]
+    _o, _pur = modal_offset_from_seqs(_seqs)
+    chk(f"{_lay}: modal offset {_exp}, purity 1.0", _o == _exp and _pur == 1.0, f"got {_o} {_pur}")
+chk("no confirmed reads -> (None, 0.0)", modal_offset_from_seqs(["ACGT" * 20] * 50) == (None, 0.0))
+chk("cap is honoured", modal_offset_from_seqs(iter([build("C_3.0")[0]] * 10 + [build("A_1.0/2.5")[0]] * 1000), cap=10)[0] == 10)
+
 print(f"\n{P} passed, {F} failed")
+
+
+def test_all_checks_pass():
+    """pytest entry point. The checks above run at import; this makes pytest SEE them
+    (before 2026-09-10 pytest collected zero tests from this file)."""
+    assert F == 0, f"{F} bc1-extraction checks failed -- run this file directly for the list"
+
+
+if __name__ == "__main__":
+    sys.exit(1 if F else 0)
