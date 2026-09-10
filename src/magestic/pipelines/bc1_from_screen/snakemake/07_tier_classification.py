@@ -21,6 +21,14 @@ Usage:
         --output-tier-mapping tier_mapping.tsv \\
         --output-stats tier_stats.tsv
 
+MEMORY (2026-08-06): the long-format counts file is read in CHUNKS and the t0
+totals are accumulated incrementally, instead of materialising all ~122M rows
+as one DataFrame. The BC1 reference table is read with `usecols` because only
+`bc1` + `oligo_name` are ever used. Both changes are numerically inert -- see
+planning/pipeline_provenance_rebuild/15_step07_memory_fix.md for the
+byte-identity proof (md5 of the tier mapping + tier stats, before vs after, on
+the full yL406 input).
+
 Author: Kevin R. Roy
 """
 
@@ -31,9 +39,17 @@ from pathlib import Path
 
 import pandas as pd
 
-# Add common scripts to path
-
-from magestic.pipelines.bc1_from_screen.config import TierConfig
+# Resolve TierConfig without requiring the magestic package to be installed.
+# Verified 2026-08-06: NONE of the conda envs the pipeline is driven with
+# (snakemake / ihw_env / pydeseq2) has magestic installed -- only the base
+# anaconda3 python does -- so the bare `from magestic...` import made this step
+# die with ModuleNotFoundError under exactly the interpreters Snakemake uses.
+# Fall back to the sibling config.py, which imports nothing but stdlib + yaml.
+try:
+    from magestic.pipelines.bc1_from_screen.config import TierConfig
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from config import TierConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +57,15 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Default rows per read_csv chunk when streaming the long-format counts file.
+# MEASURED on the full yL406 file (122,647,244 rows, SLURM 37782771):
+#   chunksize 10,000,000 -> peak RSS 1.257 GiB, wall 0:58.01
+#   chunksize  2,000,000 -> peak RSS 0.434 GiB, wall 0:58.66
+# i.e. 2M is 2.9x lighter for no measurable time cost, and the output is
+# byte-identical at both (and at 7 and 50,000) -- chunksize is a memory knob
+# only.
+DEFAULT_CHUNKSIZE = 2_000_000
 
 
 def parse_args():
@@ -87,39 +112,32 @@ def parse_args():
         "--screen-dates", type=str, nargs="+",
         help="Screen dates to filter for this library (optional)"
     )
+    parser.add_argument(
+        "--chunksize", type=int, default=DEFAULT_CHUNKSIZE,
+        help=f"Rows per chunk when streaming the counts file "
+             f"(default: {DEFAULT_CHUNKSIZE:,}). Memory only -- the result is "
+             f"independent of this value."
+    )
     return parser.parse_args()
 
 
-def calculate_t0_counts(
-    bc1_counts: pd.DataFrame,
+def identify_t0_samples(
     sample_key: pd.DataFrame,
     t0_condition: str = "YPD",
     screen_dates: list = None,
-    bc1_col: str = "bc1",
     sample_col: str = "sample_name",
-    count_col: str = "counts",
-) -> pd.DataFrame:
+) -> list:
     """
-    Calculate total t0 counts per BC1.
+    Identify t0 sample names from the sample key.
 
-    Identifies t0 samples as those with:
+    t0 samples are those with:
     - condition matching t0_condition (default: YPD)
     - generations == 0
     - Optionally filtered by screen_dates
 
-    Args:
-        bc1_counts: Long-format BC1 counts (bc1, sample_name, counts)
-        sample_key: Sample metadata with condition, generations, sample_name
-        t0_condition: Condition value identifying t0 samples
-        screen_dates: Optional list of screen dates to filter
-        bc1_col: Column name for BC1 barcodes
-        sample_col: Column name for sample identifiers
-        count_col: Column name for read counts
-
-    Returns:
-        DataFrame with bc1 and t0_total columns
+    Extracted verbatim from calculate_t0_counts() (2026-08-06) so the streaming
+    and in-memory paths share ONE definition of "which samples are t0".
     """
-    # Identify t0 samples from sample key
     # Handle generations as numeric, converting strings/floats to int for comparison
     generations_numeric = pd.to_numeric(sample_key["generations"], errors="coerce").fillna(-1).astype(int)
     t0_mask = (
@@ -139,6 +157,39 @@ def calculate_t0_counts(
             + (f", screen_dates={screen_dates}" if screen_dates else "")
         )
 
+    return t0_samples
+
+
+def calculate_t0_counts(
+    bc1_counts: pd.DataFrame,
+    sample_key: pd.DataFrame,
+    t0_condition: str = "YPD",
+    screen_dates: list = None,
+    bc1_col: str = "bc1",
+    sample_col: str = "sample_name",
+    count_col: str = "counts",
+) -> pd.DataFrame:
+    """
+    Calculate total t0 counts per BC1 from an already-loaded counts DataFrame.
+
+    Retained unchanged as the reference (in-memory) implementation and for any
+    caller that already holds the frame; `main()` uses the streaming variant
+    below, which is proven to produce a byte-identical result.
+
+    Args:
+        bc1_counts: Long-format BC1 counts (bc1, sample_name, counts)
+        sample_key: Sample metadata with condition, generations, sample_name
+        t0_condition: Condition value identifying t0 samples
+        screen_dates: Optional list of screen dates to filter
+        bc1_col: Column name for BC1 barcodes
+        sample_col: Column name for sample identifiers
+        count_col: Column name for read counts
+
+    Returns:
+        DataFrame with bc1 and t0_total columns
+    """
+    t0_samples = identify_t0_samples(sample_key, t0_condition, screen_dates, sample_col)
+
     logger.info(f"  Found {len(t0_samples)} t0 samples")
 
     # Filter BC1 counts to t0 samples
@@ -147,6 +198,89 @@ def calculate_t0_counts(
     # Sum counts per BC1 across all t0 samples
     bc1_t0_totals = (
         t0_counts
+        .groupby(bc1_col)[count_col]
+        .sum()
+        .reset_index()
+        .rename(columns={count_col: "t0_total"})
+    )
+
+    return bc1_t0_totals
+
+
+def calculate_t0_counts_streaming(
+    bc1_counts_path: Path,
+    sample_key: pd.DataFrame,
+    t0_condition: str = "YPD",
+    screen_dates: list = None,
+    bc1_col: str = "bc1",
+    sample_col: str = "sample_name",
+    count_col: str = "counts",
+    chunksize: int = DEFAULT_CHUNKSIZE,
+) -> pd.DataFrame:
+    """
+    Streaming equivalent of calculate_t0_counts() that never holds the whole
+    long-format counts file in memory.
+
+    Identical by construction:
+      * the t0 sample set comes from the same identify_t0_samples()
+      * each chunk is filtered with the same `.isin(t0_samples)` predicate
+      * per-chunk `groupby(bc1)[counts].sum()` partial sums are added exactly
+        (integer addition; no float accumulation is introduced)
+      * the final frame is produced by the SAME
+        `groupby(bc1)[counts].sum().reset_index().rename(...)` call, so the row
+        ORDER (groupby sort=True) and the column dtype are whatever pandas
+        would have produced from the one-shot path.
+
+    Returns:
+        DataFrame with bc1 and t0_total columns
+    """
+    t0_samples = identify_t0_samples(sample_key, t0_condition, screen_dates, sample_col)
+
+    logger.info(f"  Found {len(t0_samples)} t0 samples")
+
+    totals = {}
+    n_rows = 0
+    n_t0_rows = 0
+    n_chunks = 0
+
+    reader = pd.read_csv(
+        bc1_counts_path,
+        sep="\t",
+        usecols=[bc1_col, sample_col, count_col],
+        chunksize=chunksize,
+    )
+    with reader:
+        for chunk in reader:
+            n_chunks += 1
+            n_rows += len(chunk)
+            sub = chunk[chunk[sample_col].isin(t0_samples)]
+            del chunk
+            if len(sub):
+                n_t0_rows += len(sub)
+                partial = sub.groupby(bc1_col)[count_col].sum()
+                for key, value in partial.items():
+                    prev = totals.get(key)
+                    totals[key] = value if prev is None else prev + value
+                del partial
+            del sub
+
+    logger.info(
+        f"  Streamed {n_rows:,} rows in {n_chunks} chunk(s) of {chunksize:,}; "
+        f"{n_t0_rows:,} rows from t0 samples"
+    )
+
+    if totals:
+        accumulated = pd.DataFrame(
+            {bc1_col: list(totals.keys()), count_col: list(totals.values())}
+        )
+    else:
+        accumulated = pd.DataFrame(
+            {bc1_col: pd.Series(dtype=object), count_col: pd.Series(dtype="int64")}
+        )
+    del totals
+
+    bc1_t0_totals = (
+        accumulated
         .groupby(bc1_col)[count_col]
         .sum()
         .reset_index()
@@ -216,23 +350,27 @@ def main():
     logger.info(f"  t0 condition: {args.t0_condition}")
     logger.info(f"  Tier thresholds: abundance_high >= {args.tier_1_min}, abundance_medium >= {args.tier_2_min}")
 
-    # Load BC1 counts
-    logger.info("Loading BC1 counts...")
-    bc1_counts = pd.read_csv(args.bc1_counts, sep="\t")
-    logger.info(f"  Loaded {len(bc1_counts):,} rows")
-
     # Detect count column name (handles both 'counts' and 'sample_counts')
-    if "counts" in bc1_counts.columns:
+    # from the HEADER ONLY -- the file itself is streamed below.
+    counts_columns = list(pd.read_csv(args.bc1_counts, sep="\t", nrows=0).columns)
+    if "counts" in counts_columns:
         count_col = "counts"
-    elif "sample_counts" in bc1_counts.columns:
+    elif "sample_counts" in counts_columns:
         count_col = "sample_counts"
     else:
         raise ValueError("BC1 counts file must have 'counts' or 'sample_counts' column")
     logger.info(f"  Using count column: {count_col}")
 
-    # Load BC1 reference table
+    # Load BC1 reference table.
+    # Only `bc1` and `oligo_name` are ever used (see the merge below), so read
+    # just those two columns -- the full table carries the ~235 bp `donor`
+    # sequence for every BC1 and is ~2 orders of magnitude larger in memory.
     logger.info("Loading BC1 reference table...")
-    ref_table = pd.read_csv(args.bc1_reference, sep="\t")
+    ref_columns = list(pd.read_csv(args.bc1_reference, sep="\t", nrows=0).columns)
+    if "bc1" in ref_columns and "oligo_name" in ref_columns:
+        ref_table = pd.read_csv(args.bc1_reference, sep="\t", usecols=["bc1", "oligo_name"])
+    else:
+        ref_table = pd.read_csv(args.bc1_reference, sep="\t")
     logger.info(f"  Loaded {len(ref_table):,} BC1s")
 
     # Load sample key
@@ -252,14 +390,15 @@ def main():
         tier_2_min_reads=args.tier_2_min,
     )
 
-    # Calculate t0 counts
+    # Calculate t0 counts by STREAMING the long-format counts file.
     logger.info(f"Calculating t0 counts (condition={args.t0_condition}, generations=0)...")
-    t0_counts = calculate_t0_counts(
-        bc1_counts,
+    t0_counts = calculate_t0_counts_streaming(
+        args.bc1_counts,
         sample_key,
         t0_condition=args.t0_condition,
         screen_dates=args.screen_dates,
         count_col=count_col,
+        chunksize=args.chunksize,
     )
     logger.info(f"  Found {len(t0_counts):,} BC1s with t0 counts")
 

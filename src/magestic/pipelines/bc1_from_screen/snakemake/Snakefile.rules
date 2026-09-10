@@ -119,29 +119,48 @@ rule tier_07_classification:
     """Classify BC1s into tiers based on t0 counts (per library)"""
     input:
         bc1_counts = BC1_COUNTS_DIR / "{screen}_bc1_counts_long_format.tsv",
-        ref_table = KEYFILE_DIR / "bc1_reference_table.tsv"
+        ref_table = KEYFILE_DIR / "bc1_reference_table.tsv",
+        # FIX 2026-08-06: 07_tier_classification.py REQUIRES --sample-key (it
+        # derives t0 from condition + generations == 0); the rule never declared
+        # or passed it, so the step aborted with exit 2 before doing any work.
+        sample_key = KEYFILE_DIR / "sample_key.tsv"
     output:
         tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv",
         tier_stats = BC1_COUNTS_DIR / "{screen}_tier_stats_{library}.tsv"
     params:
         script = COMMON_SCRIPTS_DIR / "07_tier_classification.py",
         tier_1_min = config.get("tier_thresholds", {}).get("tier_1_min_reads", 100),
-        tier_2_min = config.get("tier_thresholds", {}).get("tier_2_min_reads", 20)
+        tier_2_min = config.get("tier_thresholds", {}).get("tier_2_min_reads", 20),
+        t0_condition = config.get("tier_thresholds", {}).get("t0_condition", "YPD"),
+        # MEMORY FIX 2026-08-06: rows per read_csv chunk when streaming the
+        # long-format counts file. Memory only -- the tier mapping is byte-
+        # identical for any chunksize (proven for 7 / 50k / 2M / 10M).
+        chunksize = config.get("resources", {}).get("step_07", {}).get("chunksize", 2000000)
     log:
         LOGS_DIR / "07_tier_{screen}_{library}.log"
     threads: config.get("resources", {}).get("step_07", {}).get("cpus", 4)
     resources:
-        mem_mb = config.get("resources", {}).get("step_07", {}).get("mem_mb", 32000)
+        # The streaming t0 accumulation (2026-08-06) drops peak RSS from
+        # 9.08 GiB to 0.434 GiB on yL406 (122.6M rows); 4 GB is now ample.
+        # Override in config if a screen has a far larger t0 BC1 universe.
+        mem_mb = config.get("resources", {}).get("step_07", {}).get("mem_mb", 4000)
     shell:
+        # FIX 2026-08-06: the flag was `--ref-table`, which the script has never
+        # defined -- it is `--bc1-reference` (07_tier_classification.py:54-57).
+        # Same defect class as D1 on step 08; both were `error: unrecognized
+        # arguments` / missing-required, exit 2.
         """
         {PYTHON} {params.script} \\
             --bc1-counts {input.bc1_counts} \\
-            --ref-table {input.ref_table} \\
+            --bc1-reference {input.ref_table} \\
+            --sample-key {input.sample_key} \\
             --library {wildcards.library} \\
             --output-tier-mapping {output.tier_mapping} \\
             --output-stats {output.tier_stats} \\
             --tier-1-min {params.tier_1_min} \\
             --tier-2-min {params.tier_2_min} \\
+            --t0-condition {params.t0_condition} \\
+            --chunksize {params.chunksize} \\
             2>&1 | tee {log}
         """
 
@@ -159,13 +178,36 @@ rule matrix_08_create:
         count_matrix = BC1_COUNTS_DIR / "{screen}_bc1_counts_wide_{library}_combined_tiers.tsv"
     params:
         script = COMMON_SCRIPTS_DIR / "08_create_count_matrix.py",
-        consolidate_t0 = config.get("deseq2", {}).get("consolidate_t0", True),
-        t0_groups = config.get("deseq2", {}).get("t0_consolidation_groups", 4)
+        # FIX 2026-08-06 (defect D1): this rule passed `--consolidate-t0` /
+        # `--t0-groups`, which are the CLI of the ARCHIVED predecessor
+        # snakemake/archive/step_d_create_count_matrix.py:72-79. 08 has never
+        # accepted them, so the rule died with `error: unrecognized arguments`
+        # (exit 2). The script's CLI is canonical -- run_full_pipeline.sh:176-188
+        # already drives it with the flags below.
+        # Legacy config keys are still honoured: consolidate_t0 == False maps to
+        # mode "none", and t0_consolidation_groups is the fallback pseudo-rep count.
+        t0_mode = (
+            config.get("deseq2", {}).get("t0_consolidation_mode")
+            or ("screen_date" if config.get("deseq2", {}).get("consolidate_t0", True) else "none")
+        ),
+        t0_pseudo_reps = (
+            config.get("deseq2", {}).get("t0_pseudo_rep_count")
+            or config.get("deseq2", {}).get("t0_consolidation_groups", 4)
+        ),
+        # NOTE: must be a lambda, not a Path literal -- Snakemake does not expand
+        # {wildcards} inside a Path object in `params` (verified by dry-run: the
+        # literal "{screen}"/"{library}" reached the shell command unexpanded).
+        metadata_output = lambda w: str(
+            BC1_COUNTS_DIR / f"{w.screen}_t0_consolidation_metadata_{w.library}.tsv"),
+        chunksize = config.get("resources", {}).get("step_08", {}).get("chunksize", 5000000)
     log:
         LOGS_DIR / "08_matrix_{screen}_{library}.log"
     threads: config.get("resources", {}).get("step_08", {}).get("cpus", 4)
     resources:
-        mem_mb = config.get("resources", {}).get("step_08", {}).get("mem_mb", 64000)
+        # The streaming pivot (2026-08-06) drops peak RSS from 13.6 GiB to
+        # 1.5 GiB on yL406; 16 GB is now ample. Override in config if a screen
+        # with a much larger keep-set needs more.
+        mem_mb = config.get("resources", {}).get("step_08", {}).get("mem_mb", 16000)
     shell:
         """
         {PYTHON} {params.script} \\
@@ -174,8 +216,10 @@ rule matrix_08_create:
             --sample-key {input.sample_key} \\
             --library {wildcards.library} \\
             --output {output.count_matrix} \\
-            --consolidate-t0 {params.consolidate_t0} \\
-            --t0-groups {params.t0_groups} \\
+            --metadata-output {params.metadata_output} \\
+            --t0-consolidation-mode {params.t0_mode} \\
+            --t0-pseudo-rep-count {params.t0_pseudo_reps} \\
+            --chunksize {params.chunksize} \\
             2>&1 | tee {log}
         """
 
