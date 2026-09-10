@@ -656,6 +656,38 @@ def _match_row(args):
 
 
 CANDIDATE_LIST_CAP = 50
+CAS12A_OLIGO_PREFIXES = ("LbCas12a_", "impLbCas12a_")
+
+
+def repair_gdb01_shifted_guides(guides: pd.Series, tables: "OligoLookupTables"):
+    """Undo gdb Step 02's 1-nt-early guide extraction on Cas12a reads (planning 30_ GDB-01).
+
+    gdb Step 02 searches the SpCas9 RE site first; on a Cas12a read the fuzzy fallback ties the true TTTCGAAGAGC window
+    with the window one base earlier whenever the guide ends in G, and keeps the earlier one. The extracted guide is
+    then 'T' + guide[:19] (the base before a Cas12a guide is T). Measured on the rescued Oak tables bdb 03 consumes
+    (V438 LbCas12a / V439 impLbCas12a): for G-ending designs 99.3% / 98.8% of reads carry the shifted string; A/C/T-ending
+    designs are >99% exact.
+
+    Repair rule (deterministic, conservative): a guide that is NOT a designed guide, starts with 'T', and whose
+    guide[1:] + 'G' IS a designed guide belonging only to Cas12a oligos, is replaced by that designed guide.
+    Returns (guides_out, repaired_flag). Guides that are themselves designed are never touched."""
+    known = tables.guide_to_oligos
+    up = guides.where(guides.isna(), guides.astype(str).str.upper())
+
+    def _fix(x):
+        if not isinstance(x, str) or not x or x in known or x[0] != "T":
+            return None
+        r = x[1:] + "G"
+        oligos = known.get(r)
+        if oligos and all(str(o).startswith(CAS12A_OLIGO_PREFIXES) for o in oligos):
+            return r
+        return None
+
+    uniq = up.dropna().unique()
+    fixmap = {u: _fix(u) for u in uniq}
+    rep = up.map(fixmap)
+    flag = rep.notna()
+    return guides.where(~flag, rep), flag
 
 
 def format_candidates(candidates, n_variants: int) -> Optional[str]:

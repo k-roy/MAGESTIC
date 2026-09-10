@@ -30,11 +30,13 @@ from pathlib import Path
 # Canonical package matcher. Works whether magestic is installed (workflow PYTHON)
 # or this file is run directly by path (fallback adds .../src to sys.path).
 try:
-    from magestic.pipelines.bc1_donor_bc0.core.matching import load_and_build_lookup, match_dataframe
+    from magestic.pipelines.bc1_donor_bc0.core.matching import (
+        load_and_build_lookup, match_dataframe, repair_gdb01_shifted_guides)
     from magestic.utils import path_utils
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))  # .../src
-    from magestic.pipelines.bc1_donor_bc0.core.matching import load_and_build_lookup, match_dataframe
+    from magestic.pipelines.bc1_donor_bc0.core.matching import (
+        load_and_build_lookup, match_dataframe, repair_gdb01_shifted_guides)
     from magestic.utils import path_utils
 
 
@@ -61,6 +63,8 @@ def main():
     parser.add_argument("--v-libraries", nargs="*", default=None, help="Restrict harmonized lookup to these V libraries")
     parser.add_argument("--nuclease", nargs="*", default=None, help="Restrict harmonized lookup to these nuclease/PAM types")
     parser.add_argument("--no-pre-trim", action="store_true", help="Disable anchor pre-trim (already-trimmed donors)")
+    parser.add_argument("--no-gdb01-repair", action="store_true",
+                        help="Do not restore Cas12a guides that gdb Step 02 extracted 1 nt early (planning 30_ GDB-01)")
     # Back-compat (accepted + IGNORED): the old exact-merge args, so existing rule
     # shells keep working without a rule edit. The harmonized table is used instead.
     parser.add_argument("--oligo-pools", nargs="*", default=None, help="(ignored; harmonized table used)")
@@ -90,6 +94,16 @@ def main():
         v_libraries=args.v_libraries,
         nuclease_types=args.nuclease,
     )
+
+    # GDB-01: gdb Step 02 shifted every G-ending Cas12a guide 1 nt early ('T' + guide[:19]); bdb 03 copied the shifted
+    # string. Restore it before matching so guide narrowing works, keep the raw string, and label the row.
+    if args.guide_col in bc1_data.columns and not args.no_gdb01_repair:
+        fixed, flag = repair_gdb01_shifted_guides(bc1_data[args.guide_col], tables)
+        bc1_data["guide_gdb_raw"] = bc1_data[args.guide_col].where(flag)
+        bc1_data[args.guide_col] = fixed
+        bc1_data["guide_repaired_gdb01"] = flag
+        nr = int(flag.sum()); ng = int(bc1_data[args.guide_col].notna().sum())
+        print(f"GDB-01 repair: restored {nr:,} of {ng:,} guide-carrying rows ({100*nr/max(ng,1):.2f}%) to a designed Cas12a guide")
 
     print(f"Matching donors (col '{donor_col}') via core.matching.match_dataframe...")
     out = match_dataframe(bc1_data, tables, donor_col=donor_col, guide_col=args.guide_col,
