@@ -74,15 +74,39 @@ chk("prefix but no downstream -> tier 'prefix_only', bc1 KEPT", r.anchor_tier=="
 short="GAGCTC"+UPSTREAM_ANCHOR+BC[:12]
 chk("truncated read -> length_mismatch, bc1 None", extract_bc1(short).anchor_tier=="length_mismatch")
 
-print("\n== 8-mer fallback is OFFSET-CONSTRAINED, never a scan ==")
-# layout D: tail too short for the 10-mer -- only the 8-mer fits
-dread="GAGCTCCTACGACGTCGA"+UPSTREAM_ANCHOR+BC+"A"+DOWNSTREAM_FALLBACK
-chk("no fallback without an established offset", extract_bc1(dread).anchor_tier=="prefix_only")
-r=extract_bc1(dread, established_offset=1)
-chk("fallback fires at the established offset", r.anchor_tier=="offset_fallback" and r.bc1==BC,
-    f"got {r.anchor_tier}")
-r=extract_bc1(dread, established_offset=10)
-chk("fallback does NOT fire at a different offset", r.anchor_tier=="prefix_only", f"got {r.anchor_tier}")
+print("\n== downstream confirmation is OFFSET-CONSTRAINED, never a scan ==")
+LEAD="GAGCTCCTACGACGTCGA"
+def mk(tail): return LEAD+UPSTREAM_ANCHOR+BC+tail
+# truncated mid-anchor: longest fitting prefix must match exactly, >= 6 nt
+chk("truncated read -> confirmed_truncated at the established offset",
+    extract_bc1(mk("A"+UNIVERSAL_DOWNSTREAM[:6]), established_offset=1).anchor_tier=="confirmed_truncated")
+chk("truncated below the 6-nt floor is REFUSED",
+    extract_bc1(mk("A"+UNIVERSAL_DOWNSTREAM[:5]), established_offset=1).anchor_tier=="prefix_only")
+chk("truncated 6-mer prefix with a mismatch is REFUSED (below the mm floor)",
+    extract_bc1(mk("A"+"T"+UNIVERSAL_DOWNSTREAM[1:6]), established_offset=1).anchor_tier=="prefix_only")
+_t8 = "T"+UNIVERSAL_DOWNSTREAM[1:8] if UNIVERSAL_DOWNSTREAM[0]!="T" else "A"+UNIVERSAL_DOWNSTREAM[1:8]
+chk("truncated 8-mer prefix with ONE mismatch -> confirmed_truncated_mismatch",
+    extract_bc1(mk("A"+_t8), established_offset=1).anchor_tier=="confirmed_truncated_mismatch")
+_t8b = "TT"+UNIVERSAL_DOWNSTREAM[2:8]
+chk("truncated 8-mer prefix with TWO mismatches is REFUSED",
+    extract_bc1(mk("A"+_t8b), established_offset=1).anchor_tier=="prefix_only")
+# single substitution inside a full-length anchor
+mm = UNIVERSAL_DOWNSTREAM[:4]+("A" if UNIVERSAL_DOWNSTREAM[4]!="A" else "T")+UNIVERSAL_DOWNSTREAM[5:]
+chk("1 mismatch at the established offset -> confirmed_mismatch",
+    extract_bc1(mk("A"+mm+"TTTT"), established_offset=1).anchor_tier=="confirmed_mismatch")
+mm2 = "A"+mm[1:]
+mm2 = ("A" if UNIVERSAL_DOWNSTREAM[0]!="A" else "T")+mm[1:]
+chk("2 mismatches are REFUSED",
+    extract_bc1(mk("A"+mm2+"TTTT"), established_offset=1).anchor_tier=="prefix_only")
+chk("no established offset -> no loosening at all",
+    extract_bc1(mk("A"+mm+"TTTT")).anchor_tier=="prefix_only")
+chk("loosening does NOT fire at a different offset",
+    extract_bc1(mk("A"+mm+"TTTT"), established_offset=10).anchor_tier=="prefix_only")
+# widened window still finds a genuinely shifted anchor, exactly
+chk("shifted anchor within the widened window is found EXACTLY",
+    extract_bc1(mk("T"*24+UNIVERSAL_DOWNSTREAM+"TT")).anchor_tier=="confirmed")
+chk("anchor beyond the window is NOT found",
+    extract_bc1(mk("T"*60+UNIVERSAL_DOWNSTREAM)).anchor_tier=="prefix_only")
 
 print("\n== bc1 is never padded or normalized ==")
 chk("no N-padding anywhere", all("N" not in (extract_bc1(x).bc1 or "") for x in (short, prefix_only, noanchor)))

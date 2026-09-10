@@ -43,7 +43,14 @@ BC1_LENGTH = 20
 #: observed universal-anchor offset -> layout label
 LAYOUT_BY_OFFSET: Dict[int, str] = {18: "A_1.0/2.5", 1: "B_no_spacer", 10: "C_3.0"}
 #: widest window in which the universal anchor may sit (max offset + its length)
-MAX_DOWNSTREAM_OFFSET = 24
+MAX_DOWNSTREAM_OFFSET = 40
+#: shortest anchor prefix accepted at an ESTABLISHED offset when the read is
+#: truncated mid-anchor. 6 nt at ONE fixed position = 1/4096 by chance, and it
+#: sits 20 nt from an already-verified 12-mer upstream anchor.
+MIN_TRUNCATED_ANCHOR = 6
+#: floor for accepting a truncated anchor prefix that ALSO carries a mismatch.
+#: At one fixed offset that is C(8,1)*3/4^8 ~= 3.7e-4 by chance.
+MIN_TRUNCATED_ANCHOR_MM = 8
 
 _COMP = str.maketrans("ACGTN", "TGCAN")
 
@@ -145,17 +152,44 @@ def _find_upstream(seq: str, anchor: str, k: int, protect: int) -> Optional[Tupl
 def _scan_downstream(tail: str, established_offset: Optional[int]) -> Tuple[Optional[int], str]:
     """Find the universal anchor in the post-barcode tail.
 
-    Returns (offset, tier_fragment). The 8-mer fallback is used ONLY at an
-    already-established offset -- its 26x genome-wide penalty is a SCANNING
-    cost, and constraining it to one position is not a scan.
+    Returns (offset, tier). Everything beyond the first exact scan is
+    OFFSET-CONSTRAINED -- tested at one already-established position, never
+    scanned -- so the specificity cost of loosening is a single-position cost,
+    not a window-wide one.
+
+    Tiers, in the order they are attempted:
+      confirmed            full 10-mer, exact, anywhere in the window
+      confirmed_mismatch   full 10-mer with <=1 mismatch AT the established offset
+      confirmed_truncated  read ends mid-anchor; longest fitting prefix (>=6 nt)
+                           matches exactly at the established offset
+      offset_fallback      8-mer at the established offset
+      prefix_only          none of the above
     """
     j = tail.find(UNIVERSAL_DOWNSTREAM)
     if 0 <= j <= MAX_DOWNSTREAM_OFFSET:
         return j, "confirmed"
-    if established_offset is not None:
-        o = established_offset
-        if tail[o:o + len(DOWNSTREAM_FALLBACK)] == DOWNSTREAM_FALLBACK:
-            return o, "offset_fallback"
+    if established_offset is None:
+        return None, "prefix_only"
+    o = established_offset
+    seg = tail[o:o + len(UNIVERSAL_DOWNSTREAM)]
+
+    # (a) full-length anchor with a single substitution
+    if len(seg) == len(UNIVERSAL_DOWNSTREAM):
+        if _hamming_at_most(seg, UNIVERSAL_DOWNSTREAM, 1) is not None:
+            return o, "confirmed_mismatch"
+    # (b) read truncated mid-anchor: longest fitting prefix must match exactly
+    elif len(seg) >= MIN_TRUNCATED_ANCHOR:
+        exp = UNIVERSAL_DOWNSTREAM[:len(seg)]
+        if seg == exp:
+            return o, "confirmed_truncated"
+        # truncated AND carrying a substitution -- the two degradations co-occur
+        # far more often than either alone (measured: it is the single largest
+        # residual class on layout A). Needs a longer floor than the exact case.
+        if len(seg) >= MIN_TRUNCATED_ANCHOR_MM and _hamming_at_most(seg, exp, 1) is not None:
+            return o, "confirmed_truncated_mismatch"
+    # (c) the 8-mer fallback
+    if tail[o:o + len(DOWNSTREAM_FALLBACK)] == DOWNSTREAM_FALLBACK:
+        return o, "offset_fallback"
     return None, "prefix_only"
 
 
