@@ -24,6 +24,7 @@ import sys
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -171,6 +172,7 @@ def collapse_sequences_by_edit_distance(
     count_cols: list,
     edit_distance_threshold: int = 3,
     show_progress: bool = True,
+    set_cols: Optional[list] = None,
 ) -> pd.DataFrame:
     """
     Collapse similar sequences within groups by edit distance.
@@ -179,14 +181,27 @@ def collapse_sequences_by_edit_distance(
         df: Input DataFrame
         group_cols: Columns to group by
         seq_col: Column containing sequences to collapse
-        count_cols: Columns to sum when collapsing
+        count_cols: Columns to SUM when collapsing (reads)
         edit_distance_threshold: Maximum edit distance for collapsing
         show_progress: Show progress bar
+        set_cols: Columns holding *sets of identities* to UNION when collapsing
+            (e.g. ``pcr_replicate_id``). These must never be summed --
+            see the P2 note below.
 
     Returns:
         DataFrame with collapsed sequences
+
+    Note (P2 fix, 2026-07-28):
+        Replicate SUPPORT must be a **distinct count**, never a sum. If bc1
+        variant A is seen in replicates {1,2} and its 1-nt sequencing-error twin
+        B in replicate {2}, summing gives 2+1=3 when the true distinct count is
+        2 -- inflating a single-tube chimera over a >=3-replicate threshold,
+        which is precisely the artifact the recombination filter exists to
+        remove. Carrying replicate-ID **sets** and taking the union makes the
+        post-collapse count correct by construction.
     """
     from Levenshtein import distance
+    set_cols = [c for c in (set_cols or []) if c in df.columns]
 
     def process_group(group):
         """Collapse sequences within a single group."""
@@ -194,7 +209,7 @@ def collapse_sequences_by_edit_distance(
         result_rows = []
 
         while not group.empty:
-            # Find row with highest count
+            # Find row with highest count (ranking uses read counts only)
             top_idx = group[count_cols].sum(axis=1).idxmax()
             top_seq = group.loc[top_idx, seq_col]
 
@@ -204,17 +219,28 @@ def collapse_sequences_by_edit_distance(
             )
             collapse_mask = group['_edit_dist'] <= edit_distance_threshold
 
-            # Aggregate counts
+            # Aggregate counts (reads: sum)
             collapsed_counts = {
                 col: group.loc[collapse_mask, col].sum()
                 for col in count_cols
             }
+            # Aggregate identity sets (replicates: UNION, never sum)
+            collapsed_sets = {}
+            for col in set_cols:
+                acc = set()
+                for v in group.loc[collapse_mask, col]:
+                    if isinstance(v, (set, frozenset, list, tuple)):
+                        acc |= set(v)
+                    elif pd.notna(v):
+                        acc.add(v)
+                collapsed_sets[col] = acc
 
             # Create result row
             result_rows.append({
                 **{col: group.iloc[0][col] for col in group_cols},
                 seq_col: top_seq,
                 **collapsed_counts,
+                **collapsed_sets,
             })
 
             # Remove collapsed rows
@@ -321,7 +347,18 @@ def aggregate_and_filter(
     # value. Legacy upstream may produce multiple rows per group with a
     # `sample_number` column distinguishing samples; in that case we count
     # distinct sample_numbers instead.
-    if 'num_PCR_replicates' in df.columns:
+    # --- P1 FIX (2026-07-28): use the real replicate identity when present -----
+    # `pcr_replicate_id` = (gDNA_plate_name, inner_primers, outer_primers,
+    # sample_number) is built by data_loader but was NEVER referenced here
+    # (`grep pcr_replicate_id run_pipeline.py` -> no hits). The fallback counted
+    # distinct `sample_number`, which merges Q5 and KAPA -- same well, same
+    # sample_number, different outer_primers -- discarding half the independent
+    # amplification evidence the recombination filter depends on. Carry the SET
+    # of replicate ids so it can be unioned across collapse (never summed).
+    use_replicate_sets = 'pcr_replicate_id' in df.columns
+    if use_replicate_sets:
+        agg_cols['pcr_replicate_id'] = lambda x: set(v for v in x if pd.notna(v))
+    elif 'num_PCR_replicates' in df.columns:
         agg_cols['num_PCR_replicates'] = 'max'
     elif 'sample_number' in df.columns:
         agg_cols['sample_number'] = lambda x: len(set(x))
@@ -352,13 +389,26 @@ def aggregate_and_filter(
     if 'sample_number' in agg_df.columns:
         agg_df.rename(columns={'sample_number': 'num_PCR_replicates'}, inplace=True)
 
+    # Derive replicate support from the identity sets (P1).
+    if use_replicate_sets:
+        agg_df['num_PCR_replicates'] = agg_df['pcr_replicate_id'].apply(len)
+        logger.info(
+            f"  PCR replicates from pcr_replicate_id: "
+            f"median={agg_df['num_PCR_replicates'].median():.0f}, "
+            f"max={agg_df['num_PCR_replicates'].max()}, "
+            f"distribution={agg_df['num_PCR_replicates'].value_counts().sort_index().to_dict()}"
+        )
+
     logger.info(f"  After aggregation: {len(agg_df)} rows, {agg_df['bc1'].nunique()} unique bc1s")
 
     # Optional sequence collapsing
     if collapse_sequences and len(agg_df) > 0:
         count_cols = ['counts']
-        if 'num_PCR_replicates' in agg_df.columns:
+        # P2: only SUM num_PCR_replicates on the legacy path that has no identity
+        # sets. With sets present it is re-derived by union after each collapse.
+        if 'num_PCR_replicates' in agg_df.columns and not use_replicate_sets:
             count_cols.append('num_PCR_replicates')
+        set_cols = ['pcr_replicate_id'] if use_replicate_sets else None
 
         # Collapse similar donors within bc1+bc0
         logger.info("  Collapsing similar donors...")
@@ -368,7 +418,8 @@ def aggregate_and_filter(
             seq_col='donor',
             count_cols=count_cols,
             edit_distance_threshold=5,
-            show_progress=show_progress
+            show_progress=show_progress,
+            set_cols=set_cols,
         )
 
         # Collapse similar bc1s within bc0+donor
@@ -379,8 +430,21 @@ def aggregate_and_filter(
             seq_col='bc1',
             count_cols=count_cols,
             edit_distance_threshold=1,
-            show_progress=show_progress
+            show_progress=show_progress,
+            set_cols=set_cols,
         )
+
+        # P2: replicate support is re-derived from the UNION of the collapsed
+        # rows' identity sets -- never the sum. Do this after BOTH collapses.
+        if use_replicate_sets and 'pcr_replicate_id' in agg_df.columns:
+            agg_df['num_PCR_replicates'] = agg_df['pcr_replicate_id'].apply(
+                lambda v: len(v) if isinstance(v, (set, frozenset, list, tuple)) else 1
+            )
+            logger.info(
+                f"  Post-collapse PCR replicates (distinct, unioned): "
+                f"median={agg_df['num_PCR_replicates'].median():.0f}, "
+                f"max={agg_df['num_PCR_replicates'].max()}"
+            )
 
     # Apply filters
     if 'counts' in agg_df.columns and min_reads > 0:

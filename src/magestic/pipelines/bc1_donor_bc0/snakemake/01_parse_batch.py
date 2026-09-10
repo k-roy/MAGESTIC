@@ -70,13 +70,16 @@ def discover_bc1_donor_bc0_samples(project_dir: Optional[Path] = None) -> List[T
         bc1_dirs = list(raw_data_dir.glob("*bc1_donor_bc0*"))
         for bc1_dir in bc1_dirs:
             # Find R1 files
-            r1_files = list(bc1_dir.glob("**/*_R1.fastq.gz"))
+            # match both "<sample>_R1.fastq.gz" and "<sample>_R1_001.fastq.gz"
+            # (the latter is the naming used by 20210724 and 20210822)
+            r1_files = sorted(set(bc1_dir.glob("**/*_R1.fastq.gz")) | set(bc1_dir.glob("**/*_R1_001.fastq.gz")))
             for r1_path in r1_files:
-                r2_path = Path(str(r1_path).replace("_R1.fastq.gz", "_R2.fastq.gz"))
+                r2_path = Path(str(r1_path).replace("_R1.fastq.gz", "_R2.fastq.gz")
+                                           .replace("_R1_001.fastq.gz", "_R2_001.fastq.gz"))
                 if r2_path.exists():
                     # Determine output path
                     project_name = raw_data_dir.parent.name
-                    sample_name = r1_path.stem.replace("_R1.fastq", "")
+                    sample_name = r1_path.stem.replace("_R1_001.fastq", "").replace("_R1.fastq", "")
                     output_dir = raw_data_dir.parent / "processed_data" / "bc1_donor_bc0" / "parsed"
                     output_path = output_dir / f"{sample_name}_bc1_donor_bc0.tsv"
                     samples.append((r1_path, r2_path, output_path))
@@ -113,8 +116,11 @@ def process_sample(args):
 def find_fastq(bc1_dir: Path, sample_name: str) -> tuple:
     """Find R1/R2 FASTQ files for a sample."""
     # Search in bc1_dir and subdirectories
-    for r1_path in bc1_dir.rglob(f"{sample_name}_R1.fastq.gz"):
-        r2_path = r1_path.parent / f"{sample_name}_R2.fastq.gz"
+    for r1_path in list(bc1_dir.rglob(f"{sample_name}_R1.fastq.gz")) + list(
+        bc1_dir.rglob(f"{sample_name}_R1_001.fastq.gz")
+    ):
+        suffix = "_R1_001.fastq.gz" if r1_path.name.endswith("_R1_001.fastq.gz") else "_R1.fastq.gz"
+        r2_path = r1_path.parent / r1_path.name.replace(suffix, suffix.replace("_R1", "_R2"))
         if r2_path.exists():
             return str(r1_path), str(r2_path)
     return None, None

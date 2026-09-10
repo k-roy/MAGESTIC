@@ -89,16 +89,76 @@ class PipelineConfig:
 
     # Processing parameters
     min_reads: int = 2
-    min_pcr_replicates: int = 1
+    # P4 FIX (2026-07-28): was 1 here and 2 in run_pipeline.py's argparse, so the
+    # effective threshold depended on the call path and the recombination filter
+    # had probably never actually fired (>=1 passes everything). Aligned to the
+    # documented CLI default of 2. NOTE this ACTIVATES a filter that was
+    # previously a no-op -- see planning/QTL_analyses/BC1_LOADER_FIX_20260728.md.
+    # Achievable ceiling (corrected 2026-07-28 by Kevin; my first read was wrong):
+    # a bc1 can reach **4** independent PCR replicates, not 2. The bc1-donor-bc0
+    # amplicons exist at TWO levels and the same bc1 appears in both:
+    #   trafo-level amplicon (e.g. trafo_2-1)  x {plate_3F/Q5, plate_1A/KAPA} = 2
+    #   pooled yL-level amplicon (e.g. yL387)  x {plate_3F/Q5, plate_1A/KAPA} = 2
+    # For yL406: 45 distinct trafo-level + 48 pooled yL-level sample_numbers;
+    # trafo_key maps yL386->trafo_1, yL387->trafo_2, ... Both are legitimate PCR
+    # replicates for bc1->donor MATCHING (the bc1-donor linkage is fixed at
+    # barcoding and does not change with outgrowth). They carry distinct
+    # sample_numbers, so pcr_replicate_id already separates them correctly.
+    # => a threshold of 3 IS achievable and meaningful. Measure the realized
+    # distribution before choosing between 2 and 3.
+    #
+    # RATIFIED 2026-09-09 (Kevin, direct): N=2 -- **AS A LABEL, NOT A FILTER.**
+    # "It is also useful to see what fraction of bc1 ... were only captured by a
+    # single replicate. Those can be provisionally assigned."
+    # Measured on yL406 (replicate_dist_20260729/03_postcollapse_minreads1.json):
+    # 10,067,553 bc1-donor links; 9,208,614 (91.47%) have exactly 1 replicate;
+    # 858,939 (8.53%) have >=2. Filtering at 2 therefore DISCARDS 9.2M links.
+    # Required semantics: every link is RETAINED and labelled
+    #   support_tier = 'confident'   if n_pcr_replicates >= 2
+    #   support_tier = 'provisional' if n_pcr_replicates == 1
+    # 🔴 `core/merge.py:630-632` DROPS rows when this value is >1. That function
+    # currently has ZERO call sites (dead code, signature default 1), so nothing
+    # is filtered today -- but wiring it up would silently delete 91.47% of the
+    # data. When it IS wired, it must either gain mode="label" (writes
+    # support_tier, returns every row; mode="filter" explicit and opt-in) or be
+    # deleted. Do not leave a dead filter armed at 2.
+    # Spec: planning/pipeline_provenance_rebuild/21_support_tier_requirement.md
+    min_pcr_replicates: int = 2
     bc1_purity_threshold: float = 0.8
 
     def __post_init__(self):
-        """Validate configuration after initialization."""
-        if not any([self.has_2x150_data, self.has_2x300_data]):
-            logger.warning("No data sources specified. Pipeline may not produce results.")
+        """Set derived defaults after initialization.
 
+        FIX 2026-08-06: this used to emit
+            "No data sources specified. Pipeline may not produce results."
+        here. That is ALWAYS wrong inside ``from_project_dir``, which constructs
+        the object FIRST and only detects data sources afterwards -- so the
+        warning fired on every auto-detected run no matter what was on disk.
+        A 2026-07-25 audit read that warning as proof the data-source detector
+        had failed and attributed a partial yL406 load to it
+        (AUDIT_20260725_SGTC_state.md:413-417); the real cause was per-file
+        pattern resolution, fixed separately on 2026-07-28. Measured 2026-08-06
+        with the current tree: yL406 detects 2x300 and loads 288/288 files while
+        still printing this warning. The check now lives in
+        ``warn_if_no_data_sources()`` and is called AFTER detection.
+        """
         if self.output_dir is None:
             self.output_dir = self.project_dir / "processed_data" / "bc1_donor_bc0"
+
+    def warn_if_no_data_sources(self) -> bool:
+        """Warn when neither read layout was found. Returns True if none were.
+
+        Call this AFTER data-source detection, never from ``__post_init__``.
+        """
+        if not any([self.has_2x150_data, self.has_2x300_data]):
+            logger.warning(
+                "No 2x150 or 2x300 data source found under "
+                f"{self.project_dir / 'processed_data' / 'bc1_donor_bc0'} -- the pipeline "
+                "will not produce results. Point --project-dir at a tree containing a "
+                "2x150/ or 2x300/ directory, or pass the data directory explicitly."
+            )
+            return True
+        return False
 
     @classmethod
     def from_project_dir(cls, project_dir: Path,
@@ -160,23 +220,46 @@ class PipelineConfig:
                 logger.info(f"Found guide-donor-bc0 data at {path}")
                 break
 
-        # Set up default oligo designs
-        spg_design = common_dir / "oligo_designs" / "20240411_Twist_200mer_oligo_array_order.tsv"
-        spcas9_design = common_dir / "oligo_designs" / "20210422_Twist_200mer_SpCas9_oligos_with_controls.tsv"
+        # --- Oligo designs -----------------------------------------------------
+        # FIX 2026-07-29: this looked for
+        #   oligo_designs/20210422_Twist_200mer_SpCas9_oligos_with_controls.tsv
+        # which DOES NOT EXIST on Oak -- the real file is `20210422_Twist_200mer.tsv`
+        # (and run_pipeline.py's --spcas9-oligo-design help already documented that
+        # correct name, so the two disagreed). The `if .exists()` had no `else`, so
+        # the SpCas9 design was **silently dropped** and every SpCas9/NGG oligo went
+        # unmatched. yL406 contains cV416 NGG sublibraries (yL391/yL397, trafo_6,
+        # yKR1036 WT SpCas9), so this was actively wrong for that screen.
+        # Same failure class as the loader defect: a path that quietly isn't there.
+        # Now: try known filenames in order, and WARN LOUDLY if none resolve.
+        design_specs = [
+            ("SpG_2024", ["SpG_NGNG", "SpG_NGNH"], [
+                "20240411_Twist_200mer_oligo_array_order.tsv",
+            ]),
+            ("SpCas9_2021", ["SpG_NGG", "SpCas9_NGG"], [
+                "20210422_Twist_200mer.tsv",                          # actual file on Oak
+                "20210422_Twist_200mer_SpCas9_oligos_with_controls.tsv",  # legacy name
+                "20210422_Twist_200mer_as_submitted.tsv",             # as-submitted variant
+            ]),
+        ]
+        for name, sublibs, candidates in design_specs:
+            for fname in candidates:
+                path = common_dir / "oligo_designs" / fname
+                if path.exists():
+                    config.oligo_designs.append(OligoDesignConfig(
+                        name=name, file_path=path, sublibraries=sublibs))
+                    logger.info(f"Found {name} oligo design: {path}")
+                    break
+            else:
+                logger.warning(
+                    f"NO oligo design found for {name} (sublibraries {sublibs}). Tried "
+                    f"{candidates} under {common_dir / 'oligo_designs'}. Oligos from these "
+                    f"sublibraries will NOT be matched -- pass --{name.split('_')[0].lower()}"
+                    f"-oligo-design explicitly, or fix --common-dir."
+                )
 
-        if spg_design.exists():
-            config.oligo_designs.append(OligoDesignConfig(
-                name="SpG_2024",
-                file_path=spg_design,
-                sublibraries=["SpG_NGNG", "SpG_NGNH"]
-            ))
-
-        if spcas9_design.exists():
-            config.oligo_designs.append(OligoDesignConfig(
-                name="SpCas9_2021",
-                file_path=spcas9_design,
-                sublibraries=["SpG_NGG", "SpCas9_NGG"]
-            ))
+        # Now that detection has actually run, say something true about it
+        # (see warn_if_no_data_sources / __post_init__ for why this moved here).
+        config.warn_if_no_data_sources()
 
         return config
 
