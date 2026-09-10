@@ -75,6 +75,54 @@ class LibraryConfig:
         return self.timepoints
 
 
+# ---------------------------------------------------------------------------
+# Abundance-tier vocabulary (single source of truth)
+#
+# TWO spellings of the same three tiers exist in real data on Oak and both are
+# still consumed by the pipeline:
+#   * `abundance_high` / `abundance_medium` / `abundance_low`  -- emitted by
+#     TierConfig.get_tier() below, and present in e.g.
+#     20240806_yL410-yL433_cAMP_Ras_PKA_screen_tier_mapping.tsv
+#   * `tier_1` / `tier_2` / `tier_3`  -- the earlier spelling, still the content
+#     of the yL406, yL437 and yL442 tier mappings on Oak (and of the Feb-2026
+#     production count-matrix logs).
+# HitCallingConfig.get_thresholds() already treats the two as synonyms; these
+# constants exist so every other consumer does the same instead of hardcoding
+# one spelling. Hardcoding either one alone silently empties the count matrix
+# for half the screens -- see planning/pipeline_provenance_rebuild/
+# 10_step08_and_detector_fixes.md (defect D2).
+# ---------------------------------------------------------------------------
+TIER_ALIASES = {
+    "high": ("abundance_high", "tier_1"),
+    "medium": ("abundance_medium", "tier_2"),
+    "low": ("abundance_low", "tier_3"),
+}
+
+#: The tiers carried forward into DESeq2 (high = individual BC1s,
+#: medium = oligo-aggregated). `low` is excluded by design.
+ANALYSIS_TIER_LEVELS = ("high", "medium")
+
+#: Every accepted spelling of the analysis tiers, in either vocabulary.
+ANALYSIS_TIERS = tuple(
+    name for level in ANALYSIS_TIER_LEVELS for name in TIER_ALIASES[level]
+)
+
+
+def canonical_tier_level(tier: str) -> str:
+    """Map either spelling of a tier to its canonical level ('high'/'medium'/'low').
+
+    Raises:
+        ValueError: if the tier string belongs to neither vocabulary.
+    """
+    for level, names in TIER_ALIASES.items():
+        if tier in names:
+            return level
+    raise ValueError(
+        f"Unknown tier: {tier!r}. Expected one of "
+        f"{sorted(n for names in TIER_ALIASES.values() for n in names)}"
+    )
+
+
 @dataclass
 class TierConfig:
     """
