@@ -41,7 +41,9 @@ logging.basicConfig(
 )
 from magestic.utils.bc1_extraction import (
     extract_bc1 as _canonical_extract_bc1, UPSTREAM_ANCHOR,
-    ANCHOR_TIERS, EMITTING_TIERS)
+    ANCHOR_TIERS, EMITTING_TIERS, NON_EMITTING_TIERS, TIER_COUNT_COLUMNS,
+    BC1_ORIENTATION, LAYOUT_BY_OFFSET, modal_offset_from_seqs)
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,12 @@ class ReadConfig:
 
     # Primer orientation: "standard" (R1=BC1, R2=msd) or "reversed" (R2=BC1, R1=msd)
     orientation: str = "standard"
+
+    # PASS-1 result (2026-09-10): this sample's modal universal-anchor offset from
+    # strictly confirmed reads, and its purity. None => offset-constrained tiers
+    # (confirmed_mismatch/_truncated/_indel, offset_fallback) stay disabled.
+    established_offset: Optional[int] = None
+    offset_purity: float = 0.0
 
     # Extraction strategy
     can_extract_full_donor_from_bc1_read: bool = False
@@ -317,6 +325,8 @@ def extract_bc1_from_r1(seq: str, config: ReadConfig,
         prefix-only hit returns False, which is the distinction the old
         ``prefix_found`` flag collapsed.
     """
+    if established_offset is None:
+        established_offset = config.established_offset
     call = _canonical_extract_bc1(seq, k=1, bc1_length=config.bc1_length,
                                   established_offset=established_offset)
     if call.bc1 is None:
@@ -326,6 +336,15 @@ def extract_bc1_from_r1(seq: str, config: ReadConfig,
     ps1 = call.strand_seq[:call.prefix_start + len(UPSTREAM_ANCHOR)] if call.strand_seq else ""
     confirmed = call.anchor_tier in EMITTING_TIERS and call.anchor_tier != "prefix_only"
     return call.bc1, ps1, call.bc1_length, confirmed
+
+def bc1_call(seq: str, config: ReadConfig):
+    """The canonical per-read verdict (a ``Bc1Call``), with this sample's
+    established offset. ``process_read_pair`` needs the TIER of every read --
+    including the non-emitting ones -- for the per-tier count columns and the
+    tier-accounting sidecar, which the 4-tuple of ``extract_bc1_from_r1`` drops."""
+    return _canonical_extract_bc1(seq, k=1, bc1_length=config.bc1_length,
+                                  established_offset=config.established_offset)
+
 
 def extract_donor_from_r1(seq: str, config: ReadConfig) -> Optional[Tuple[str, str]]:
     """
@@ -508,7 +527,9 @@ def process_read_pair(
     - Reversed: R2 has BC1, R1 has msd/bc0/SPS/donor (in RC)
 
     Returns:
-        Dict with all extracted components or None if extraction fails
+        Dict that ALWAYS carries ``anchor_tier`` and ``read_orientation`` (so every
+        read can be accounted for, 2026-09-10); extraction fields (``bc1``, donor,
+        bc0, SPS, ...) are present only when the tier emits a barcode.
     """
     result = {}
 
@@ -521,17 +542,18 @@ def process_read_pair(
         msd_seq = r2_seq
 
     # Extract BC1 from the BC1-containing read
-    bc1, ps1, bc1_length, bc1_prefix_found = extract_bc1_from_r1(bc1_seq, config)
-    if bc1 is None:
-        return None   # no anchor: counted as unparsed, never manufactured
+    call = bc1_call(bc1_seq, config)
+    result['anchor_tier'] = call.anchor_tier
+    result['read_orientation'] = call.orientation or "NA"
+    if call.bc1 is None:
+        return result   # non-emitting tier: accounted for, never manufactured
 
-    if not bc1:
-        return None
-
-    result['bc1'] = bc1
-    result['PS1'] = ps1
-    result['bc1_length'] = bc1_length
-    result['bc1_prefix_found'] = bc1_prefix_found
+    result['bc1'] = call.bc1
+    result['PS1'] = (call.strand_seq[:call.prefix_start + len(UPSTREAM_ANCHOR)]
+                     if call.strand_seq else "")
+    result['bc1_length'] = call.bc1_length
+    # kept for back-compat: True only for a downstream-confirmed extraction
+    result['bc1_prefix_found'] = call.anchor_tier != "prefix_only"
 
     # Extract bc0, SPS, msd, and donor from the msd-containing read
     msd_components = process_msd_read(msd_seq, config, is_reverse_complement=True)
@@ -569,12 +591,13 @@ def process_files(
         r1_len, r2_len = detect_read_lengths(r1_path, r2_path)
         logger.info(f"Detected read lengths: R1={r1_len}bp, R2={r2_len}bp")
 
-        # Handle empty files - write empty output and exit
+        # Handle empty files - write empty output (SAME schema as a real one) and exit
         if r1_len == 0 or r2_len == 0:
             logger.warning(f"Empty FASTQ files detected. Writing empty output.")
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            with open(output_path, "w") as f:
-                f.write("bc1\tdonor\tsps\tbc0\tcount\n")
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            _write_parsed(output_path, {})
+            _write_sidecars(output_path, r1_path, r2_path, None, Counter(), 0, 0, 0,
+                            note="empty FASTQ input")
             return
 
         # Sample sequences for BC1_PREFIX and orientation detection
@@ -604,17 +627,37 @@ def process_files(
             orientation=orientation,
         )
 
+    # PASS 1 -- this sample's layout from its own barcode-carrying reads (the
+    # same two-pass scheme the screen path uses, 4542652). The offset enables the
+    # offset-constrained tiers in PASS 2.
+    _bc1_read_path = r2_path if config.orientation == "reversed" else r1_path
+    _pass1 = [seq for _, seq, _, _ in read_fastq_entries(_bc1_read_path, 20000)]
+    config.established_offset, config.offset_purity = modal_offset_from_seqs(
+        _pass1, k=1, bc1_length=config.bc1_length)
+    if config.established_offset is None:
+        logger.warning("  PASS 1: no strictly confirmed read -- offset-constrained "
+                       "tiers DISABLED for this sample (reads fall to prefix_only).")
+    else:
+        _lay = LAYOUT_BY_OFFSET.get(config.established_offset, "UNRECOGNIZED offset")
+        logger.info(f"  PASS 1: layout offset +{config.established_offset} = {_lay}, "
+                    f"purity {config.offset_purity:.4f} over {len(_pass1):,} reads")
+        if config.offset_purity < 0.90:
+            logger.warning(f"  PASS 1 offset purity {config.offset_purity:.4f} < 0.90 -- "
+                           f"MIXED sample; layout call least trustworthy here.")
+
     logger.info(f"Extraction strategy: {config.strategy}")
     logger.info(f"  Orientation: {config.orientation}")
     logger.info(f"  BC1 read: {config.bc1_read}")
     logger.info(f"  MSD read: {config.msd_read}")
     logger.info(f"  Can extract full donor from msd read: {config.can_extract_full_donor_from_msd_read}")
 
-    # Process reads
-    results = Counter()
+    # Process reads. results: key -> per-tier read counts (TIER_COUNT_COLUMNS order)
+    results: Dict[tuple, List[int]] = {}
+    tier_acct = Counter()          # (anchor_tier, read_orientation) -> reads
     length_stats = Counter()
     reads_processed = 0
     reads_successful = 0
+    reads_msd_unparsed = 0
 
     start_time = timeit.default_timer()
 
@@ -623,24 +666,14 @@ def process_files(
             for r1_read, r2_read in tqdm(zip(r1_file, r2_file), desc="Processing reads"):
                 reads_processed += 1
                 if reads_processed > MAX_READS:
+                    reads_processed -= 1   # this read is not tallied
                     break
 
                 parsed = process_read_pair(r1_read.sequence, r2_read.sequence, config)
-
-                if parsed and 'bc1' in parsed:
-                    # Create key tuple for counting
-                    key = (
-                        parsed.get('bc1', ''),
-                        parsed.get('donor', ''),
-                        parsed.get('bc0', ''),
-                        parsed.get('SPS', ''),
-                        parsed.get('donor_bc0_fragment', ''),
-                    )
-                    results[key] += 1
+                if _tally(parsed, results, tier_acct, length_stats):
                     reads_successful += 1
-
-                    if 'bc1_length' in parsed:
-                        length_stats[parsed['bc1_length']] += 1
+                    if not parsed.get('bc0'):
+                        reads_msd_unparsed += 1
     else:
         r1_iter = read_fastq_entries(r1_path)
         r2_iter = read_fastq_entries(r2_path)
@@ -648,23 +681,14 @@ def process_files(
         for (_, r1_seq, _, _), (_, r2_seq, _, _) in tqdm(zip(r1_iter, r2_iter), desc="Processing reads"):
             reads_processed += 1
             if reads_processed > MAX_READS:
+                reads_processed -= 1   # this read is not tallied
                 break
 
             parsed = process_read_pair(r1_seq, r2_seq, config)
-
-            if parsed and 'bc1' in parsed:
-                key = (
-                    parsed.get('bc1', ''),
-                    parsed.get('donor', ''),
-                    parsed.get('bc0', ''),
-                    parsed.get('SPS', ''),
-                    parsed.get('donor_bc0_fragment', ''),
-                )
-                results[key] += 1
+            if _tally(parsed, results, tier_acct, length_stats):
                 reads_successful += 1
-
-                if 'bc1_length' in parsed:
-                    length_stats[parsed['bc1_length']] += 1
+                if not parsed.get('bc0'):
+                    reads_msd_unparsed += 1
 
     elapsed = timeit.default_timer() - start_time
 
@@ -682,16 +706,101 @@ def process_files(
             pct = 100 * count / total
             logger.info(f"    {length}bp: {count:,} ({pct:.1f}%)")
 
+    logger.info("  Anchor tiers (all reads):")
+    for t in ANCHOR_TIERS:
+        n_t = sum(v for (tt, _o), v in tier_acct.items() if tt == t)
+        logger.info(f"    {t:30s} {n_t:>12,} ({100*n_t/max(reads_processed,1):.2f}%)")
+
     # Write output
-    with open(output_path, 'w') as f:
-        header = "\t".join(['counts', 'bc1', 'donor', 'bc0', 'SPS', 'donor_bc0_fragment'])
-        f.write(header + "\n")
-
-        for key, count in sorted(results.items(), key=lambda x: -x[1]):
-            bc1, donor, bc0, sps, donor_bc0_fragment = key
-            f.write(f"{count}\t{bc1}\t{donor}\t{bc0}\t{sps}\t{donor_bc0_fragment}\n")
-
+    _write_parsed(output_path, results)
+    _write_sidecars(output_path, r1_path, r2_path, config, tier_acct,
+                    reads_processed, reads_successful, reads_msd_unparsed)
     logger.info(f"Wrote {len(results)} unique sequences to {output_path}")
+
+
+# =============================================================================
+# Output (2026-09-10: per-tier counts + tier-accounting sidecar, 28_ Sec. 1b/1c)
+# =============================================================================
+
+PARSED_COLUMNS = ['counts', 'bc1', 'donor', 'bc0', 'SPS', 'donor_bc0_fragment', *TIER_COUNT_COLUMNS]
+_TIER_INDEX = {t: i for i, t in enumerate(EMITTING_TIERS)}
+
+
+def _tally(parsed, results, tier_acct, length_stats) -> bool:
+    """Account one read. Returns True iff it emitted a bc1 row."""
+    tier = parsed.get('anchor_tier', 'none')
+    tier_acct[(tier, parsed.get('read_orientation', 'NA'))] += 1
+    if not parsed.get('bc1'):
+        return False
+    key = (
+        parsed.get('bc1', ''),
+        parsed.get('donor', ''),
+        parsed.get('bc0', ''),
+        parsed.get('SPS', ''),
+        parsed.get('donor_bc0_fragment', ''),
+    )
+    vec = results.get(key)
+    if vec is None:
+        vec = results[key] = [0] * len(EMITTING_TIERS)
+    vec[_TIER_INDEX[tier]] += 1
+    if 'bc1_length' in parsed:
+        length_stats[parsed['bc1_length']] += 1
+    return True
+
+
+def _write_parsed(output_path, results) -> None:
+    """One row per (bc1, donor, bc0, SPS, fragment). ``counts == sum(n_<tier>)``
+    on every row; all seven tier columns always present, even when zero.
+    Deterministic order: counts desc, then the key (ties are common in the tail)."""
+    rows = sorted(((sum(v), k, v) for k, v in results.items()),
+                  key=lambda r: (-r[0], r[1]))
+    with open(output_path, 'w') as f:
+        f.write("\t".join(PARSED_COLUMNS) + "\n")
+        for count, key, vec in rows:
+            bc1, donor, bc0, sps, frag = key
+            f.write("\t".join([str(count), bc1, donor, bc0, sps, frag, *map(str, vec)]) + "\n")
+
+
+def _write_sidecars(output_path, r1_path, r2_path, config, tier_acct,
+                    reads_processed, reads_emitting, reads_msd_unparsed, note="") -> None:
+    """``<parsed>.tier_accounting.tsv``: every read accounted for, all 9 tiers x
+    {fwd, rev, NA}, so nothing is silently set aside (the 23_ mandatory
+    companion). ``<parsed>.parse_meta.json``: the per-sample facts PROVENANCE needs."""
+    sample_id = os.path.basename(output_path)
+    for suf in ('.tsv', '_bc1_donor_bc0', '_parsed'):
+        if sample_id.endswith(suf):
+            sample_id = sample_id[:-len(suf)]
+    acct_path = f"{output_path}.tier_accounting.tsv"
+    with open(acct_path, 'w') as f:
+        f.write("sample_id\tanchor_tier\tread_orientation\treads\temits_bc1\n")
+        for t in ANCHOR_TIERS:
+            for o in ("fwd", "rev", "NA"):
+                f.write(f"{sample_id}\t{t}\t{o}\t{tier_acct.get((t, o), 0)}\t"
+                        f"{t in EMITTING_TIERS}\n")
+        f.write(f"{sample_id}\t_reads_processed\tNA\t{reads_processed}\tNA\n")
+        f.write(f"{sample_id}\t_reads_emitting_bc1\tNA\t{reads_emitting}\tNA\n")
+        f.write(f"{sample_id}\t_reads_msd_unparsed\tNA\t{reads_msd_unparsed}\tNA\n")
+    if sum(tier_acct.values()) != reads_processed:   # explicit: survives python -O
+        raise RuntimeError(f"tier accounting {sum(tier_acct.values())} != reads_processed {reads_processed}")
+    meta = {
+        "sample_id": sample_id, "r1": str(r1_path), "r2": str(r2_path),
+        "output": str(output_path), "note": note,
+        "reads_processed": reads_processed, "reads_emitting_bc1": reads_emitting,
+        "reads_msd_unparsed": reads_msd_unparsed,
+        "bc1_orientation": BC1_ORIENTATION,
+        "tier_columns": list(TIER_COUNT_COLUMNS),
+    }
+    if config is not None:
+        meta.update({
+            "r1_length": config.r1_length, "r2_length": config.r2_length,
+            "primer_orientation": config.orientation, "bc1_read": config.bc1_read,
+            "strategy": config.strategy,
+            "established_offset": config.established_offset,
+            "offset_purity": round(config.offset_purity, 6),
+            "layout": LAYOUT_BY_OFFSET.get(config.established_offset),
+        })
+    with open(f"{output_path}.parse_meta.json", 'w') as f:
+        json.dump(meta, f, indent=1)
 
 
 # =============================================================================
