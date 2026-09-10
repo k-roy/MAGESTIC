@@ -2,6 +2,7 @@
 import sys, random, itertools
 pass
 from magestic.utils.bc1_extraction import (extract_bc1, reverse_complement, _find_upstream, _seed_positions,
+                            _edit_at_most_1, PrefixCatalog,
                             UPSTREAM_ANCHOR, UNIVERSAL_DOWNSTREAM, DOWNSTREAM_FALLBACK, BC1_LENGTH)
 
 P=F=0
@@ -111,5 +112,54 @@ chk("anchor beyond the window is NOT found",
 print("\n== bc1 is never padded or normalized ==")
 chk("no N-padding anywhere", all("N" not in (extract_bc1(x).bc1 or "") for x in (short, prefix_only, noanchor)))
 
+
+print("\n== indel-aware fallback ==")
+LEAD2="GAGCTCCTACGACGTCGA"
+def mk2(tail): return LEAD2+UPSTREAM_ANCHOR+BC+tail
+# an indel BEFORE the anchor leaves it intact, so the plain scan finds it at a
+# shifted offset -- that is 'confirmed', and better than a fallback.
+chk("intact anchor at a shifted offset -> confirmed (not a fallback)",
+    extract_bc1(mk2("A"+"G"+UNIVERSAL_DOWNSTREAM), established_offset=1).anchor_tier=="confirmed")
+# the fallback exists for an indel INSIDE the anchor, which breaks the exact scan
+_ins = UNIVERSAL_DOWNSTREAM[:2]+"G"+UNIVERSAL_DOWNSTREAM[2:]   # real D case: CGGTGCATAAC
+chk("1-nt INSERTION INSIDE the anchor -> confirmed_indel",
+    extract_bc1(mk2("A"+_ins), established_offset=1).anchor_tier=="confirmed_indel")
+_del = UNIVERSAL_DOWNSTREAM[:3]+UNIVERSAL_DOWNSTREAM[4:]
+chk("1-nt DELETION INSIDE the anchor -> confirmed_indel",
+    extract_bc1(mk2("A"+_del+"TT"), established_offset=1).anchor_tier=="confirmed_indel")
+chk("1-nt DELETION before the anchor is recovered",
+    extract_bc1(mk2(UNIVERSAL_DOWNSTREAM+"TT"), established_offset=1).anchor_tier in
+    ("confirmed","confirmed_indel"))
+chk("indel-like garbage is REFUSED",
+    extract_bc1(mk2("A"+"TTTTTTTTTT"), established_offset=1).anchor_tier=="prefix_only")
+chk("indel fallback needs an established offset",
+    extract_bc1(mk2("A"+_ins)).anchor_tier=="prefix_only")
+chk("_edit_at_most_1 sees a substitution", _edit_at_most_1("CGTGCATAAT","CGTGCATAAC")==1)
+chk("_edit_at_most_1 sees an insertion",   _edit_at_most_1("CGGTGCATAAC","CGTGCATAAC")==1)
+chk("_edit_at_most_1 sees a deletion",     _edit_at_most_1("CGTGCATAC","CGTGCATAAC")==1)
+chk("_edit_at_most_1 rejects 2 edits",     _edit_at_most_1("CGTGCATTTC","CGTGCATAAC") is None)
+
+print("\n== prefix catalog: real difference vs sequencing error ==")
+cat = PrefixCatalog(min_support=3, min_fraction=0.10)
+VAR = "CAGGTCATGCTA"
+for _ in range(500): cat.observe("X", UPSTREAM_ANCHOR, 18)
+for _ in range(2):   cat.observe("X", VAR, 18)
+for _ in range(290): cat.observe("Y", VAR, 18)
+for _ in range(10):  cat.observe("Y", UPSTREAM_ANCHOR, 18)
+for _ in range(2):   cat.observe("Z", VAR, 18)
+chk("rare context on a deep barcode -> error_likely",
+    cat.classify("X", VAR, 18)["verdict"]=="error_likely")
+chk("dominant variant on a deep barcode -> canonical for THAT barcode",
+    cat.classify("Y", VAR, 18)["verdict"]=="canonical")
+chk("shallow barcode -> insufficient_coverage, no opinion",
+    cat.classify("Z", UPSTREAM_ANCHOR, 18)["verdict"]=="insufficient_coverage")
+chk("unseen barcode -> novel_barcode",
+    cat.classify("Q", VAR, 18)["verdict"]=="novel_barcode")
+chk("variant_barcodes is depth-guarded (Z excluded, Y kept)",
+    [b for b,_,_,_ in cat.variant_barcodes()]==["Y"])
+chk("N-containing contexts never count as variants",
+    (lambda c: (c.observe("W","CAGNTCATGCTC",18,50) or [b for b,_,_,_ in c.variant_barcodes()]==[]))(PrefixCatalog()))
+chk("coverage_report flags a shallow catalog",
+    PrefixCatalog().coverage_report()["barcodes"]==0)
+
 print(f"\n{P} passed, {F} failed")
-sys.exit(1 if F else 0)

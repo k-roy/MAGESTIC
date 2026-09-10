@@ -69,6 +69,7 @@ class Bc1Call:
     layout: Optional[str]
     k_used: Optional[int]     # mismatches actually found in the upstream anchor
     bc1_length: Optional[int]
+    prefix_observed: Optional[str] = None   # the upstream anchor AS READ
     reason: str = ""
 
     def as_row(self) -> dict:
@@ -84,6 +85,33 @@ def _hamming_at_most(a: str, b: str, k: int) -> Optional[int]:
             if d > k:
                 return None
     return d
+
+
+def _edit_at_most_1(obs: str, exp: str) -> Optional[int]:
+    """Levenshtein distance between ``obs`` and ``exp`` if <= 1, else None.
+
+    Unlike Hamming this sees INDELS, which is the point: a 1-nt insertion in the
+    tail shifts every downstream base by one, so a Hamming comparison against a
+    shifted string looks like ~75% mismatches and is silently discarded. Length
+    difference must be 0 or 1; anything larger cannot be within edit distance 1.
+    """
+    la, lb = len(obs), len(exp)
+    if abs(la - lb) > 1:
+        return None
+    if la == lb:
+        d = 0
+        for x, y in zip(obs, exp):
+            if x != y:
+                d += 1
+                if d > 1:
+                    return None
+        return d
+    # one is longer by exactly 1: find the first divergence, skip that base
+    lo, sh = (obs, exp) if la > lb else (exp, obs)
+    i = 0
+    while i < len(sh) and lo[i] == sh[i]:
+        i += 1
+    return 1 if lo[i + 1:] == sh[i:] else None
 
 
 def _seed_positions(seq: str, pattern: str, k: int) -> List[int]:
@@ -190,6 +218,30 @@ def _scan_downstream(tail: str, established_offset: Optional[int]) -> Tuple[Opti
     # (c) the 8-mer fallback
     if tail[o:o + len(DOWNSTREAM_FALLBACK)] == DOWNSTREAM_FALLBACK:
         return o, "offset_fallback"
+    # (d) INDEL-aware last resort. A 1-nt insertion or deletion upstream of the
+    #     anchor shifts it by one, so the anchor is intact but at o+/-1; an indel
+    #     INSIDE the anchor is caught by the edit-distance test. Still
+    #     offset-constrained: only o-1, o, o+1 are ever examined.
+    for cand in (o, o - 1, o + 1):
+        if cand < 0:
+            continue
+        seg2 = tail[cand:cand + len(UNIVERSAL_DOWNSTREAM)]
+        if len(seg2) < MIN_TRUNCATED_ANCHOR_MM:
+            continue
+        exp2 = UNIVERSAL_DOWNSTREAM[:len(seg2)]
+        d = _edit_at_most_1(seg2, exp2)
+        if d is not None:
+            return cand, "confirmed_indel"
+        # DELETION inside the anchor: the observed run is one SHORTER than the
+        # anchor, so it must be compared against the FULL anchor, not against a
+        # same-length prefix (which is the truncation case, handled at (b)).
+        # Require the read to actually extend far enough that this is a deletion
+        # and not a truncated read.
+        if len(tail) - cand >= len(UNIVERSAL_DOWNSTREAM):
+            seg3 = tail[cand:cand + len(UNIVERSAL_DOWNSTREAM) - 1]
+            if (len(seg3) >= MIN_TRUNCATED_ANCHOR_MM
+                    and _edit_at_most_1(seg3, UNIVERSAL_DOWNSTREAM) is not None):
+                return cand, "confirmed_indel"
     return None, "prefix_only"
 
 
@@ -228,23 +280,160 @@ def extract_bc1(
 
         if offset is not None:
             bc1 = s[b0:b0 + bc1_length]
+            obs = s[start:start + len(UPSTREAM_ANCHOR)]
             if len(bc1) != bc1_length:
                 return Bc1Call(None, "length_mismatch", orient, offset,
-                               LAYOUT_BY_OFFSET.get(offset), mism, len(bc1),
+                               LAYOUT_BY_OFFSET.get(offset), mism, len(bc1), obs,
                                f"read ends {bc1_length - len(bc1)} nt short of a full barcode")
             return Bc1Call(bc1, tier, orient, offset,
-                           LAYOUT_BY_OFFSET.get(offset), mism, bc1_length)
+                           LAYOUT_BY_OFFSET.get(offset), mism, bc1_length, obs)
 
         # prefix found, no downstream confirmation -- keep it, but SAY SO
         bc1 = s[b0:b0 + bc1_length]
+        obs = s[start:start + len(UPSTREAM_ANCHOR)]
         if len(bc1) != bc1_length:
             best_miss = Bc1Call(None, "length_mismatch", orient, None, None, mism,
-                                len(bc1), "read too short for a full barcode")
+                                len(bc1), obs, "read too short for a full barcode")
             continue
-        best_miss = Bc1Call(bc1, "prefix_only", orient, None, None, mism, bc1_length,
+        best_miss = Bc1Call(bc1, "prefix_only", orient, None, None, mism, bc1_length, obs,
                             "upstream anchor verified; no downstream anchor in window")
 
     if best_miss is not None:
         return best_miss
-    return Bc1Call(None, "none", None, None, None, None, None,
+    return Bc1Call(None, "none", None, None, None, None, None, None,
                    "upstream anchor not found within k on either strand")
+
+
+# =============================================================================
+# Per-barcode prefix catalog
+# =============================================================================
+#
+# Kevin, 2026-09-09: "a catalog of barcode prefixes identified, so that as we are
+# matching barcodes, we can distinguish between seq errors and true prefix
+# differences for each barcode."
+#
+# The separating principle: a TRUE structural difference is REPRODUCIBLE across
+# independent reads of the same barcode. A sequencing error is not. A barcode
+# seen 500x with the canonical anchor and twice with a variant has two errors; a
+# barcode seen 290 of 300 times with that same variant has a real difference --
+# a subpool cloned on a different backbone, say. The canonical anchor is
+# therefore a PRIOR, not a rule, and each barcode gets its own empirical answer.
+
+from collections import defaultdict, Counter as _Counter
+
+
+class PrefixCatalog:
+    """Observed upstream-anchor context per bc1, and the error-vs-real verdict.
+
+    Two passes: ``observe`` every confirmed read, then ``classify`` the doubtful
+    ones against what that barcode actually looks like.
+    """
+
+    #: a context must clear BOTH to count as a real difference rather than noise
+    def __init__(self, min_support: int = 3, min_fraction: float = 0.10):
+        self.min_support = min_support
+        self.min_fraction = min_fraction
+        self._ctx: Dict[str, "_Counter[Tuple[str, Optional[int]]]"] = defaultdict(_Counter)
+
+    def observe(self, bc1: str, prefix_observed: str,
+                anchor_offset: Optional[int], count: int = 1) -> None:
+        if bc1 and prefix_observed:
+            self._ctx[bc1][(prefix_observed, anchor_offset)] += count
+
+    def observe_call(self, call: "Bc1Call", count: int = 1) -> None:
+        if call.bc1 and call.prefix_observed:
+            self.observe(call.bc1, call.prefix_observed, call.anchor_offset, count)
+
+    def total(self, bc1: str) -> int:
+        return sum(self._ctx.get(bc1, {}).values())
+
+    def consensus(self, bc1: str) -> Optional[Tuple[str, Optional[int]]]:
+        c = self._ctx.get(bc1)
+        return c.most_common(1)[0][0] if c else None
+
+    def classify(self, bc1: str, prefix_observed: str,
+                 anchor_offset: Optional[int] = None) -> Dict[str, object]:
+        """Is this context a real property of this barcode, or a read error?
+
+        Returns a dict with ``verdict``, ``support``, ``total``, ``fraction``
+        and the barcode's ``consensus``. Verdicts:
+          novel_barcode      -- bc1 absent from the catalog; no opinion possible
+          canonical          -- context IS this barcode's consensus
+          variant_confirmed  -- non-consensus, but reproducible for THIS barcode
+                                (>= min_support reads AND >= min_fraction)
+          error_likely       -- non-consensus and rare for this barcode
+        """
+        c = self._ctx.get(bc1)
+        if not c:
+            return {"verdict": "novel_barcode", "support": 0, "total": 0,
+                    "fraction": 0.0, "consensus": None}
+        key = (prefix_observed, anchor_offset)
+        tot = sum(c.values())
+        sup = c.get(key, 0)
+        cons = c.most_common(1)[0][0]
+        frac = sup / tot if tot else 0.0
+        if tot < self.MIN_COVERAGE_FOR_CONSENSUS and key != cons:
+            # not enough reads of THIS barcode to tell a variant from a misread
+            return {"verdict": "insufficient_coverage", "support": sup, "total": tot,
+                    "fraction": frac, "consensus": cons}
+        if key == cons:
+            verdict = "canonical"
+        elif sup >= self.min_support and frac >= self.min_fraction:
+            verdict = "variant_confirmed"
+        else:
+            verdict = "error_likely"
+        return {"verdict": verdict, "support": sup, "total": tot,
+                "fraction": frac, "consensus": cons}
+
+    #: a consensus drawn from fewer reads than this is not a consensus. Measured
+    #: 2026-09-09: at 1.3 reads/barcode EVERY "non-canonical consensus" was a
+    #: low-coverage artifact (2/2, 1/2, 4/4 reads) or an N base-call failure.
+    #: Two reads cannot separate a real variant from one misread base.
+    MIN_COVERAGE_FOR_CONSENSUS = 10
+
+    def variant_barcodes(self, min_total: Optional[int] = None
+                         ) -> List[Tuple[str, Tuple[str, Optional[int]], int, int]]:
+        """Barcodes whose CONSENSUS context is genuinely not the canonical anchor.
+
+        Only barcodes with >= ``min_total`` observations are considered: below
+        that the consensus is noise, not signal. Contexts containing N are
+        excluded outright -- an uncalled base is an instrument failure, not a
+        construct difference.
+        """
+        floor = self.MIN_COVERAGE_FOR_CONSENSUS if min_total is None else min_total
+        out = []
+        for bc1, c in self._ctx.items():
+            tot = sum(c.values())
+            if tot < floor:
+                continue
+            cons = c.most_common(1)[0][0]
+            if cons[0] != UPSTREAM_ANCHOR and "N" not in cons[0]:
+                out.append((bc1, cons, c[cons], tot))
+        return sorted(out, key=lambda r: -r[3])
+
+    def coverage_report(self) -> Dict[str, object]:
+        """Is this catalog deep enough to be believed?
+
+        Per-barcode coverage is the limiting resource: the error-vs-real call is
+        only possible for barcodes observed enough times for a minority context
+        to be distinguishable from a single misread base. Build the catalog at
+        SCREEN scale, not per file.
+        """
+        tots = sorted(sum(c.values()) for c in self._ctx.values())
+        if not tots:
+            return {"barcodes": 0, "usable": 0, "usable_fraction": 0.0}
+        n_ok = sum(1 for t in tots if t >= self.MIN_COVERAGE_FOR_CONSENSUS)
+        return {"barcodes": len(tots),
+                "observations": sum(tots),
+                "mean_coverage": sum(tots) / len(tots),
+                "median_coverage": tots[len(tots) // 2],
+                "usable": n_ok,
+                "usable_fraction": n_ok / len(tots),
+                "min_coverage_required": self.MIN_COVERAGE_FOR_CONSENSUS}
+
+    def summary(self) -> Dict[str, int]:
+        n_multi = sum(1 for c in self._ctx.values() if len(c) > 1)
+        return {"barcodes": len(self._ctx),
+                "barcodes_with_multiple_contexts": n_multi,
+                "barcodes_with_noncanonical_consensus": len(self.variant_barcodes()),
+                "observations": sum(sum(c.values()) for c in self._ctx.values())}
