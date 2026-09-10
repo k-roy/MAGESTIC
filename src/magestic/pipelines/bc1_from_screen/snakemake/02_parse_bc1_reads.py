@@ -49,6 +49,8 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+from magestic.utils.bc1_extraction import extract_bc1 as _canonical_extract_bc1
+
 logger = logging.getLogger(__name__)
 
 
@@ -744,102 +746,42 @@ BC1_LENGTH_TOLERANCE = 1  # +/- 1bp from expected length
 
 def extract_bc1_from_sequence(
     seq: str,
-    bc1_prefix: str,
-    bc1_suffix: str,
-    bc1_length: int,
-    length_tolerance: int = BC1_LENGTH_TOLERANCE,
+    bc1_prefix: str = None,
+    bc1_suffix: str = None,
+    bc1_length: int = 20,
+    length_tolerance: int = None,
+    k: int = 1,
+    established_offset: int = None,
 ) -> tuple:
-    """
-    Extract BC1 barcode from a sequence.
+    """Extract BC1 -- DELEGATES to the canonical extractor.
 
-    Supports BC1 lengths of +/- length_tolerance from expected.
-    For example, with bc1_length=20 and tolerance=1, accepts 19-21bp BC1s.
+    2026-09-09: the previous body was an exact ``str.find`` on the prefix (zero
+    error tolerance) followed by a suffix check that degraded to no check at
+    all, returning an UNLABELLED guess. Measured on real reads, with the
+    shipped defaults it produced ZERO confirmed extractions on three of the four
+    known layouts, and on the 2021 layout emitted 46.53% of reads as
+    unvalidated barcodes. See planning/pipeline_provenance_rebuild/
+    22_bc1_extraction_review.md.
+
+    There is now ONE definition of a bc1, in magestic.utils.bc1_extraction,
+    shared by the screen path, the bc1_donor_bc0 path and WGS.
+
+    ``bc1_prefix`` / ``bc1_suffix`` / ``length_tolerance`` are accepted and
+    IGNORED -- kept so existing callers do not break. The canonical anchors are
+    layout-independent, so a per-era suffix is no longer a parameter: the
+    universal downstream anchor's OBSERVED OFFSET is the layout call.
 
     Returns:
-        (bc1, orientation, primer_pair, actual_length) or (None, None, None, None) if not found
+        (bc1, orientation, anchor_tier, actual_length). The third element was
+        previously named ``primer_pair`` and carried "inner"/"outer"/"no_suffix"
+        -- extraction-branch values in a field whose name collides with the real
+        inner/outer PCR primers. It now carries the anchor tier:
+        confirmed | offset_fallback | prefix_only | length_mismatch | none
     """
-    seq = seq.upper()
-    bc1_prefix = bc1_prefix.upper()
-    bc1_suffix = bc1_suffix.upper()
-
-    min_bc1_len = bc1_length - length_tolerance
-    max_bc1_len = bc1_length + length_tolerance
-
-    # Try forward orientation
-    prefix_idx = seq.find(bc1_prefix)
-    if prefix_idx >= 0:
-        bc1_start = prefix_idx + len(bc1_prefix)
-
-        # PASS 1: Look for EXACT suffix match at any valid BC1 length
-        # This prevents fuzzy match at 19bp from triggering when 20bp is the real match
-        for try_len in range(min_bc1_len, max_bc1_len + 1):
-            bc1_end = bc1_start + try_len
-            if bc1_end > len(seq):
-                continue
-
-            suffix_start = bc1_end
-            suffix_region = seq[suffix_start:suffix_start + len(bc1_suffix)]
-
-            if suffix_region == bc1_suffix:
-                bc1 = seq[bc1_start:bc1_end]
-                return bc1, "forward", "inner", len(bc1)
-
-        # PASS 2: If no exact match, try fuzzy match (partial suffix) at expected length only
-        # This avoids false positives from finding suffix at wrong offset
-        bc1_end = bc1_start + bc1_length
-        if bc1_end <= len(seq):
-            suffix_start = bc1_end
-            # Check if first 3 chars of suffix appear at exactly the expected position
-            suffix_region = seq[suffix_start:suffix_start + len(bc1_suffix)]
-            if suffix_region.startswith(bc1_suffix[:3]):
-                bc1 = seq[bc1_start:bc1_end]
-                return bc1, "forward", "outer", len(bc1)
-
-        # PASS 3: If still no match, return expected length without suffix validation
-        if bc1_end <= len(seq):
-            bc1 = seq[bc1_start:bc1_end]
-            return bc1, "forward", "no_suffix", len(bc1)
-
-    # Try reverse complement orientation
-    rc_prefix = reverse_complement(bc1_suffix)
-    rc_suffix = reverse_complement(bc1_prefix)
-
-    prefix_idx = seq.find(rc_prefix)
-    if prefix_idx >= 0:
-        bc1_start = prefix_idx + len(rc_prefix)
-
-        # PASS 1: Look for EXACT suffix match at any valid BC1 length
-        for try_len in range(min_bc1_len, max_bc1_len + 1):
-            bc1_end = bc1_start + try_len
-            if bc1_end > len(seq):
-                continue
-
-            suffix_start = bc1_end
-            suffix_region = seq[suffix_start:suffix_start + len(rc_suffix)]
-
-            if suffix_region == rc_suffix:
-                bc1_rc = seq[bc1_start:bc1_end]
-                bc1 = reverse_complement(bc1_rc)
-                return bc1, "reverse", "inner", len(bc1)
-
-        # PASS 2: Try fuzzy match at expected length only
-        bc1_end = bc1_start + bc1_length
-        if bc1_end <= len(seq):
-            suffix_start = bc1_end
-            suffix_region = seq[suffix_start:suffix_start + len(rc_suffix)]
-            if suffix_region.startswith(rc_suffix[:3]):
-                bc1_rc = seq[bc1_start:bc1_end]
-                bc1 = reverse_complement(bc1_rc)
-                return bc1, "reverse", "outer", len(bc1)
-
-        # PASS 3: Return expected length without suffix validation
-        if bc1_end <= len(seq):
-            bc1_rc = seq[bc1_start:bc1_end]
-            bc1 = reverse_complement(bc1_rc)
-            return bc1, "reverse", "no_suffix", len(bc1)
-
-    return None, None, None, None
-
+    call = _canonical_extract_bc1(
+        seq, k=k, bc1_length=bc1_length, established_offset=established_offset
+    )
+    return call.bc1, call.orientation, call.anchor_tier, call.bc1_length
 
 def parse_collapsed_fastq(
     fastq_path: Path,
@@ -852,13 +794,14 @@ def parse_collapsed_fastq(
     Parse collapsed FASTQ and extract BC1 counts.
 
     Returns:
-        Tuple of (bc1_counts, total_reads, matched_reads, length_stats)
+        Tuple of (bc1_counts, total_reads, matched_reads, length_stats, tier_stats)
         where length_stats is a Counter of BC1 lengths
     """
     bc1_counts = defaultdict(int)
     total_reads = 0
     matched_reads = 0
     length_stats = Counter()
+    tier_stats = Counter()
 
     min_bc1_len = bc1_length - length_tolerance
     max_bc1_len = bc1_length + length_tolerance
@@ -893,9 +836,10 @@ def parse_collapsed_fastq(
             total_reads += count
 
             # Extract BC1 (now returns 4 values)
-            bc1, orientation, primer_pair, actual_length = extract_bc1_from_sequence(
+            bc1, orientation, anchor_tier, actual_length = extract_bc1_from_sequence(
                 sequence, bc1_prefix, bc1_suffix, bc1_length, length_tolerance
             )
+            tier_stats[anchor_tier] += count
 
             if bc1 and "N" not in bc1:
                 # Validate length is within tolerance
@@ -904,7 +848,7 @@ def parse_collapsed_fastq(
                     matched_reads += count
                     length_stats[actual_length] += count
 
-    return bc1_counts, total_reads, matched_reads, length_stats
+    return bc1_counts, total_reads, matched_reads, length_stats, tier_stats
 
 
 def main():
@@ -976,17 +920,21 @@ def main():
             bc1_prefix = args.bc1_prefix or "CATGCTC"
             bc1_suffix = args.bc1_suffix or "CCCTAGG"
             logger.warning(f"Using default BC1_PREFIX={bc1_prefix} BC1_SUFFIX={bc1_suffix}")
-            logger.warning("Consider using --auto-infer for library-specific detection")
+            
         else:
             bc1_prefix = args.bc1_prefix
             bc1_suffix = args.bc1_suffix
 
-    logger.info(f"  BC1 prefix: {bc1_prefix}")
-    logger.info(f"  BC1 suffix: {bc1_suffix}")
+    logger.info(
+        "  Anchors: CANONICAL (magestic.utils.bc1_extraction). "
+        "--bc1-prefix/--bc1-suffix are accepted but IGNORED since 2026-09-09: "
+        "the layout is identified from the universal downstream anchor's "
+        "observed offset, not configured per era."
+    )
 
     # Parse FASTQ
     logger.info("Parsing collapsed FASTQ...")
-    bc1_counts, total_reads, matched_reads, length_stats = parse_collapsed_fastq(
+    bc1_counts, total_reads, matched_reads, length_stats, tier_stats = parse_collapsed_fastq(
         args.input,
         bc1_prefix,
         bc1_suffix,
@@ -1006,6 +954,24 @@ def main():
             pct = 100 * count / matched_reads if matched_reads > 0 else 0
             marker = " <-- expected" if length == args.bc1_length else ""
             logger.info(f"    {length}bp: {count:,} ({pct:.1f}%){marker}")
+
+    # Anchor-tier breakdown. The old code discarded this entirely: every read
+    # was counted the same whether both anchors were verified or neither was.
+    if tier_stats:
+        logger.info("  Anchor tier distribution (read-weighted):")
+        for tier in ("confirmed", "offset_fallback", "prefix_only",
+                     "length_mismatch", "none"):
+            n = tier_stats.get(tier, 0)
+            if n:
+                logger.info(f"    {tier}: {n:,} ({100*n/total_reads:.2f}%)")
+        unconfirmed = tier_stats.get("prefix_only", 0)
+        if unconfirmed and total_reads and unconfirmed / total_reads > 0.05:
+            logger.warning(
+                f"  {100*unconfirmed/total_reads:.1f}% of reads yielded a bc1 with NO "
+                f"downstream anchor confirmation (tier=prefix_only). This is the "
+                f"failure mode that made the pre-2026-09-09 extractor emit unvalidated "
+                f"barcodes on 2021-era layouts -- check the layout call."
+            )
 
     # Filter by minimum counts
     if args.min_counts > 1:

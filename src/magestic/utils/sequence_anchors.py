@@ -153,7 +153,15 @@ def extract_bc1_between_anchors(
     """
     Extract BC1 by finding prefix and suffix anchors.
 
-    This is the recommended approach as it handles length variations naturally.
+    .. deprecated:: 2026-09-09
+        **Use magestic.utils.bc1_extraction.extract_bc1 instead.** This function
+        was never called for bc1 by any pipeline, and it shares the defect it was
+        meant to avoid: when the suffix is not found it falls back to a fixed
+        length and returns a bc1 that is INDISTINGUISHABLE from a confirmed one.
+        The canonical extractor tiers every read instead, uses a counted Hamming
+        budget rather than a similarity ratio, and identifies the layout from the
+        universal downstream anchor's observed offset.
+        See planning/pipeline_provenance_rebuild/22_bc1_extraction_review.md.
 
     Args:
         seq: Sequence to search
