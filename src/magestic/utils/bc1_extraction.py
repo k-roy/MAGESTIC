@@ -91,6 +91,8 @@ class Bc1Call:
     k_used: Optional[int]     # mismatches actually found in the upstream anchor
     bc1_length: Optional[int]
     prefix_observed: Optional[str] = None   # the upstream anchor AS READ
+    prefix_start: Optional[int] = None      # its index in the strand actually used
+    strand_seq: Optional[str] = None        # that strand (fwd read, or its rev-comp)
     reason: str = ""
 
     def as_row(self) -> dict:
@@ -315,24 +317,24 @@ def extract_bc1(
             obs = s[start:start + len(UPSTREAM_ANCHOR)]
             if len(bc1) != bc1_length:
                 return Bc1Call(None, "length_mismatch", orient, offset,
-                               LAYOUT_BY_OFFSET.get(offset), mism, len(bc1), obs,
+                               LAYOUT_BY_OFFSET.get(offset), mism, len(bc1), obs, start, s,
                                f"read ends {bc1_length - len(bc1)} nt short of a full barcode")
             return Bc1Call(bc1, tier, orient, offset,
-                           LAYOUT_BY_OFFSET.get(offset), mism, bc1_length, obs)
+                           LAYOUT_BY_OFFSET.get(offset), mism, bc1_length, obs, start, s)
 
         # prefix found, no downstream confirmation -- keep it, but SAY SO
         bc1 = s[b0:b0 + bc1_length]
         obs = s[start:start + len(UPSTREAM_ANCHOR)]
         if len(bc1) != bc1_length:
             best_miss = Bc1Call(None, "length_mismatch", orient, None, None, mism,
-                                len(bc1), obs, "read too short for a full barcode")
+                                len(bc1), obs, start, s, "read too short for a full barcode")
             continue
         best_miss = Bc1Call(bc1, "prefix_only", orient, None, None, mism, bc1_length, obs,
-                            "upstream anchor verified; no downstream anchor in window")
+                            start, s, "upstream anchor verified; no downstream anchor in window")
 
     if best_miss is not None:
         return best_miss
-    return Bc1Call(None, "none", None, None, None, None, None, None,
+    return Bc1Call(None, "none", None, None, None, None, None, None, None, None,
                    "upstream anchor not found within k on either strand")
 
 

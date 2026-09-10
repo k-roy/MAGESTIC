@@ -39,6 +39,10 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+from magestic.utils.bc1_extraction import (
+    extract_bc1 as _canonical_extract_bc1, UPSTREAM_ANCHOR,
+    ANCHOR_TIERS, EMITTING_TIERS)
+
 logger = logging.getLogger(__name__)
 
 # Try to import pysam and tqdm
@@ -281,43 +285,47 @@ def detect_orientation(r1_seqs: List[str], r2_seqs: List[str], n_sample: int = 1
 # R1 Processing (BC1 and Donor extraction)
 # =============================================================================
 
-def extract_bc1_from_r1(seq: str, config: ReadConfig) -> Tuple[str, str, int, bool]:
-    """
-    Extract BC1 from R1 sequence.
+def extract_bc1_from_r1(seq: str, config: ReadConfig,
+                        established_offset: int = None) -> Tuple[str, str, int, bool]:
+    """Extract BC1 from R1 -- DELEGATES to the canonical extractor.
+
+    2026-09-09: the previous body had three failure modes, and on 2021-era data
+    all three fired:
+      * ``DEFAULT_BC1_SUFFIX = "CCCTAGGATACGTGC"`` is the yL406-era suffix and
+        measures ~0% on 1.0/2.5 reads, so the exact-suffix branch essentially
+        never succeeded and every read fell through;
+      * the fall-through returned a fixed-length slice with ``prefix_found=True``
+        -- so ``prefix_found`` meant "prefix found", NOT "extraction confirmed",
+        and callers could not tell the two apart;
+      * 🔴 when the prefix was absent entirely it returned ``seq[16:36]`` as the
+        barcode -- a blind positional slice with no anchor at all, i.e. a
+        manufactured barcode from arbitrary sequence.
+
+    Kevin, 2026-09-09: "consistency for how bc1 is grabbed from reads and defined
+    in tables." The screen path was moved to the canonical extractor earlier the
+    same day; this is the other half. ONE definition now serves
+    bc1_from_screen, bc1_donor_bc0 and WGS.
+
+    ``config.bc1_prefix`` / ``bc1_suffix`` are accepted and IGNORED: the layout
+    is identified from the universal downstream anchor's observed offset rather
+    than configured per era.
 
     Returns:
-        Tuple of (bc1, PS1, bc1_length, prefix_found)
+        (bc1, PS1, bc1_length, confirmed). ``bc1`` is None when no barcode could
+        be extracted -- callers MUST check rather than assuming a string.
+        ``confirmed`` is True only for a downstream-confirmed extraction; a
+        prefix-only hit returns False, which is the distinction the old
+        ``prefix_found`` flag collapsed.
     """
-    bc1_prefix = config.bc1_prefix
-    bc1_suffix = config.bc1_suffix
-    bc1_length = config.bc1_length
-
-    prefix_idx = seq.find(bc1_prefix)
-
-    if prefix_idx >= 0:
-        bc1_start = prefix_idx + len(bc1_prefix)
-        PS1 = seq[:prefix_idx + len(bc1_prefix)]
-
-        # Try to find exact suffix match at each valid BC1 length
-        for try_len in range(bc1_length - BC1_LENGTH_TOLERANCE, bc1_length + BC1_LENGTH_TOLERANCE + 1):
-            bc1_end = bc1_start + try_len
-            if bc1_end > len(seq):
-                continue
-
-            suffix_region = seq[bc1_end:bc1_end + len(bc1_suffix)]
-            if suffix_region == bc1_suffix:
-                bc1 = seq[bc1_start:bc1_end]
-                return bc1, PS1, len(bc1), True
-
-        # Fall back to expected length
-        bc1 = seq[bc1_start:bc1_start + bc1_length]
-        return bc1, PS1, bc1_length, True
-    else:
-        # Default position if prefix not found
-        bc1 = seq[16:16 + bc1_length]
-        PS1 = seq[:16]
-        return bc1, PS1, bc1_length, False
-
+    call = _canonical_extract_bc1(seq, k=1, bc1_length=config.bc1_length,
+                                  established_offset=established_offset)
+    if call.bc1 is None:
+        return None, "", 0, False
+    # PS1 = everything up to and including the upstream anchor, on the strand
+    # that actually matched (which may be the reverse complement of the read).
+    ps1 = call.strand_seq[:call.prefix_start + len(UPSTREAM_ANCHOR)] if call.strand_seq else ""
+    confirmed = call.anchor_tier in EMITTING_TIERS and call.anchor_tier != "prefix_only"
+    return call.bc1, ps1, call.bc1_length, confirmed
 
 def extract_donor_from_r1(seq: str, config: ReadConfig) -> Optional[Tuple[str, str]]:
     """
@@ -514,6 +522,8 @@ def process_read_pair(
 
     # Extract BC1 from the BC1-containing read
     bc1, ps1, bc1_length, bc1_prefix_found = extract_bc1_from_r1(bc1_seq, config)
+    if bc1 is None:
+        return None   # no anchor: counted as unparsed, never manufactured
 
     if not bc1:
         return None
