@@ -39,11 +39,42 @@ logger = logging.getLogger(__name__)
 PARSED_SUFFIX = "_bc1_donor_bc0.tsv"
 #: A parsed filename starts with its sequencing date: ``20251125_plate_2A_sample_25_bc1_donor_bc0.tsv``.
 DATE_PREFIX_RE = re.compile(r"^(\d{8})_")
+#: ...and names the PCR plate right after it. The amplicon size is a property of the primer pair on that
+#: plate, not of the day it was sequenced, so the plate classifies a run the date map has never seen.
+PLATE_RE = re.compile(r"^\d{8}_(plate_[A-Za-z0-9]+)_")
+#: the same token wherever it appears inside a keyfile cell
+PLATE_TOKEN_RE = re.compile(r"plate_[A-Za-z0-9]+")
 #: 2x150 reads merge across an insert up to ~300 nt; the real screens sit far from this boundary
 #: (152 vs 451-460), so the exact cut only has to be defensible, not tuned.
 MAX_INSERT_FOR_2X150 = 300
 LAYOUT_2X150 = "2x150"
 LAYOUT_2X300 = "2x300"
+#: Used when NO keyfile of the screen records an amplicon size at all -- the pre-AVITI screens have a single
+#: read layout and never needed the distinction. This is NOT the same as `unclassified`, which means a layout
+#: record exists and does not cover these files (a real gap worth fixing).
+LAYOUT_UNSPECIFIED = "unspecified"
+
+#: The same fact is spelled differently across eras of keyfile. 20250912 writes `inner_product_size_bp`;
+#: 20210822 writes `inner product (bp)`. Matching only the modern spelling made four of five screens look
+#: like they had no size record at all.
+SIZE_COLUMN_ALIASES = ("inner_product_size_bp", "inner product (bp)", "inner_product_bp",
+                       "inner product size (bp)", "inner_product (bp)")
+DATE_COLUMN_PREFIXES = ("sequencing_date", "sequencing date")
+PLATE_COLUMN_ALIASES = ("outer_primers", "PCR_plate_name", "outer primers", "PCR plate", "PCR plate names")
+
+
+def _norm(col: str) -> str:
+    return (col or "").strip().lower().replace("_", " ")
+
+
+def _pick(cols, aliases):
+    want = {_norm(a) for a in aliases}
+    return next((c for c in cols if _norm(c) in want), None)
+
+
+def _pick_prefix(cols, prefixes):
+    pre = tuple(_norm(p) for p in prefixes)
+    return next((c for c in cols if _norm(c).startswith(pre)), None)
 
 
 @dataclass
@@ -53,6 +84,8 @@ class DataSources:
     files_by_layout: Dict[str, List[Path]] = field(default_factory=dict)
     dirs_by_layout: Dict[str, Path] = field(default_factory=dict)
     unclassified: List[Path] = field(default_factory=list)
+    #: files whose sequencing date no keyfile maps, resolved instead by their PCR plate
+    classified_by_plate: List[Path] = field(default_factory=list)
     searched: List[str] = field(default_factory=list)
     how: str = ""
 
@@ -62,9 +95,53 @@ class DataSources:
 
     def describe(self) -> str:
         parts = [f"{k}: {len(v)} files" for k, v in sorted(self.files_by_layout.items())]
+        if self.classified_by_plate:
+            parts.append(f"{len(self.classified_by_plate)} by plate (date unmapped)")
         if self.unclassified:
             parts.append(f"unclassified: {len(self.unclassified)}")
         return f"{self.how} -> " + (", ".join(parts) if parts else "NOTHING FOUND")
+
+
+def _layout_for_size(size: int) -> str:
+    return LAYOUT_2X150 if size <= MAX_INSERT_FOR_2X150 else LAYOUT_2X300
+
+
+def plate_layout_map(keyfile: str | os.PathLike) -> Dict[str, str]:
+    """``plate -> '2x150'|'2x300'`` from the same keyfile columns.
+
+    Needed because a keyfile documents a RUN's amplicon size on the row where that plate was first
+    sequenced, and a later re-run of the same plate may appear only in a combined key that carries no size
+    column. Measured on 20250912: plate_4C is sized 451 on its 20251212 row, and the 20260302 re-run of
+    plate_4C (96 files) appears only in `bc1_donor_bc0_combined_key.tsv`, which has no
+    `inner_product_size_bp`. Classifying by plate recovers those 96 files from text already on disk --
+    the alternative was the symlink shim, which encoded the same fact in the filesystem instead.
+    """
+    out: Dict[str, str] = {}
+    with open(keyfile, newline="") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+    if not rows:
+        return out
+    cols = list(rows[0].keys())
+    size_col = _pick(cols, SIZE_COLUMN_ALIASES)
+    if not size_col:
+        return out
+    plate_cols = [c for c in cols if _norm(c) in {_norm(a) for a in PLATE_COLUMN_ALIASES}]
+    for row in rows:
+        raw_size = (row.get(size_col) or "").strip()
+        if not raw_size:
+            continue
+        try:
+            size = int(float(raw_size))
+        except ValueError:
+            continue
+        layout = _layout_for_size(size)
+        for pc in plate_cols:
+            for m in PLATE_TOKEN_RE.finditer(row.get(pc) or ""):
+                plate = m.group(0)
+                if out.get(plate) == LAYOUT_2X300:
+                    continue
+                out[plate] = layout
+    return out
 
 
 def read_layout_map(keyfile: str | os.PathLike) -> Dict[str, str]:
@@ -80,9 +157,9 @@ def read_layout_map(keyfile: str | os.PathLike) -> Dict[str, str]:
         rows = list(csv.DictReader(fh, delimiter="\t"))
     if not rows:
         return out
-    cols = rows[0].keys()
-    date_col = next((c for c in cols if c and c.startswith("sequencing_date")), None)
-    size_col = next((c for c in cols if c == "inner_product_size_bp"), None)
+    cols = list(rows[0].keys())
+    date_col = _pick_prefix(cols, DATE_COLUMN_PREFIXES)
+    size_col = _pick(cols, SIZE_COLUMN_ALIASES)
     if not date_col or not size_col:
         return out
     for row in rows:
@@ -93,7 +170,7 @@ def read_layout_map(keyfile: str | os.PathLike) -> Dict[str, str]:
             size = int(float(raw_size))
         except ValueError:
             continue
-        layout = LAYOUT_2X150 if size <= MAX_INSERT_FOR_2X150 else LAYOUT_2X300
+        layout = _layout_for_size(size)
         for date in (d.strip() for d in (row.get(date_col) or "").split(",")):
             if not date:
                 continue
@@ -191,18 +268,34 @@ def _classify(ds: DataSources, files: List[Path], project_dir: Path,
     """Split a flat parsed directory into read layouts using the keyfile record."""
     kfs = [Path(k) for k in keyfiles] if keyfiles else find_keyfiles(project_dir)
     layout_map: Dict[str, str] = {}
+    plate_map: Dict[str, str] = {}
     for k in kfs:
         try:
             layout_map.update({d: l for d, l in read_layout_map(k).items() if d not in layout_map})
+            plate_map.update({d: l for d, l in plate_layout_map(k).items() if d not in plate_map})
         except Exception as exc:                       # a malformed keyfile must not kill discovery
             logger.warning("could not read layout map from %s: %s", k, exc)
+    have_any_record = bool(layout_map or plate_map)
     for f in files:
         m = DATE_PREFIX_RE.match(f.name)
         layout = layout_map.get(m.group(1)) if m else None
+        if layout is None:                             # the date is unmapped: fall back to the PCR plate
+            mp = PLATE_RE.match(f.name)
+            if mp:
+                layout = plate_map.get(mp.group(1))
+                if layout:
+                    ds.classified_by_plate.append(f)
         if layout:
             ds.files_by_layout.setdefault(layout, []).append(f)
+        elif not have_any_record:
+            # No keyfile of this screen records an amplicon size anywhere. The pre-AVITI screens have a
+            # single read layout and never needed one; the files are found and usable, just unlabelled.
+            ds.files_by_layout.setdefault(LAYOUT_UNSPECIFIED, []).append(f)
         else:
             ds.unclassified.append(f)
+    ds.classified_by_plate.sort()
+    for v in ds.files_by_layout.values():
+        v.sort()
     for v in ds.files_by_layout.values():
         v.sort()
     ds.unclassified.sort()

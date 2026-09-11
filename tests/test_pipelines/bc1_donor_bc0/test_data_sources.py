@@ -118,3 +118,65 @@ def test_discovery_follows_symlinks_but_never_needs_them(tmp_path):
     ds = dsrc.discover(p)
     assert ds.total_files == 5
     assert not any("PACKAGE_RERUN" in str(f) for v in ds.files_by_layout.values() for f in v)
+
+
+# --- header-spelling drift, plate fallback, and the no-record-at-all case ------------------------
+
+def test_the_old_keyfile_spelling_of_the_size_column_is_recognised(tmp_path):
+    """20250912 writes `inner_product_size_bp`; 20210822 writes `inner product (bp)`. Matching only the
+    modern spelling made four of five screens look like they had no size record at all."""
+    k = tmp_path / "old.tsv"
+    k.write_text("sequencing date\tPCR plate\tinner product (bp)\tcycles\n"
+                 "20210820\tplate_2B\t455\t9+9\n20210906\tplate_2C\t152\t10+10\n")
+    assert dsrc.read_layout_map(k) == {"20210820": "2x300", "20210906": "2x150"}
+    assert dsrc.plate_layout_map(k) == {"plate_2B": "2x300", "plate_2C": "2x150"}
+
+
+def test_a_rerun_of_a_known_plate_on_an_unmapped_date_is_resolved_BY_PLATE(tmp_path):
+    """The real 20250912 case: plate_4C is sized on its 20251212 row, and the 20260302 re-run of the same
+    plate appears only in a combined key with no size column. 96 files hung on this."""
+    p = tmp_path / "screen"
+    _keyfile(p / "keyfiles" / "plate_key.tsv", [("20251212", 451)])
+    # give the keyfile a plate column naming plate_4C
+    kf = p / "keyfiles" / "plate_key.tsv"
+    kf.write_text("sequencing_date\touter_primers\tinner_product_size_bp\tcycles\n"
+                  "20251212\tplate_4C\t451\t9+9\n")
+    _parsed(p / "processed_data" / "bc1_donor_bc0" / "parsed", [
+        "20251212_plate_4C_sample_1_bc1_donor_bc0.tsv",
+        "20260302_plate_4C_sample_2_bc1_donor_bc0.tsv",   # date unmapped, plate known
+    ])
+    ds = dsrc.discover(p)
+    assert len(ds.files_by_layout["2x300"]) == 2
+    assert not ds.unclassified
+    assert [f.name for f in ds.classified_by_plate] == ["20260302_plate_4C_sample_2_bc1_donor_bc0.tsv"]
+    assert "by plate (date unmapped)" in ds.describe()
+
+
+def test_a_screen_with_NO_size_record_anywhere_is_unspecified_not_unclassified(tmp_path):
+    """Pre-AVITI screens have one read layout and never needed the distinction. Their files are found and
+    usable; flagging them as a gap would be false alarm. A real gap looks different -- see the next test."""
+    p = tmp_path / "old_screen"
+    (p / "keyfiles").mkdir(parents=True)
+    _parsed(p / "processed_data" / "bc1_donor_bc0" / "parsed",
+            ["20220805_plate_3E_sample_1_bc1_donor_bc0.tsv"])
+    ds = dsrc.discover(p)
+    assert ds.files_by_layout == {dsrc.LAYOUT_UNSPECIFIED: [
+        p / "processed_data" / "bc1_donor_bc0" / "parsed" / "20220805_plate_3E_sample_1_bc1_donor_bc0.tsv"]}
+    assert not ds.unclassified
+
+
+def test_a_record_that_exists_but_omits_a_run_IS_a_gap(tmp_path):
+    """The distinction that matters: a layout record exists and does not cover these files. That is a real
+    documentation gap and must stay visible rather than being bucketed as 'unspecified'."""
+    p = tmp_path / "screen"
+    (p / "keyfiles").mkdir(parents=True)
+    (p / "keyfiles" / "plate_key.tsv").write_text(
+        "sequencing_date\touter_primers\tinner_product_size_bp\tcycles\n20251212\tplate_4C\t451\t9+9\n")
+    _parsed(p / "processed_data" / "bc1_donor_bc0" / "parsed", [
+        "20251212_plate_4C_sample_1_bc1_donor_bc0.tsv",
+        "20990101_plate_9Z_sample_1_bc1_donor_bc0.tsv",   # neither date nor plate known
+    ])
+    ds = dsrc.discover(p)
+    assert len(ds.files_by_layout["2x300"]) == 1
+    assert len(ds.unclassified) == 1
+    assert dsrc.LAYOUT_UNSPECIFIED not in ds.files_by_layout
