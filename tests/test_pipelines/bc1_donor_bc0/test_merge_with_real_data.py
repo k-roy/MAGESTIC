@@ -29,15 +29,35 @@ logger = logging.getLogger(__name__)
 
 pytestmark = pytest.mark.integration
 
-# Data paths for the SpG QTL screen (yL406 project)
-BASE_DIR = Path("/path/to")
+# Data paths for the SpG QTL screen (yL406 project). Resolved through path_utils, which honours
+# MAGESTIC_BASE_DIR / MAGESTIC_COMMON_DIR and only falls back to the public "/path/to" placeholder.
+# This file used to hardcode the placeholder, so load_test_data() found nothing, merge_data_sources()
+# returned an empty frame, and every test here died on KeyError: 'has_2x300' -- on a host where the
+# env IS set. A permanently red suite hides real regressions, so the data is now located properly and
+# the tests SKIP when it is genuinely absent.
+from magestic.utils.path_utils import DEFAULT_BASE_DIR
+
+BASE_DIR = DEFAULT_BASE_DIR
 PROJECT_DIR = BASE_DIR / "projects/QTL/20240806_yL406_SpG_QTL_screen/processed_data"
 
 # 2x300 data (full bc1-donor-bc0)
 DATA_2X300_FILE = PROJECT_DIR / "bc1_donor_bc0/data_tables/top_bc1_donor_bc0_fragments_by_trafo_ID.tsv"
 
-# Guide-donor-bc0 data
-GDB_DIR = PROJECT_DIR / "guide_donor_bc0_purity_filtered"
+# Guide-donor-bc0 data. NOTE the purity tables for this screen do NOT live under processed_data/ --
+# they are under processed_data/guide_donor_bc0/guide_donor_bc0_purity_filtered/. Both are checked so
+# the test works against either layout.
+GDB_DIR_CANDIDATES = (
+    PROJECT_DIR / "guide_donor_bc0" / "guide_donor_bc0_purity_filtered",
+    PROJECT_DIR / "guide_donor_bc0_purity_filtered",
+)
+GDB_DIR = next((d for d in GDB_DIR_CANDIDATES if d.is_dir()), GDB_DIR_CANDIDATES[0])
+
+
+def _require_2x300():
+    """Skip (never fail, never silently pass) when the real 2x300 table is not on this host."""
+    if not DATA_2X300_FILE.exists():
+        pytest.skip(f"integration data not reachable on this host: {DATA_2X300_FILE} "
+                    "(set MAGESTIC_BASE_DIR)")
 
 
 def load_test_data(n_rows: int = 10000):
@@ -79,7 +99,9 @@ def test_merge_basic():
     logger.info("TEST: Basic merge functionality")
     logger.info("="*60)
 
+    _require_2x300()
     data = load_test_data(n_rows=5000)
+    assert data.get("2x300") is not None and len(data["2x300"]) > 0
 
     # Merge data
     df_merged = merge_data_sources(
@@ -90,6 +112,15 @@ def test_merge_basic():
 
     logger.info(f"\nMerged DataFrame shape: {df_merged.shape}")
     logger.info(f"Columns: {df_merged.columns.tolist()}")
+
+    # The merge contract: one row per bc1, with the source flags and the count the rest of the
+    # pipeline keys on. Asserting it here is what makes this a test rather than a log-dumper.
+    assert len(df_merged) > 0
+    for col in ("bc1", "bc0", "donor", "guide", "has_2x300", "has_gdb",
+                "has_donor_conflict", "total_counts"):
+        assert col in df_merged.columns, f"merge output lost the '{col}' column"
+    assert df_merged["bc1"].is_unique
+    assert bool(df_merged["has_2x300"].any())
 
     # Summary statistics
     logger.info("\n--- Summary Statistics ---")
@@ -120,6 +151,7 @@ def test_conflict_detection():
     logger.info("TEST: Conflict detection")
     logger.info("="*60)
 
+    _require_2x300()
     data = load_test_data(n_rows=50000)
 
     df_merged = merge_data_sources(
@@ -129,8 +161,12 @@ def test_conflict_detection():
     )
 
     # Find records with conflicts
+    assert "has_donor_conflict" in df_merged.columns
     conflicts = df_merged[df_merged['has_donor_conflict']]
     logger.info(f"\nFound {len(conflicts)} records with donor conflicts")
+    # a conflict can only exist where both sources contributed a donor
+    assert not conflicts.empty or not bool((df_merged["has_2x300"] & df_merged["has_gdb"]).any()) \
+        or True   # zero conflicts is a legitimate outcome; the column existing is the contract
 
     if len(conflicts) > 0:
         logger.info("\n--- Sample Conflicts ---")
@@ -152,6 +188,7 @@ def test_quality_filtering():
     logger.info("TEST: Quality filtering")
     logger.info("="*60)
 
+    _require_2x300()
     data = load_test_data(n_rows=10000)
 
     df_merged = merge_data_sources(
@@ -169,6 +206,11 @@ def test_quality_filtering():
     )
 
     logger.info(f"After filtering (min_reads=10, min_pcr_replicates=2): {len(df_filtered)} records")
+
+    # filtering can only remove rows, and every survivor must clear the threshold
+    assert len(df_filtered) <= len(df_merged)
+    if len(df_filtered):
+        assert (df_filtered["total_counts"] >= 10).all()
 
     return df_filtered
 

@@ -29,15 +29,30 @@ logger = logging.getLogger(__name__)
 
 pytestmark = pytest.mark.integration
 
-# Paths
-BASE_DIR = Path("/path/to")
-COMMON_DIR = BASE_DIR / "common"
+# Paths. These come from path_utils, which resolves MAGESTIC_BASE_DIR / MAGESTIC_COMMON_DIR and only
+# falls back to the public "/path/to" placeholder when neither is set. Hardcoding the placeholder here
+# (as this file used to) made every test in it fail with FileNotFoundError on a host where the env IS
+# set -- a permanently red suite that hid real regressions and made "a fix needs a passing test"
+# hollow. When the real data is not reachable the tests SKIP; they never silently pass.
+from magestic.utils.path_utils import DEFAULT_BASE_DIR, DEFAULT_COMMON_DIR
+
+BASE_DIR = DEFAULT_BASE_DIR
+COMMON_DIR = DEFAULT_COMMON_DIR
 SPG_OLIGO_FILE = COMMON_DIR / "oligo_designs/20240411_Twist_200mer_oligo_array_order.tsv"
 SPCAS9_OLIGO_FILE = COMMON_DIR / "oligo_designs/20210422_Twist_200mer.tsv"
 
 
+def _require(*paths):
+    """Skip (never fail, never silently pass) when a real-data input is not on this host."""
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        pytest.skip("integration data not reachable on this host: " + "; ".join(missing)
+                    + " (set MAGESTIC_BASE_DIR / MAGESTIC_COMMON_DIR)")
+
+
 def test_load_oligo_design():
     """Test loading oligo design files."""
+    _require(SPCAS9_OLIGO_FILE)
     logger.info("\n" + "="*60)
     logger.info("TEST: Load oligo design")
     logger.info("="*60)
@@ -60,6 +75,7 @@ def test_load_oligo_design():
 
 def test_build_lookup_tables():
     """Test building lookup tables."""
+    _require(SPCAS9_OLIGO_FILE)
     logger.info("\n" + "="*60)
     logger.info("TEST: Build lookup tables")
     logger.info("="*60)
@@ -77,6 +93,7 @@ def test_build_lookup_tables():
 
 def test_perfect_donor_match():
     """Test perfect donor matching."""
+    _require(SPCAS9_OLIGO_FILE)
     logger.info("\n" + "="*60)
     logger.info("TEST: Perfect donor matching")
     logger.info("="*60)
@@ -117,6 +134,7 @@ def test_truncated_donor_sliding_window():
     The old bdb matching failed because it extracted a fixed middle region.
     The new sliding window should match because the intact portion matches.
     """
+    _require(SPCAS9_OLIGO_FILE)
     logger.info("\n" + "="*60)
     logger.info("TEST: Truncated donor (95bp) sliding window match")
     logger.info("="*60)
@@ -180,6 +198,7 @@ def test_truncated_donor_sliding_window():
 
 def test_extended_donor():
     """Test matching an extended donor (chimera)."""
+    _require(SPCAS9_OLIGO_FILE)
     logger.info("\n" + "="*60)
     logger.info("TEST: Extended donor (chimera)")
     logger.info("="*60)
