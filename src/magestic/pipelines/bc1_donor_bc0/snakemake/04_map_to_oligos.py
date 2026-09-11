@@ -31,12 +31,14 @@ from pathlib import Path
 # or this file is run directly by path (fallback adds .../src to sys.path).
 try:
     from magestic.pipelines.bc1_donor_bc0.core.matching import (
-        load_and_build_lookup, match_dataframe, repair_gdb01_shifted_guides)
+        load_and_build_lookup, match_dataframe, match_dataframe_scoped, repair_gdb01_shifted_guides,
+        assign_sps_scope, load_sps_mapping)
     from magestic.utils import path_utils
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))  # .../src
     from magestic.pipelines.bc1_donor_bc0.core.matching import (
-        load_and_build_lookup, match_dataframe, repair_gdb01_shifted_guides)
+        load_and_build_lookup, match_dataframe, match_dataframe_scoped, repair_gdb01_shifted_guides,
+        assign_sps_scope, load_sps_mapping)
     from magestic.utils import path_utils
 
 
@@ -136,41 +138,33 @@ def main():
             print("         gdb Step 02 on the fix and rebuild from there. See PIPELINE_CORRECTNESS_POLICY.md §1.")
             print("=" * 100)
 
-    # --- SPS scoping (planning 36_): a bc1-donor-bc0 read carries the subpool priming site between donor and bc0,
-    # and it names which design subpool the molecule was amplified from. Matching a row against all subpools at once
-    # lets the donor tie be broken by alphabetical order instead: 313,570 named rows (7.0%) ended up named from a
-    # subpool their own read did not come from. Post-filtering the candidate list cannot fix that, because an
-    # UNAMBIGUOUS row carries no candidate list -- the right design was never a candidate. So scope the search itself.
-    sps2v = {}
+    # --- SPS scoping (core.matching; planning 34_/36_) -------------------------------------------
+    # Every read carries the subpool priming site between donor and bc0, naming which design subpool the
+    # molecule was amplified from. Matching a row against all subpools at once let the donor tie be broken
+    # alphabetically across subpools instead: 313,570 of 4,458,480 named rows with a readable SPS (7.0%)
+    # took a name from a subpool their own read did not come from. A post-hoc candidate filter cannot fix
+    # an unambiguous row -- the right design was never a candidate -- so the SEARCH is scoped.
     if args.sps_mapping:
-        m = pd.read_csv(args.sps_mapping, sep="	", dtype=str)
-        sps2v = {str(k).upper(): v for k, v in zip(m["sps"], m["library_id"]) if isinstance(v, str) and v}
-        if args.v_libraries:
-            sps2v = {k: v for k, v in sps2v.items() if v in args.v_libraries}
+        sps2v = load_sps_mapping(args.sps_mapping, args.v_libraries)
         print(f"SPS scoping: {len(sps2v)} SPS -> subpool ({sorted(set(sps2v.values()))})")
-
-    if sps2v and "SPS" in bc1_data.columns:
-        scope = bc1_data["SPS"].astype(str).str.upper().map(sps2v)
+        scope = assign_sps_scope(bc1_data, sps2v)
         bc1_data["sps_scope_V"] = scope
         bc1_data["sps_scoped"] = scope.notna()
-        print(f"  {int(scope.notna().sum()):,} of {len(bc1_data):,} rows scoped by their own SPS; "
-              f"{int(scope.isna().sum()):,} fall back to the full scope")
+        n_scoped = int(scope.notna().sum())
+        print(f"  {n_scoped:,} of {len(bc1_data):,} rows scoped by their own SPS; "
+              f"{len(bc1_data) - n_scoped:,} fall back to the full scope")
         print("  rows per subpool: " + str(scope.value_counts(dropna=False).to_dict()))
-        parts = []
-        for v, sub in bc1_data.groupby(scope.fillna("__UNSCOPED__"), sort=False):
-            if v == "__UNSCOPED__":
-                t = tables
-                print(f"  matching {len(sub):,} unscoped rows against the full scope...")
-            else:
-                print(f"  building lookup for {v} and matching {len(sub):,} rows...")
-                t = load_and_build_lookup(use_harmonized_table=True, v_libraries=[v],
-                                          nuclease_types=args.nuclease)
-            parts.append(match_dataframe(sub, t, donor_col=donor_col, guide_col=args.guide_col,
-                                         pre_trim=not args.no_pre_trim))
-            if v != "__UNSCOPED__":
-                del t
-        out = pd.concat(parts).sort_index()
-        del parts
+
+        def _build(v):
+            if v is None:
+                print(f"  matching unscoped rows against the full scope...")
+                return tables
+            print(f"  building lookup for {v}...")
+            return load_and_build_lookup(use_harmonized_table=True, v_libraries=[v],
+                                         nuclease_types=args.nuclease)
+
+        out = match_dataframe_scoped(bc1_data, scope, _build, donor_col=donor_col,
+                                     guide_col=args.guide_col, pre_trim=not args.no_pre_trim)
     else:
         print(f"Matching donors (col '{donor_col}') via core.matching.match_dataframe...")
         out = match_dataframe(bc1_data, tables, donor_col=donor_col, guide_col=args.guide_col,

@@ -1033,3 +1033,79 @@ def build_lookup_from_harmonized(
         v_libraries=v_libraries,
         nuclease_types=nuclease_types,
     )
+
+
+# ---------------------------------------------------------------------------
+# SPS scoping: match a row only against the subpool its own molecule came from
+# ---------------------------------------------------------------------------
+#
+# Every bc1-donor-bc0 read carries the subpool priming site (SPS) between the donor and bc0, and the SPS
+# names which design SUBPOOL the molecule was amplified from. Matching every row against every subpool at
+# once lets a donor tie be broken by alphabetical order across subpools instead: measured on the
+# 2026-09-10 rebuild, 313,570 of 4,458,480 named rows with a readable SPS (7.0%) carried a name from a
+# different subpool than the read itself came from, and the transformation independently agreed with the
+# SPS on 99.3% of them.
+#
+# 🔴 A POST-HOC CANDIDATE FILTER CANNOT FIX THIS. An UNAMBIGUOUS row carries no candidate list -- the
+# right design was never a candidate to begin with. The SEARCH has to be scoped, which is why this is a
+# root fix and not a bridge. Ordered by Kevin 2026-09-10: "SPS scoping in 04: implement and re-run."
+#
+# 🔴 SPS NAMES THE SUBPOOL ONLY (policy §4). V450 and V454 share one SPS; V451 and V455 share the other.
+# A scaffold claim can NEVER be read out of an SPS -- scaffold comes from the transformation (the cut
+# vector) or from the guide-donor-bc0 linkage.
+
+
+def load_sps_mapping(path: str, v_libraries: Optional[Sequence[str]] = None) -> Dict[str, str]:
+    """Read an ``sps -> library_id`` TSV into an uppercased dict, optionally restricted to a scope.
+
+    Raises rather than silently returning an empty map: a mistyped path that yields ``{}`` would turn
+    SPS scoping off without saying so, and the run would look like it had scoped when it had not.
+    """
+    m = pd.read_csv(path, sep="\t", dtype=str)
+    missing = [c for c in ("sps", "library_id") if c not in m.columns]
+    if missing:
+        raise ValueError(f"{path}: SPS mapping lacks {missing}; expected columns sps, library_id")
+    out = {str(k).upper(): v for k, v in zip(m["sps"], m["library_id"])
+           if isinstance(k, str) and isinstance(v, str) and k and v}
+    if v_libraries:
+        keep = set(v_libraries)
+        out = {k: v for k, v in out.items() if v in keep}
+    if not out:
+        raise ValueError(f"{path}: SPS mapping is empty after filtering to {v_libraries}; refusing to "
+                         f"run unscoped while claiming to be scoped")
+    return out
+
+
+def assign_sps_scope(df: pd.DataFrame, sps2v: Dict[str, str], sps_col: str = "SPS") -> pd.Series:
+    """Per row, the subpool its own SPS names, or NaN when the SPS is absent or unrecognised."""
+    if sps_col not in df.columns:
+        return pd.Series([None] * len(df), index=df.index, dtype=object)
+    return df[sps_col].astype(str).str.upper().map(sps2v)
+
+
+UNSCOPED = "__UNSCOPED__"
+
+
+def match_dataframe_scoped(df: pd.DataFrame, scope: pd.Series, build_tables, match_fn=None, **kw):
+    """Match each group of rows against ONLY the lookup its ``scope`` names.
+
+    ``build_tables(v)`` returns the lookup tables for subpool ``v``; it is called with ``None`` for rows
+    whose scope is NaN, which must return the caller's full unscoped lookup. Row ORDER and the original
+    index are restored with ``sort_index()``, so this is a drop-in for ``match_dataframe``.
+
+    ``build_tables`` is injected rather than called directly so the grouping can be tested without the
+    harmonized oligo table.
+    """
+    if match_fn is None:
+        match_fn = match_dataframe
+    if df.empty:
+        return match_fn(df, build_tables(None), **kw)
+    key = scope.fillna(UNSCOPED)
+    parts = []
+    for v, sub in df.groupby(key, sort=False):
+        tables = build_tables(None if v == UNSCOPED else v)
+        parts.append(match_fn(sub, tables, **kw))
+    out = pd.concat(parts).sort_index()
+    if len(out) != len(df):
+        raise RuntimeError(f"SPS-scoped match changed row count: {len(df)} in, {len(out)} out")
+    return out
