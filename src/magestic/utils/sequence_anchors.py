@@ -362,6 +362,127 @@ def find_anchor_from_end(
 
 
 # =============================================================================
+# RE-site (cloning-site) search across nucleases
+# =============================================================================
+#
+# The guide is delimited on its 3' side by the 11-nt cloning site that follows it in the
+# oligo: GTTTGAAGAGC for SpCas9/SpG/SaCas9 designs, TTTCGAAGAGC for LbCas12a/impLbCas12a
+# designs. `guide = seq[re_pos - 20 : re_pos]`, so a 1-nt error in `re_pos` shifts the whole
+# guide by one base.
+#
+# DEFECT RECORD (planning/pipeline_provenance_rebuild 30_ "GDB-01", fixed 2026-09-11).
+# gdb step 02 used to call find_anchor() for the SpCas9 pattern FIRST and only tried the
+# LbCas12a pattern when that returned None. find_anchor() falls back to fuzzy matching at
+# min_score=85 using rapidfuzz's Indel ratio, which cannot tell a 1-substitution window from
+# a 1-shift window: on a Cas12a read whose guide ends in G, the SpCas9 pattern scores 90.9
+# at the true site AND 90.9 one base earlier (window 'G'+'TTTCGAAGAG'), the earlier position
+# won the tie, and every G-ending Cas12a guide was emitted as 'T' + guide[:19]
+# (99.3% of reads on G-ending designs in V438, 98.8% in V439; A/C/T-ending designs score
+# 81.8 at the shifted window and were unaffected). The exact LbCas12a site was never
+# consulted because the SpCas9 search had "succeeded".
+#
+# THE FIX, in two parts, both load-bearing:
+#   1. Try EVERY pattern exactly before trying any pattern approximately.
+#   2. Approximate matching of a fixed-length, fixed-position anchor uses SUBSTITUTIONS ONLY
+#      (Hamming distance), never an indel-tolerant ratio: a shifted window then scores as the
+#      >= 6 mismatches it really is instead of tying with a 1-substitution window. The old
+#      min_score=85 threshold accepted exactly one substitution in an 11-mer (ratio 90.9;
+#      two substitutions = 81.8), so max_mismatches=1 keeps the intended tolerance.
+
+RE_SITE_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ("SpCas9", "GTTTGAAGAGC"),    # SpCas9 / SpG / SaCas9 designs
+    ("LbCas12a", "TTTCGAAGAGC"),  # LbCas12a / impLbCas12a designs
+)
+DEFAULT_RE_SITE_MAX_MISMATCHES = 1
+
+
+@dataclass(frozen=True)
+class ReSiteHit:
+    """Where the cloning site was found and how.
+
+    ``kind`` is the nuclease family of the matched pattern, or ``"ambiguous"`` when two
+    patterns tied at the same position with the same mismatch count (only possible with
+    >= 1 mismatch; the guide window is then still unambiguous because the POSITION is).
+    ``mismatches`` is 0 for an exact hit. ``kinds`` lists every pattern that tied.
+    """
+    pos: int
+    kind: str
+    mismatches: int
+    kinds: Tuple[str, ...]
+
+
+def hamming_mismatches(a: str, b: str, stop_after: Optional[int] = None) -> int:
+    """Substitution count between two equal-length strings; returns early once it exceeds
+    ``stop_after`` (the caller only needs to know it is too many)."""
+    if len(a) != len(b):
+        raise ValueError(f"hamming_mismatches needs equal lengths, got {len(a)} and {len(b)}")
+    mm = 0
+    for x, y in zip(a, b):
+        if x != y:
+            mm += 1
+            if stop_after is not None and mm > stop_after:
+                return mm
+    return mm
+
+
+def find_re_site(
+    seq: str,
+    start: int = 0,
+    end: Optional[int] = None,
+    max_mismatches: int = DEFAULT_RE_SITE_MAX_MISMATCHES,
+    patterns: Tuple[Tuple[str, str], ...] = RE_SITE_PATTERNS,
+) -> Optional[ReSiteHit]:
+    """Locate the cloning site in ``seq[start:end]`` across all nuclease patterns.
+
+    Pass 1: exact ``str.find`` for every pattern; the earliest position wins (the site is
+    expected ~20 nt into the read, so an earlier chance hit is less likely than a later
+    one inside the donor). Pass 2 (only if nothing matched exactly and
+    ``max_mismatches > 0``): scan every window, score every pattern by substitutions
+    only, keep the lowest mismatch count, earliest position on ties; two patterns tying at
+    the same position give ``kind="ambiguous"``.
+
+    Returns None when no pattern is within ``max_mismatches`` of any window.
+    """
+    if not patterns:
+        raise ValueError("find_re_site needs at least one pattern")
+    plen = len(patterns[0][1])
+    if any(len(p) != plen for _, p in patterns):
+        raise ValueError("all RE-site patterns must have the same length")
+    if end is None or end > len(seq):
+        end = len(seq)
+    region = seq[start:end]
+
+    best_exact = None
+    for kind, pat in patterns:
+        i = region.find(pat)
+        if i != -1 and (best_exact is None or i < best_exact[0]):
+            best_exact = (i, kind)
+    if best_exact is not None:
+        return ReSiteHit(start + best_exact[0], best_exact[1], 0, (best_exact[1],))
+
+    if max_mismatches <= 0 or len(region) < plen:
+        return None
+
+    best_mm = max_mismatches + 1
+    best_pos: Optional[int] = None
+    best_kinds: Tuple[str, ...] = ()
+    for i in range(len(region) - plen + 1):
+        window = region[i:i + plen]
+        for kind, pat in patterns:
+            mm = hamming_mismatches(window, pat, stop_after=max_mismatches)
+            if mm > max_mismatches:
+                continue
+            if mm < best_mm:
+                best_mm, best_pos, best_kinds = mm, i, (kind,)
+            elif mm == best_mm and i == best_pos:
+                best_kinds = best_kinds + (kind,)
+    if best_pos is None:
+        return None
+    kind = best_kinds[0] if len(best_kinds) == 1 else "ambiguous"
+    return ReSiteHit(start + best_pos, kind, best_mm, best_kinds)
+
+
+# =============================================================================
 # End-Slice Extraction
 # =============================================================================
 

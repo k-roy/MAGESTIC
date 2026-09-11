@@ -17,9 +17,11 @@ import pysam
 
 from magestic.utils.sequence_anchors import (
     extract_donor_bc0_fragment,
-    find_anchor,
     find_anchor_from_end,
+    find_re_site,
     DEFAULT_DONOR_BC0_FRAGMENT_LENGTH,
+    DEFAULT_RE_SITE_MAX_MISMATCHES,
+    RE_SITE_PATTERNS,
 )
 
 
@@ -34,6 +36,9 @@ class SequenceConstants:
     RE_site: str = "GTTTGAAGAGC"        # SpCas9/SpG restriction enzyme site
     RE_site_lbcas12a: str = "TTTCGAAGAGC"  # LbCas12a restriction enzyme site
     RE_site_length: int = 11
+    RE_site_search_end: int = 150       # the site is searched in seq[:RE_site_search_end]
+    RE_site_max_mismatches: int = DEFAULT_RE_SITE_MAX_MISMATCHES  # substitutions tolerated (1 == old min_score 85)
+    msd_max_distance_from_end: int = 30
     bc0_length: int = 10
     SPS_length: int = 20
     msd: str = "AGGAAAACAGAC"           # Constant 3' anchor sequence
@@ -139,16 +144,33 @@ def calculate_avg_phred(qual_string: str) -> float:
 # Sequence Parsing
 # ============================================================================
 
+PARSE_STAT_KEYS = (
+    "reads", "no_msd", "no_re_site", "bad_frame", "parsed",
+    "re_site_SpCas9_exact", "re_site_LbCas12a_exact",
+    "re_site_SpCas9_mm1", "re_site_LbCas12a_mm1", "re_site_ambiguous_mm1",
+)
+"""Keys of the per-read parse accounting written to every step-02 provenance sidecar.
+``reads = no_msd + no_re_site + bad_frame + parsed`` and ``parsed = sum(re_site_*)``."""
+
+
+def new_parse_stats() -> Dict[str, int]:
+    """A zeroed parse-accounting dict (every key present so sidecars have a fixed schema)."""
+    return {k: 0 for k in PARSE_STAT_KEYS}
+
+
 def parse_sequence(
     seq: str,
     cas_type: str = "SpCas9",
+    stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[str, str, str, str, str, str, str]:
     """
     Parse a read into its guide-donor-BC0 components using anchor-based extraction.
 
     Anchors (in order of reliability):
     1. ``msd`` found from the 3' end — most stable anchor.
-    2. RE site found from the 5' end.
+    2. RE (cloning) site found from the 5' end, across ALL nuclease patterns at once
+       (:func:`magestic.utils.sequence_anchors.find_re_site`): exact first, then
+       substitutions-only within ``SEQ_CONST.RE_site_max_mismatches``.
 
     Positions relative to anchors::
 
@@ -159,26 +181,34 @@ def parse_sequence(
     seq : str
         Full read sequence (forward orientation).
     cas_type : str
-        One of ``"SpCas9"``, ``"SpG"``, or ``"LbCas12a"``.  Determines which
-        RE site pattern to search for first.
+        Retained for API compatibility only. The search is nuclease-agnostic: every
+        pattern is tried exactly before any is tried approximately, so the caller's
+        expectation can no longer steer the anchor onto the wrong window (GDB-01: the
+        SpCas9-first search mis-cut every G-ending Cas12a guide by one base).
+    stats : dict, optional
+        Accounting dict from :func:`new_parse_stats`; incremented in place per read.
 
     Returns
     -------
     tuple of (leader, guide, donor, SPS, bc0, msd, donor_bc0_fragment)
         All elements are ``"NA"`` if the anchors cannot be located.
     """
-    msd_pos = find_anchor_from_end(seq, SEQ_CONST.msd, max_distance_from_end=30)
+    if stats is not None:
+        stats["reads"] += 1
+    msd_pos = find_anchor_from_end(seq, SEQ_CONST.msd,
+                                   max_distance_from_end=SEQ_CONST.msd_max_distance_from_end)
     if msd_pos is None:
+        if stats is not None:
+            stats["no_msd"] += 1
         return ("NA",) * 7
 
-    re_pattern = SEQ_CONST.RE_site if cas_type != "LbCas12a" else SEQ_CONST.RE_site_lbcas12a
-    re_pos = find_anchor(seq, re_pattern, end=min(150, len(seq)))
-
-    if re_pos is None and cas_type != "LbCas12a":
-        re_pos = find_anchor(seq, SEQ_CONST.RE_site_lbcas12a, end=min(150, len(seq)))
-
-    if re_pos is None:
+    hit = find_re_site(seq, end=min(SEQ_CONST.RE_site_search_end, len(seq)),
+                       max_mismatches=SEQ_CONST.RE_site_max_mismatches)
+    if hit is None:
+        if stats is not None:
+            stats["no_re_site"] += 1
         return ("NA",) * 7
+    re_pos = hit.pos
 
     guide_start = re_pos - SEQ_CONST.guide_length
     donor_start = re_pos + SEQ_CONST.RE_site_length
@@ -189,7 +219,14 @@ def parse_sequence(
     donor_end = sps_start
 
     if guide_start < 0 or donor_end <= donor_start:
+        if stats is not None:
+            stats["bad_frame"] += 1
         return ("NA",) * 7
+
+    if stats is not None:
+        stats["parsed"] += 1
+        key = f"re_site_{hit.kind}_" + ("exact" if hit.mismatches == 0 else f"mm{hit.mismatches}")
+        stats[key] = stats.get(key, 0) + 1
 
     leader = seq[:guide_start]
     guide = seq[guide_start:re_pos]
@@ -212,6 +249,27 @@ def parse_sequence(
     return leader, guide, donor, SPS, bc0, msd, donor_bc0_fragment
 
 
+def parse_parameters() -> Dict[str, object]:
+    """Every constant that affects parse_sequence's output, for provenance sidecars."""
+    return {
+        "guide_length": SEQ_CONST.guide_length,
+        "re_site_patterns": {k: v for k, v in RE_SITE_PATTERNS},
+        "re_site_length": SEQ_CONST.RE_site_length,
+        "re_site_search_end": SEQ_CONST.RE_site_search_end,
+        "re_site_max_mismatches": SEQ_CONST.RE_site_max_mismatches,
+        "re_site_search": "all patterns exact first (earliest position wins), then substitutions-only "
+                          "(Hamming) within re_site_max_mismatches, lowest mismatches then earliest position",
+        "msd": SEQ_CONST.msd,
+        "msd_max_distance_from_end": SEQ_CONST.msd_max_distance_from_end,
+        "msd_search": "exact then rapidfuzz ratio >= 85 (find_anchor_from_end; unchanged)",
+        "bc0_length": SEQ_CONST.bc0_length,
+        "sps_length": SEQ_CONST.SPS_length,
+        "donor_bc0_fragment_length": SEQ_CONST.donor_bc0_fragment_length,
+        "reverse_primer_pairs": sorted(_REVERSE_PRIMER_PAIRS),
+        "reverse_read_handling": "reverse-complement; KR1882-KR1953 reads get 'GAC' appended",
+    }
+
+
 # ============================================================================
 # FASTQ Processing
 # ============================================================================
@@ -229,6 +287,7 @@ def process_collapsed_fastq(
     all_dates: Set[str],
     min_quality: int = 0,
     quality_stats: Optional[Dict[str, int]] = None,
+    parse_stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[int, int]:
     """
     Process one collapsed FASTQ file and accumulate per-unique-sequence counts.
@@ -254,6 +313,8 @@ def process_collapsed_fastq(
         Minimum mean Phred quality to keep a read.  0 disables filtering.
     quality_stats : dict, optional
         Accumulator for quality-filtering statistics.  **Modified in place.**
+    parse_stats : dict, optional
+        Per-read anchor accounting (:func:`new_parse_stats`).  **Modified in place.**
 
     Returns
     -------
@@ -290,7 +351,7 @@ def process_collapsed_fastq(
                     seq += "GAC"
                     qual += "EEE"
 
-            leader, guide, donor, SPS, bc0, msd, donor_bc0_frag = parse_sequence(seq)
+            leader, guide, donor, SPS, bc0, msd, donor_bc0_frag = parse_sequence(seq, stats=parse_stats)
             bc0_info = (leader, guide, donor, SPS, bc0, msd, donor_bc0_frag, seq)
 
             if bc0_info not in bc0_counts:
@@ -405,6 +466,8 @@ def process_library(
     start_time = timeit.default_timer()
     bc0_counts: Dict[tuple, Dict[str, int]] = {}
     quality_stats: Dict[str, int] = {"filtered_low_quality": 0, "filtered_counts": 0}
+    parse_stats: Dict[str, int] = new_parse_stats()
+    files_processed: List[Dict[str, object]] = []
 
     total_files = 0
     total_seqs = 0
@@ -430,9 +493,13 @@ def process_library(
                 all_dates,
                 min_quality=min_quality,
                 quality_stats=quality_stats,
+                parse_stats=parse_stats,
             )
             total_seqs += n_seqs
             total_counts += n_counts
+            files_processed.append({"path": str(fastq_path), "sample": sample.sample_number,
+                                    "sequencing_date": seq_date, "inner_primers": sample.inner_primers,
+                                    "unique_seqs": n_seqs, "reads": n_counts})
 
     calculate_totals(bc0_counts)
 
@@ -450,4 +517,6 @@ def process_library(
         "output_file": str(output_path),
         "filtered_low_quality": quality_stats["filtered_low_quality"],
         "filtered_counts": quality_stats["filtered_counts"],
+        "parse_stats": parse_stats,
+        "files": files_processed,
     }

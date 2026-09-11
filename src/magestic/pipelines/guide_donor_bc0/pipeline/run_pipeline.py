@@ -29,6 +29,7 @@ from ..config import (
     GuideDonorBC0Config,
     get_scratch_workdir,
 )
+from magestic.utils.provenance import StepProvenance, md5_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,9 +94,29 @@ def run_combine_fastq(config: GuideDonorBC0Config) -> bool:
 
     library_to_samples, all_dates = load_sample_keyfile(sample_keyfile)
     libraries = [lib for lib in library_to_samples if lib != "empty"]
+    if config.libraries:
+        unknown = [lib for lib in config.libraries if lib not in libraries]
+        if unknown:
+            logger.error(f"  --libraries names not in the keyfile: {unknown}")
+            return False
+        libraries = [lib for lib in libraries if lib in config.libraries]
     logger.info(f"  Libraries to process: {', '.join(libraries)}")
 
+    from ..core.fastq_processing import parse_parameters
+
     for library_ID in libraries:
+        prov = StepProvenance(pipeline="guide_donor_bc0", step="02_combine",
+                              output=str(counts_dir / f"{library_ID}_guide_donor_bc0_counts.tsv"),
+                              description="collapsed FASTQs of one library parsed into guide/donor/SPS/bc0 "
+                                          "and summed per unique oriented read")
+        prov.add_input(sample_keyfile, role="sample_keyfile")
+        for sample in library_to_samples[library_ID]:
+            for seq_date in sample.sequencing_dates:
+                fq = config.collapsed_fastq_dir / f"{seq_date}_{sample.outer_primers}_{sample.sample_number}_collapsed.fastq"
+                if fq.exists():
+                    prov.add_input(fq, role="collapsed_fastq", sample_number=sample.sample_number,
+                                   sequencing_date=seq_date, inner_primers=sample.inner_primers)
+        prov.set_parameters(**parse_parameters(), all_dates=sorted(all_dates), min_quality=0)
         stats = process_library(
             library_ID=library_ID,
             samples=library_to_samples[library_ID],
@@ -110,6 +131,14 @@ def run_combine_fastq(config: GuideDonorBC0Config) -> bool:
         )
         if stats["missing_files"]:
             logger.warning(f"    {len(stats['missing_files'])} FASTQ files not found")
+        prov.set_counts(files_processed=stats["files_processed"], missing_files=stats["missing_files"],
+                        unique_seqs_in=stats["total_seqs_in_files"], reads_in=stats["total_counts"],
+                        rows_out=stats["unique_sequences"], filtered_low_quality=stats["filtered_low_quality"],
+                        filtered_counts=stats["filtered_counts"], parse_reads_unique=stats["parse_stats"],
+                        files=stats["files"])
+        if stats["output_file"] and Path(stats["output_file"]).exists():
+            prov.add_output(stats["output_file"], rows=stats["unique_sequences"])
+        logger.info(f"    sidecar: {prov.write()}")
 
     logger.info("Step 02: Complete")
     return True
@@ -191,6 +220,8 @@ def run_oligo_matching(config: GuideDonorBC0Config) -> bool:
         )
         return False
 
+    if config.libraries:
+        input_files = [f for f in input_files if f.name.replace(counts_suffix, "") in config.libraries]
     logger.info(f"  Found {len(input_files)} counts file(s)")
     all_ok = True
     for input_file in input_files:
@@ -198,14 +229,31 @@ def run_oligo_matching(config: GuideDonorBC0Config) -> bool:
         output_file = working_dir / f"{library_id}_matched_guide_donor_bc0_counts.tsv"
         logger.info(f"  Matching {library_id} -> {output_file.name}")
         try:
+            scope = config.library_scope.get(library_id, {}) if config.use_harmonized_table else {}
+            v_scope = scope.get("v_libraries", config.harmonized_v_libraries)
+            n_scope = scope.get("nuclease_types", config.harmonized_nuclease_types)
+            prov = StepProvenance(pipeline="guide_donor_bc0", step="03_match", output=str(output_file),
+                                  description="step-02 counts rows matched to designed oligos (exact guide+site+donor, "
+                                              "then unique-guide / unique-donor / unique-middle-region cascade)")
+            prov.add_input(input_file, role="guide_donor_bc0_counts")
             if config.use_harmonized_table:
-                scope = config.library_scope.get(library_id, {})
-                lookups = _build_lookups(
-                    scope.get("v_libraries", config.harmonized_v_libraries),
-                    scope.get("nuclease_types", config.harmonized_nuclease_types),
-                )
+                from magestic.utils.oligo_annotations import HARMONIZED_OLIGO_TABLE
+                prov.add_input(HARMONIZED_OLIGO_TABLE, role="harmonized_oligo_table")
+                prov.set_parameters(oligo_source="harmonized_table", v_libraries=v_scope, nuclease_types=n_scope,
+                                    library_scope_json=str(config.library_scope_json) if config.library_scope_json else None)
+            else:
+                prov.add_input(config.oligo_design_file, role="oligo_design_200mer")
+                prov.set_parameters(oligo_source="raw_200mer", guide_slice=list(config.guide_slice),
+                                    donor_slice=list(config.donor_slice))
+            prov.set_parameters(middle_donor_region=[config.middle_donor_start, config.middle_donor_end])
+            if config.use_harmonized_table:
+                lookups = _build_lookups(v_scope, n_scope)
             else:
                 lookups = global_lookups
+            prov.set_counts(lookup_exact_guide_donor=len(lookups["guide_donor_to_oligo"]),
+                            lookup_guides=len(lookups["guide_to_oligos"]),
+                            lookup_donors=len(lookups["perfect_donor_to_oligos"]),
+                            lookup_partial=len(lookups["partial_donor_to_oligos"]))
             stats = process_counts_file(input_file, output_file, lookups)
             total = stats["total"]
             matched = stats["matched"]
@@ -216,6 +264,9 @@ def run_oligo_matching(config: GuideDonorBC0Config) -> bool:
                 f"    {total:,} sequences, {matched:,} matched ({match_pct:.1f}%), "
                 f"{perfect:,} perfect ({perfect_pct:.1f}%)"
             )
+            prov.set_counts(rows_in=total, rows_out=total, matched=matched, perfect_match=perfect)
+            prov.add_output(output_file, rows=total)
+            logger.info(f"    sidecar: {prov.write()}")
         except Exception:
             logger.exception(f"  Error matching {library_id}")
             all_ok = False
@@ -250,14 +301,29 @@ def run_bc0_purity(config: GuideDonorBC0Config) -> bool:
         logger.warning("  Run the 'match' step first.")
         return False
 
+    if config.libraries:
+        input_files = [f for f in input_files
+                       if f.stem.replace(INPUT_SUFFIX.replace(".tsv", ""), "") in config.libraries]
     logger.info(f"  Found {len(input_files)} input files")
     all_stats = []
     for input_file in input_files:
         library_id = input_file.stem.replace(INPUT_SUFFIX.replace(".tsv", ""), "")
         output_file = purity_dir / f"{library_id}{OUTPUT_SUFFIX}"
+        prov = StepProvenance(pipeline="guide_donor_bc0", step="04_purity", output=str(output_file),
+                              description="per (guide, bc0): counts summed over donors, dominant donor kept, "
+                                          "purity = dominant / total")
+        prov.add_input(input_file, role="matched_guide_donor_bc0_counts")
+        prov.set_parameters(min_counts=purity_config.min_counts)
         stats = calculate_bc0_purity(input_file, output_file, purity_config)
         stats["library_id"] = library_id
         all_stats.append(stats)
+        prov.set_counts(rows_in=int(stats.get("total_rows", 0)), rows_out=int(stats.get("unique_guide_bc0", 0)),
+                        mean_purity=stats.get("mean_purity"), median_purity=stats.get("median_purity"),
+                        high_purity_ge_0p9=int(stats.get("high_purity_count", 0) or 0),
+                        low_purity_lt_0p5=int(stats.get("low_purity_count", 0) or 0))
+        if output_file.exists():
+            prov.add_output(output_file, rows=int(stats.get("unique_guide_bc0", 0)))
+        logger.info(f"    sidecar: {prov.write()}")
         if stats["mean_purity"] is not None:
             logger.info(
                 f"  {library_id}: {stats['unique_guide_bc0']:,} guide-BC0 pairs, "
@@ -267,9 +333,11 @@ def run_bc0_purity(config: GuideDonorBC0Config) -> bool:
     # Write summary
     if all_stats:
         import pandas as pd
-        pd.DataFrame(all_stats).to_csv(
-            purity_dir / "purity_summary.tsv", sep="\t", index=False
-        )
+        summary_name = "purity_summary.tsv"
+        if config.libraries:
+            # one library per task: a shared summary file would race between array tasks
+            summary_name = f"purity_summary.{'_'.join(config.libraries)}.tsv"
+        pd.DataFrame(all_stats).to_csv(purity_dir / summary_name, sep="\t", index=False)
 
     logger.info("Step 04: Complete")
     return True
@@ -612,11 +680,33 @@ Examples:
         help="Optional JSON {library_ID: {nuclease_types:[...], v_libraries:[...]}} "
              "for per-library harmonized scoping (mixed-nuclease pools)."
     )
+    # Explicit path overrides (2026-09-11). Before these existed, running the pipeline on inputs
+    # that live outside <project-dir> required symlinking them into the expected layout, which
+    # Oak policy forbids; a tool that only works given a layout gets fixed, not shimmed.
+    parser.add_argument("--keyfile", type=Path, default=None,
+                        help="Step-02 sample keyfile (overrides <project-dir>/keyfiles/guide_donor_bc0/step_1_sample_key_unified.tsv)")
+    parser.add_argument("--collapsed-fastq-dir", type=Path, default=None,
+                        help="Directory of *_collapsed.fastq (overrides auto-detection under <project-dir>)")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Pipeline output root (overrides <project-dir>/processed_data/guide_donor_bc0)")
+    parser.add_argument("--libraries", type=str, default=None,
+                        help="Comma-separated library_IDs to process (default: every library in the keyfile / "
+                             "every counts file found). Lets one cluster task own one library.")
 
     args = parser.parse_args()
 
     # Create configuration
     config = GuideDonorBC0Config.from_project_dir(args.project_dir)
+    if args.keyfile:
+        config.sample_keyfile = args.keyfile
+    if args.collapsed_fastq_dir:
+        config.collapsed_fastq_dir = args.collapsed_fastq_dir
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        config.counts_dir = args.output_dir / "guide_donor_bc0"
+        config.plots_dir = args.output_dir / "plots"
+    if args.libraries:
+        config.libraries = [x.strip() for x in args.libraries.split(",") if x.strip()]
 
     # Override oligo design file if specified
     if args.oligo_design_file:
@@ -633,6 +723,7 @@ Examples:
         import json
         with open(args.library_scope_json) as _fh:
             config.library_scope = json.load(_fh)
+        config.library_scope_json = args.library_scope_json
 
     # Apply scratch setting
     if args.use_scratch:

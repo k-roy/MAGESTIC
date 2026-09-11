@@ -135,6 +135,12 @@ class GuideDonorBC0Config:
     "v_libraries": [...]}}. Overrides the global scope for that library so each V
     library in a mixed-nuclease pool matches only its own nuclease/sublibrary."""
 
+    library_scope_json: Optional[Path] = None
+    """Path the library_scope was loaded from (recorded in provenance sidecars)."""
+
+    # Which libraries to process (None = all). Set from --libraries so one cluster task can own one.
+    libraries: Optional[List[str]] = None
+
     # Scratch I/O
     use_scratch: bool = False
     scratch_dir: Optional[Path] = None

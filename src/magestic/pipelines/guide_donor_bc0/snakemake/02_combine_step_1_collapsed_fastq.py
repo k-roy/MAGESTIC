@@ -49,8 +49,8 @@ from tqdm import tqdm
 
 # Import anchor-based extraction utilities
 from magestic.utils.sequence_anchors import (
-    find_anchor,
     find_anchor_from_end,
+    find_re_site,
     extract_donor_bc0_fragment,
     DEFAULT_DONOR_BC0_FRAGMENT_LENGTH,
 )
@@ -279,16 +279,13 @@ def parse_sequence(seq: str, cas_type: str = "SpCas9") -> Tuple[str, str, str, s
     if msd_pos is None:
         return ("NA",) * 7
 
-    # Find RE site - try SpCas9/SpG first, then LbCas12a
-    RE_site_pattern = SEQ_CONST.RE_site if cas_type != "LbCas12a" else SEQ_CONST.RE_site_lbcas12a
-    RE_site_pos = find_anchor(seq, RE_site_pattern, end=min(150, len(seq)))
-
-    # If SpCas9 pattern not found, try LbCas12a
-    if RE_site_pos is None and cas_type != "LbCas12a":
-        RE_site_pos = find_anchor(seq, SEQ_CONST.RE_site_lbcas12a, end=min(150, len(seq)))
-
-    if RE_site_pos is None:
+    # Find the RE (cloning) site across BOTH nuclease patterns: exact first, then
+    # substitutions-only within 1 mismatch. The old SpCas9-first fuzzy search mis-cut every
+    # G-ending Cas12a guide by one base (GDB-01; see sequence_anchors.find_re_site).
+    hit = find_re_site(seq, end=min(150, len(seq)))
+    if hit is None:
         return ("NA",) * 7
+    RE_site_pos = hit.pos
 
     # Calculate positions based on anchors
     guide_start = RE_site_pos - SEQ_CONST.guide_length
