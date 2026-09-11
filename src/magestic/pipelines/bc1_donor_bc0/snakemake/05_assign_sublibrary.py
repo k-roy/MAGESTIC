@@ -749,7 +749,6 @@ Examples:
     # Save reference table
     bc1_reference.to_csv(args.output_reference, sep="\t", index=False)
     logger.info(f"\nSaved bc1 reference table ({len(bc1_reference)} bc1s) to: {args.output_reference}")
-    _write_provenance(args, bc1_reference, n_input_rows, n_input_bc1)
 
     # Generate purity summary
     group_col = "yeast_sublibrary" if df["yeast_sublibrary"].notna().any() else "V_library"
@@ -796,6 +795,9 @@ Examples:
     summary_df = pd.DataFrame(summary_data)
     summary_df.to_csv(args.output_summary, sep="\t", index=False)
     logger.info(f"Saved purity summary to: {args.output_summary}")
+    # The sidecar is written LAST, after every output it checksums exists. (The 2026-09-11 smoke caught it
+    # being written between the reference table and the summary: stat() on the summary raised.)
+    _write_provenance(args, bc1_reference, n_input_rows, n_input_bc1)
 
     # Print summary
     logger.info("\n" + "=" * 60)
