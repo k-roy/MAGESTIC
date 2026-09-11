@@ -179,6 +179,13 @@ def trim_to_variable_region(
     return donor
 
 
+GUIDE_NO_GUIDE = "no_guide"
+GUIDE_NOT_DESIGNED = "guide_not_designed"
+GUIDE_MATCH = "match"
+GUIDE_CONFLICT = "conflict"
+GUIDE_STATUSES = (GUIDE_NO_GUIDE, GUIDE_NOT_DESIGNED, GUIDE_MATCH, GUIDE_CONFLICT)
+
+
 @dataclass
 class OligoMatch:
     """Result of matching a sequence to designed oligos."""
@@ -187,7 +194,21 @@ class OligoMatch:
     # Match quality indicators
     perfect_donor: bool = False
     perfect_middle_region: bool = False
+
+    # `guide_match` is a BOOLEAN and therefore conflates states that mean opposite things: False was
+    # both "this row has no linked guide at all" and "the linked guide disagrees with the donor".
+    # Measured on the 2026-09-10 rebuild, False covered 711,464 rows of the first kind and 223,954 of
+    # the second. `guide_status` separates them (planning 30_ step 6):
+    #   no_guide            no guide on this row
+    #   guide_not_designed  a guide is present but is not any designed guide in scope
+    #   match               the guide's designs intersect the donor's candidates; it narrowed the match
+    #   conflict            the guide IS designed, but names NO design the donor allows
+    # `conflict` is the state that used to vanish: the matcher narrows by guide only `if overlap:`, so
+    # when the guide's designs did not intersect the donor's it kept the donor answer and said nothing.
+    # That is how ambiguous rows ended up carrying a guide matching none of their own candidates.
     guide_match: bool = False
+    guide_status: str = GUIDE_NO_GUIDE
+    num_guide_oligos: int = 0
 
     # Confidence
     #
@@ -593,6 +614,17 @@ def match_sequence(
     if guide:
         guide = guide.upper()
 
+    # Guide state, independent of whether the guide ends up narrowing anything.
+    guide_oligos = tables.guide_to_oligos.get(guide) if guide else None
+    if not guide:
+        result.guide_status = GUIDE_NO_GUIDE
+    elif guide_oligos is None:
+        result.guide_status = GUIDE_NOT_DESIGNED
+    else:
+        # provisional: a designed guide that never intersects the donor's candidates is a CONFLICT
+        result.guide_status = GUIDE_CONFLICT
+        result.num_guide_oligos = len(guide_oligos)
+
     # 1. Try perfect donor match
     if donor and donor in tables.perfect_donor_to_oligos:
         candidates = tables.perfect_donor_to_oligos[donor]
@@ -600,11 +632,14 @@ def match_sequence(
         result.perfect_middle_region = True
 
         # Narrow by guide first if it disambiguates further (rarely available).
-        if guide and guide in tables.guide_to_oligos:
-            overlap = set(candidates) & set(tables.guide_to_oligos[guide])
+        if guide_oligos is not None:
+            overlap = set(candidates) & set(guide_oligos)
             if overlap:
                 result.guide_match = True
+                result.guide_status = GUIDE_MATCH
                 candidates = list(overlap)
+            # else: guide_status stays GUIDE_CONFLICT -- the donor answer is kept, but the
+            # disagreement is now recorded instead of discarded.
 
         _resolve_candidates(
             result, candidates, tables,
@@ -620,11 +655,13 @@ def match_sequence(
         if window_matches:
             result.perfect_middle_region = True
 
-            if guide and guide in tables.guide_to_oligos:
-                overlap = window_matches & set(tables.guide_to_oligos[guide])
+            if guide_oligos is not None:
+                overlap = window_matches & set(guide_oligos)
                 if overlap:
                     result.guide_match = True
+                    result.guide_status = GUIDE_MATCH
                     window_matches = overlap
+                # else: guide_status stays GUIDE_CONFLICT
 
             _resolve_candidates(
                 result, window_matches, tables,
@@ -633,10 +670,11 @@ def match_sequence(
             )
             return result
 
-    # 3. Guide-only match (fallback)
-    if guide and guide in tables.guide_to_oligos:
-        candidates = tables.guide_to_oligos[guide]
+    # 3. Guide-only match (fallback): nothing to conflict WITH, so a designed guide is a match.
+    if guide_oligos is not None:
+        candidates = guide_oligos
         result.guide_match = True
+        result.guide_status = GUIDE_MATCH
         _resolve_candidates(
             result, candidates, tables,
             method_unique="guide_only",
@@ -765,7 +803,9 @@ def match_dataframe(
     - {prefix}oligo_name: Matched oligo name
     - {prefix}perfect_donor: True if perfect donor match
     - {prefix}perfect_middle_region: True if middle region matched
-    - {prefix}guide_match: True if guide contributed to match
+    - {prefix}guide_match: True if guide contributed to match (kept for back-compat)
+    - {prefix}guide_status: no_guide / guide_not_designed / match / conflict -- see OligoMatch
+    - {prefix}num_guide_oligos: how many designs carry this guide (0 when it is not a designed guide)
     - {prefix}is_unambiguous: True if match is unambiguous
     - {prefix}match_method: Description of how match was made
     - {prefix}num_candidates / {prefix}num_candidate_variants: candidate oligos / distinct installed variants
@@ -802,6 +842,8 @@ def match_dataframe(
     pdon = [False] * n
     pmid = [False] * n
     gmatch = [False] * n
+    gstatus = [GUIDE_NO_GUIDE] * n
+    ngoligo = [0] * n
     unamb = [False] * n
     method = ["none"] * n
     ncand = [0] * n
@@ -833,10 +875,12 @@ def match_dataframe(
         mapped = trimmed.map(pm)             # result-tuple or NaN
         if has_guide:
             guide_s = df[guide_col]
+            g_present = guide_s.notna().to_numpy(dtype=bool)
             g_block = guide_s.astype(str).str.upper().where(guide_s.notna()).map(
                 lambda x: isinstance(x, str) and x in tables.guide_to_oligos
             ).fillna(False).to_numpy(dtype=bool)
         else:
+            g_present = np.zeros(n, dtype=bool)
             g_block = np.zeros(n, dtype=bool)
         fast_mask = mapped.notna().to_numpy(dtype=bool) & (~g_block)
         mapped_vals = mapped.to_numpy()
@@ -845,6 +889,9 @@ def match_dataframe(
             oligo[i] = t[0]; pdon[i] = True; pmid[i] = True
             unamb[i] = bool(t[1]); var[i] = t[2]
             ncand[i] = int(t[3]); ncandv[i] = int(t[4]); method[i] = t[5]; cands[i] = t[6]
+            # the fast path is only taken where the guide is NOT a designed guide (~g_block), so the
+            # guide can never have narrowed here: it is absent, or present and undesigned.
+            gstatus[i] = GUIDE_NOT_DESIGNED if g_present[i] else GUIDE_NO_GUIDE
 
     # ---------------------------------------------------------------------
     # FALLBACK — unchanged per-row match_sequence for every non-fast row.
@@ -865,6 +912,7 @@ def match_dataframe(
         r = match_sequence(d, g, tables, pre_trim=pre_trim)
         oligo[i] = r.oligo_name; pdon[i] = r.perfect_donor; pmid[i] = r.perfect_middle_region
         gmatch[i] = r.guide_match; unamb[i] = r.is_unambiguous; method[i] = r.match_method
+        gstatus[i] = r.guide_status; ngoligo[i] = r.num_guide_oligos
         ncand[i] = r.num_candidate_oligos; ncandv[i] = r.num_candidate_variants; var[i] = r.variant
         cands[i] = format_candidates(r.candidate_oligos, r.num_candidate_variants)
 
@@ -873,6 +921,8 @@ def match_dataframe(
     df[f'{prefix}perfect_donor'] = pdon
     df[f'{prefix}perfect_middle_region'] = pmid
     df[f'{prefix}guide_match'] = gmatch
+    df[f'{prefix}guide_status'] = gstatus
+    df[f'{prefix}num_guide_oligos'] = ngoligo
     df[f'{prefix}is_unambiguous'] = unamb
     df[f'{prefix}match_method'] = method
     df[f'{prefix}num_candidates'] = ncand
@@ -884,6 +934,16 @@ def match_dataframe(
     n_perfect = sum(1 for x in pdon if x)
     logger.info(f"  Matched {n_matched}/{n} (perfect_donor={n_perfect}; "
                 f"vectorized fast-path={int(fast_mask.sum())}, fallback={int((~fast_mask).sum())})")
+    status_counts = {k: 0 for k in GUIDE_STATUSES}
+    for st in gstatus:
+        status_counts[st] = status_counts.get(st, 0) + 1
+    logger.info(f"  guide_status: {status_counts}")
+    if status_counts[GUIDE_CONFLICT]:
+        logger.warning(
+            f"  {status_counts[GUIDE_CONFLICT]:,} rows have guide_status='conflict': a DESIGNED guide "
+            f"naming no design the donor allows. The donor answer was kept. These were invisible before "
+            f"(guide_match=False meant this and 'no guide' alike)."
+        )
     return df
 
 
