@@ -54,7 +54,9 @@ def _build_oligo_attr_maps():
     return o2g, o2l
 
 
-def main():
+def build_parser():
+    """The CLI contract, factored out so a test can assert the defaults (notably that the GDB-01
+    bridge is OFF) without running the step."""
     parser = argparse.ArgumentParser(description="Map bc1-donor-bc0 to designed oligos (canonical rich matcher)")
     parser.add_argument("--input", nargs="+", required=True, help="Input TSV file(s) from Step 03 / combine")
     parser.add_argument("--output", required=True, help="Output TSV file")
@@ -63,8 +65,15 @@ def main():
     parser.add_argument("--v-libraries", nargs="*", default=None, help="Restrict harmonized lookup to these V libraries")
     parser.add_argument("--nuclease", nargs="*", default=None, help="Restrict harmonized lookup to these nuclease/PAM types")
     parser.add_argument("--no-pre-trim", action="store_true", help="Disable anchor pre-trim (already-trimmed donors)")
+    # GDB-01 bridge. The root fix landed in gdb Step 02 on 2026-09-11 (sequence_anchors.find_re_site),
+    # so this consumer-side repair is now OFF by default and exists only so tables built BEFORE that fix
+    # stay readable. See PIPELINE_CORRECTNESS_POLICY.md §1: a downstream repair is a bridge, never the fix.
+    parser.add_argument("--gdb01-repair", action="store_true",
+                        help="BRIDGE, off by default. Restore Cas12a guides that gdb Step 02 extracted 1 nt early "
+                             "(planning 30_ GDB-01). Only for guide-donor-bc0 tables built before the 2026-09-11 "
+                             "root fix; against corrected tables it should restore ~0 rows and will warn loudly.")
     parser.add_argument("--no-gdb01-repair", action="store_true",
-                        help="Do not restore Cas12a guides that gdb Step 02 extracted 1 nt early (planning 30_ GDB-01)")
+                        help="(deprecated no-op; the repair is off by default since 2026-09-11)")
     parser.add_argument("--sps-mapping", default=None,
                         help="SPS -> library_id TSV (cols: sps, library_id). When given, each row is matched ONLY "
                              "against the subpool its own SPS names (planning 34_/36_). Without it, behaviour is "
@@ -77,7 +86,11 @@ def main():
     parser.add_argument("--donor-start", type=int, default=None, help="(ignored)")
     parser.add_argument("--donor-end", type=int, default=None, help="(ignored)")
     parser.add_argument("--lbcas12a-donor-start", type=int, default=None, help="(ignored)")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     print("Loading bc1-donor-bc0 data...")
     bc1_data = pd.concat([pd.read_csv(f, sep="\t") for f in args.input], ignore_index=True)
@@ -99,15 +112,29 @@ def main():
         nuclease_types=args.nuclease,
     )
 
-    # GDB-01: gdb Step 02 shifted every G-ending Cas12a guide 1 nt early ('T' + guide[:19]); bdb 03 copied the shifted
-    # string. Restore it before matching so guide narrowing works, keep the raw string, and label the row.
-    if args.guide_col in bc1_data.columns and not args.no_gdb01_repair:
+    # GDB-01 BRIDGE (off unless --gdb01-repair). gdb Step 02 used to shift every G-ending Cas12a guide 1 nt
+    # early ('T' + guide[:19]) and bdb 03 copied the shifted string. That is fixed at the source now, so this
+    # only runs against pre-2026-09-11 tables; it restores the guide, keeps the raw string, and labels the row.
+    if args.no_gdb01_repair:
+        print("NOTE: --no-gdb01-repair is a deprecated no-op; the GDB-01 bridge is off by default since 2026-09-11.")
+    if args.guide_col in bc1_data.columns and args.gdb01_repair:
         fixed, flag = repair_gdb01_shifted_guides(bc1_data[args.guide_col], tables)
         bc1_data["guide_gdb_raw"] = bc1_data[args.guide_col].where(flag)
         bc1_data[args.guide_col] = fixed
         bc1_data["guide_repaired_gdb01"] = flag
         nr = int(flag.sum()); ng = int(bc1_data[args.guide_col].notna().sum())
-        print(f"GDB-01 repair: restored {nr:,} of {ng:,} guide-carrying rows ({100*nr/max(ng,1):.2f}%) to a designed Cas12a guide")
+        pct = 100 * nr / max(ng, 1)
+        print(f"GDB-01 BRIDGE: restored {nr:,} of {ng:,} guide-carrying rows ({pct:.2f}%) to a designed Cas12a guide")
+        if nr == 0:
+            print("GDB-01 BRIDGE: 0 rows restored -- these tables already carry corrected guides. Drop --gdb01-repair.")
+        else:
+            print("=" * 100)
+            print(f"WARNING: the GDB-01 bridge fired on {nr:,} rows ({pct:.2f}%). That means this input was built by")
+            print("         gdb Step 02 BEFORE the 2026-09-11 root fix (sequence_anchors.find_re_site). The bridge")
+            print("         repairs only guides it can prove are shifted; it cannot repair the donor or the counts,")
+            print("         and it cannot help any other consumer of those tables. The correct action is to re-run")
+            print("         gdb Step 02 on the fix and rebuild from there. See PIPELINE_CORRECTNESS_POLICY.md §1.")
+            print("=" * 100)
 
     # --- SPS scoping (planning 36_): a bc1-donor-bc0 read carries the subpool priming site between donor and bc0,
     # and it names which design subpool the molecule was amplified from. Matching a row against all subpools at once

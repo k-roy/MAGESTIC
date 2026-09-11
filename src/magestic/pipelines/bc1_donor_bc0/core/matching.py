@@ -660,7 +660,17 @@ CAS12A_OLIGO_PREFIXES = ("LbCas12a_", "impLbCas12a_")
 
 
 def repair_gdb01_shifted_guides(guides: pd.Series, tables: "OligoLookupTables"):
-    """Undo gdb Step 02's 1-nt-early guide extraction on Cas12a reads (planning 30_ GDB-01).
+    """BRIDGE, retired 2026-09-11: undo gdb Step 02's 1-nt-early guide extraction on Cas12a reads (planning 30_).
+
+    🔴 THE ROOT FIX IS IN gdb STEP 02, not here. ``magestic.utils.sequence_anchors.find_re_site`` now tries every
+    cloning-site pattern exactly before trying any approximately, and scores approximate matches by substitutions
+    only, so the shift cannot happen. Tables built from 2026-09-11 onward need no repair and this function will
+    restore ~0 rows against them.
+
+    This is kept, and reachable only via bdb 04's ``--gdb01-repair`` (OFF by default), so guide-donor-bc0 tables
+    built BEFORE that fix stay readable. It is a bridge in the sense of PIPELINE_CORRECTNESS_POLICY.md §1: it is
+    labelled in the output (``guide_repaired_gdb01`` / ``guide_gdb_raw``), switchable, and it protects exactly one
+    consumer while leaving the wrong guides on disk for every other reader. Re-run gdb Step 02 instead.
 
     gdb Step 02 searches the SpCas9 RE site first; on a Cas12a read the fuzzy fallback ties the true TTTCGAAGAGC window
     with the window one base earlier whenever the guide ends in G, and keeps the earlier one. The extracted guide is
