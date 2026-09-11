@@ -65,6 +65,10 @@ def main():
     parser.add_argument("--no-pre-trim", action="store_true", help="Disable anchor pre-trim (already-trimmed donors)")
     parser.add_argument("--no-gdb01-repair", action="store_true",
                         help="Do not restore Cas12a guides that gdb Step 02 extracted 1 nt early (planning 30_ GDB-01)")
+    parser.add_argument("--sps-mapping", default=None,
+                        help="SPS -> library_id TSV (cols: sps, library_id). When given, each row is matched ONLY "
+                             "against the subpool its own SPS names (planning 34_/36_). Without it, behaviour is "
+                             "unchanged: every row is matched against the whole --v-libraries scope.")
     # Back-compat (accepted + IGNORED): the old exact-merge args, so existing rule
     # shells keep working without a rule edit. The harmonized table is used instead.
     parser.add_argument("--oligo-pools", nargs="*", default=None, help="(ignored; harmonized table used)")
@@ -105,9 +109,45 @@ def main():
         nr = int(flag.sum()); ng = int(bc1_data[args.guide_col].notna().sum())
         print(f"GDB-01 repair: restored {nr:,} of {ng:,} guide-carrying rows ({100*nr/max(ng,1):.2f}%) to a designed Cas12a guide")
 
-    print(f"Matching donors (col '{donor_col}') via core.matching.match_dataframe...")
-    out = match_dataframe(bc1_data, tables, donor_col=donor_col, guide_col=args.guide_col,
-                          pre_trim=not args.no_pre_trim)
+    # --- SPS scoping (planning 36_): a bc1-donor-bc0 read carries the subpool priming site between donor and bc0,
+    # and it names which design subpool the molecule was amplified from. Matching a row against all subpools at once
+    # lets the donor tie be broken by alphabetical order instead: 313,570 named rows (7.0%) ended up named from a
+    # subpool their own read did not come from. Post-filtering the candidate list cannot fix that, because an
+    # UNAMBIGUOUS row carries no candidate list -- the right design was never a candidate. So scope the search itself.
+    sps2v = {}
+    if args.sps_mapping:
+        m = pd.read_csv(args.sps_mapping, sep="	", dtype=str)
+        sps2v = {str(k).upper(): v for k, v in zip(m["sps"], m["library_id"]) if isinstance(v, str) and v}
+        if args.v_libraries:
+            sps2v = {k: v for k, v in sps2v.items() if v in args.v_libraries}
+        print(f"SPS scoping: {len(sps2v)} SPS -> subpool ({sorted(set(sps2v.values()))})")
+
+    if sps2v and "SPS" in bc1_data.columns:
+        scope = bc1_data["SPS"].astype(str).str.upper().map(sps2v)
+        bc1_data["sps_scope_V"] = scope
+        bc1_data["sps_scoped"] = scope.notna()
+        print(f"  {int(scope.notna().sum()):,} of {len(bc1_data):,} rows scoped by their own SPS; "
+              f"{int(scope.isna().sum()):,} fall back to the full scope")
+        print("  rows per subpool: " + str(scope.value_counts(dropna=False).to_dict()))
+        parts = []
+        for v, sub in bc1_data.groupby(scope.fillna("__UNSCOPED__"), sort=False):
+            if v == "__UNSCOPED__":
+                t = tables
+                print(f"  matching {len(sub):,} unscoped rows against the full scope...")
+            else:
+                print(f"  building lookup for {v} and matching {len(sub):,} rows...")
+                t = load_and_build_lookup(use_harmonized_table=True, v_libraries=[v],
+                                          nuclease_types=args.nuclease)
+            parts.append(match_dataframe(sub, t, donor_col=donor_col, guide_col=args.guide_col,
+                                         pre_trim=not args.no_pre_trim))
+            if v != "__UNSCOPED__":
+                del t
+        out = pd.concat(parts).sort_index()
+        del parts
+    else:
+        print(f"Matching donors (col '{donor_col}') via core.matching.match_dataframe...")
+        out = match_dataframe(bc1_data, tables, donor_col=donor_col, guide_col=args.guide_col,
+                              pre_trim=not args.no_pre_trim)
 
     # Preserve the prior output contract (assign_05 consumes these).
     out["perfect_donor_match"] = out["perfect_donor"]

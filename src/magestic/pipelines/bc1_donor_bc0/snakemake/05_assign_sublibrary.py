@@ -722,7 +722,7 @@ Examples:
                 "match_method", "is_unambiguous", "num_candidates", "num_candidate_variants", "variant",
                 "candidate_oligos", "perfect_donor", "guide_match",
                 # planning 30_ GDB-01: the linked guide was restored from gdb's 1-nt-early Cas12a extraction.
-                "guide_repaired_gdb01", "guide_gdb_raw"]:
+                "guide_repaired_gdb01", "guide_gdb_raw", "sps_scope_V", "sps_scoped"]:
         if col in bc1_reference.columns and col not in ref_cols:
             ref_cols.append(col)
 
