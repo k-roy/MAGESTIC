@@ -820,21 +820,29 @@ from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS as TIER_COUNT_COLUM
 
 
 def _git_state():
-    here = Path(__file__).resolve().parent
-    try:
-        head = subprocess.run(["git", "-C", str(here), "rev-parse", "HEAD"], capture_output=True,
-                              text=True, timeout=30).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(here), "status", "--porcelain", "--untracked-files=no"],
-                               capture_output=True, text=True, timeout=30).stdout.strip()
-        return {"git_head": head or None, "git_tracked_dirty": bool(dirty)}
-    except Exception as e:  # never fail a build for provenance
-        return {"git_head": None, "git_error": str(e)}
+    """Commit sha, branch and dirty flag of the checkout that holds the running package.
+
+    Delegates to magestic.utils.provenance.git_state, which runs git with cwd= rather than `git -C`:
+    the cluster's system git predates -C, so the previous subprocess call exited 129 with an empty
+    stdout and every 2026-09-10 reference-table sidecar shipped ``git_head: null``.
+    """
+    from magestic.utils.provenance import git_state
+    g = git_state()
+    return {"git_head": g.get("commit") or None, "git_branch": g.get("branch"), "git_repo": g.get("repo"),
+            "git_tracked_dirty": bool(g.get("dirty")), "git_dirty_files": g.get("dirty_files") or []}
 
 
 def _write_provenance(args, ref, n_input_rows, n_input_bc1):
     """<output_reference>.provenance.json -- what built this table, and its conventions."""
+    from magestic.utils.provenance import environment, file_record, utc_now
     prov = {
         "step": "05_assign_sublibrary", "argv": sys.argv, **_git_state(),
+        "environment": environment(), "finished": utc_now(),
+        # inputs and outputs WITH md5 (PIPELINE_CORRECTNESS_POLICY.md Sec. 2): a path is not a version
+        "inputs": [file_record(args.input, role="bc1_mapped_to_oligos"),
+                   file_record(args.sps_mapping, role="sps_mapping")],
+        "outputs": [file_record(args.output_reference, rows=int(len(ref))),
+                    file_record(args.output_summary)],
         "input": args.input, "input_rows": int(n_input_rows), "input_bc1": int(n_input_bc1),
         "output_reference": args.output_reference, "rows": int(len(ref)),
         "unique_bc1": int(ref["bc1"].nunique()), "columns": list(ref.columns),

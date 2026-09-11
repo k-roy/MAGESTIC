@@ -36,6 +36,8 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
+from magestic.utils.provenance import StepProvenance, read_sidecar
+
 GUIDE_USECOLS = ["library_ID", "guide", "donor_bc0_fragment", "counts", "total_counts", "SPS"]
 
 
@@ -100,7 +102,23 @@ def load_guide_table(guide_dir: Path, pattern: str, fallback_pattern: str, outpu
     g["guide_link_n_guides"] = np.maximum(g["linking_key"].map(n_guides_x).to_numpy(),
                                           g["_n_guides"].to_numpy())
     g = g.rename(columns={"_n": "guide_link_counts"}).drop(columns=["_n_guides"])
-    return g
+    return g, srcs
+
+
+def _upstream_md5(path: str, nbytes: int):
+    """The md5 a guide-donor-bc0 table's OWN sidecar recorded for it, if that sidecar exists and its byte
+    count still matches -- so the 11 multi-GB inputs are not re-hashed on every link, yet a table that was
+    rewritten since its sidecar (size changed) falls back to a fresh md5. Returns None to force a recompute."""
+    sc = Path(f"{path}.provenance.json")
+    if not sc.is_file():
+        return None
+    try:
+        for rec in read_sidecar(sc).get("outputs") or []:
+            if str(rec.get("path")) == str(path) and int(rec.get("bytes", -1)) == int(nbytes) and rec.get("md5"):
+                return rec["md5"]
+    except Exception:
+        return None
+    return None
 
 
 def create_linking_key_bc1(row):
@@ -173,8 +191,8 @@ def main():
         bc1_df.to_csv(args.output, sep="\t", index=False)
         return
 
-    guide_dedup = load_guide_table(Path(args.guide_dir), args.guide_pattern,
-                                   args.guide_fallback_pattern, args.output)
+    guide_dedup, guide_srcs = load_guide_table(Path(args.guide_dir), args.guide_pattern,
+                                               args.guide_fallback_pattern, args.output)
     print(f"Unique guide linking keys: {len(guide_dedup):,} "
           f"(ambiguous, >1 guide: {(guide_dedup['guide_link_n_guides'] > 1).sum():,})")
 
@@ -208,6 +226,30 @@ def main():
     merged = merged.drop(columns=["linking_key"])
     merged.to_csv(args.output, sep="\t", index=False)
     print(f"\nSaved linked data to: {args.output}")
+
+    # --- step sidecar (PIPELINE_CORRECTNESS_POLICY.md Sec. 2). The guide tables' md5s come from their own
+    # sidecars when present (size-checked), so the provenance chain is joined by checksum, not by path.
+    prov = StepProvenance(pipeline="bc1_donor_bc0", step="03_link_guide_donor_bc0", output=args.output,
+                          description="bc1-donor-bc0 links joined to the guide-donor-bc0 tables on the 40-nt key "
+                                      "donor[-30:]+bc0[:10] == donor_bc0_fragment[:30]+donor_bc0_fragment[-10:]; "
+                                      "best-supported guide per key, ambiguity counted")
+    prov.add_input(args.input, role="bc1_donor_bc0_collapsed")
+    for s in guide_srcs:
+        up = _upstream_md5(s["file"], s["bytes"])
+        prov.add_input(s["file"], role="guide_donor_bc0_table", md5=up,
+                       md5_source="upstream sidecar" if up else "computed here",
+                       library_IDs=s["library_IDs"], keys_kept=int(s["keys_kept"]))
+    prov.set_parameters(guide_dir=str(args.guide_dir), guide_pattern=args.guide_pattern,
+                        guide_fallback_pattern=args.guide_fallback_pattern, guide_usecols=GUIDE_USECOLS,
+                        linking_key="donor[-30:] + bc0[:10]  <->  donor_bc0_fragment[:30] + donor_bc0_fragment[-10:]")
+    prov.set_counts(links_in=int(len(bc1_df)), links_out=int(len(merged)), unique_bc1=int(bc1_df["bc1"].nunique()),
+                    links_with_valid_key=int(bc1_df["linking_key"].notna().sum()), links_guide_linked=int(matched),
+                    guide_keys=int(len(guide_dedup)),
+                    guide_keys_ambiguous=int((guide_dedup["guide_link_n_guides"] > 1).sum()),
+                    guide_files=len(guide_srcs))
+    prov.add_output(args.output, rows=int(len(merged)))
+    prov.add_output(f"{args.output}.guide_sources.tsv")
+    print(f"sidecar: {prov.write()}")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ except ModuleNotFoundError:
         load_and_build_lookup, match_dataframe, match_dataframe_scoped, repair_gdb01_shifted_guides,
         assign_sps_scope, load_sps_mapping)
     from magestic.utils import path_utils
+from magestic.utils.provenance import StepProvenance
 
 
 def _build_oligo_attr_maps():
@@ -184,6 +185,33 @@ def main():
     print(f"Matched {m}/{n} ({100*m/max(n,1):.1f}%) to designed oligos; unambiguous={unamb}")
     out.to_csv(args.output, sep="\t", index=False)
     print(f"Saved mapped data to: {args.output}")
+
+    # --- step sidecar (PIPELINE_CORRECTNESS_POLICY.md Sec. 2) ---
+    prov = StepProvenance(pipeline="bc1_donor_bc0", step="04_map_to_oligos", output=args.output,
+                          description="each bc1-donor-bc0 link matched to a designed oligo of the harmonized table "
+                                      "(canonical rich matcher); with --sps-mapping the SEARCH is scoped to the "
+                                      "subpool the row's own SPS names (planning 34_/36_)")
+    for f in args.input:
+        prov.add_input(f, role="bc1_linked_guide_donor_bc0")
+    prov.add_input(path_utils.HARMONIZED_VARIANTS_FILE, role="harmonized_oligo_table")
+    if args.sps_mapping:
+        prov.add_input(args.sps_mapping, role="sps_mapping")
+    prov.set_parameters(donor_col=donor_col, guide_col=args.guide_col, v_libraries=args.v_libraries,
+                        nuclease=args.nuclease, pre_trim=not args.no_pre_trim,
+                        gdb01_repair_bridge=bool(args.gdb01_repair), sps_scoping=bool(args.sps_mapping))
+    counts = {"rows": int(n), "unique_bc1": (int(nbc1) if nbc1 != "NA" else None),
+              "oligo_named": int(m), "unambiguous": int(unamb)}
+    if "sps_scoped" in out.columns:
+        counts["sps_scoped_rows"] = int(out["sps_scoped"].sum())
+        counts["rows_per_sps_scope"] = {str(k): int(v) for k, v in
+                                       out["sps_scope_V"].value_counts(dropna=False).items()}
+    if "guide_repaired_gdb01" in out.columns:
+        counts["gdb01_bridge_repaired_rows"] = int(out["guide_repaired_gdb01"].sum())
+    if "guide_match" in out.columns:
+        counts["guide_match"] = {str(k): int(v) for k, v in out["guide_match"].value_counts(dropna=False).items()}
+    prov.set_counts(**counts)
+    prov.add_output(args.output, rows=int(n))
+    print(f"sidecar: {prov.write()}")
 
 
 if __name__ == "__main__":

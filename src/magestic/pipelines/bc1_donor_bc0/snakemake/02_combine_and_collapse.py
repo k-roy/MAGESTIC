@@ -60,6 +60,7 @@ from magestic.pipelines.bc1_donor_bc0.readers.data_loader import (
 from magestic.pipelines.bc1_donor_bc0.core.link_collapse import (
     aggregate_links, collapse_links, attach_short_donors, merge_orphan_bc1,
     mask_columns, masks_for_codes, popcount_rows, decode_masks)
+from magestic.utils.provenance import StepProvenance, md5_file
 
 TIER_COLS = list(TIER_COUNT_COLUMNS)
 SUM_COLS = ["counts", *TIER_COLS]
@@ -436,6 +437,37 @@ def main():
             f"set aside {set_aside}")
     log(f"support_tier (links): {tier_counts}; reads in {stats['reads_in']:,} = out "
         f"{stats['reads_out']:,} + set aside {set_aside:,}")
+
+    # --- step sidecar (PIPELINE_CORRECTNESS_POLICY.md Sec. 2): every input with its md5, the code sha,
+    # the exact argv, every parameter that shapes the result, and the accounting. The parsed inputs are
+    # hashed in parallel; a path is not a version.
+    prov = StepProvenance(pipeline="bc1_donor_bc0", step="02_combine_and_collapse", output=args.output_collapsed,
+                          description="per-sample parsed bc1-donor-bc0 links combined across every sequencing "
+                                      "run, collapsed (donor/bc1/bc0 within one edit), short donors attached, "
+                                      "orphan bc1 merged, replicate support LABELED (never filtered)")
+    if args.manifest:
+        prov.add_input(args.manifest, role="manifest", md5=stats["manifest_md5"])
+    parsed_paths = present["parsed_path"].tolist()
+    with ProcessPoolExecutor(max_workers=max(1, min(args.n_jobs, 16))) as ex:
+        parsed_md5s = list(ex.map(md5_file, parsed_paths))
+    for (_, r), m in zip(present.iterrows(), parsed_md5s):
+        prov.add_input(r["parsed_path"], role="parsed_bc1_donor_bc0", md5=m, sample_id=r["sample_id"],
+                       sequencing_date=str(r["sequencing_date"]), pcr_replicate_id=r["pcr_replicate_id"])
+    prov.set_parameters(edit_distances=thr, min_pcr_replicates=args.min_pcr_replicates,
+                        attach_dominance=args.attach_dominance, accumulate_every=args.accumulate_every,
+                        orphan_merge=not args.no_orphan_merge, orphan_star_guard=not args.no_orphan_star_guard,
+                        n_jobs=args.n_jobs, bc1_orientation=BC1_ORIENTATION, tier_columns=TIER_COLS)
+    prov.set_counts(**{k: stats[k] for k in (
+        "samples_defined", "samples_present", "pcr_replicate_ids", "sequencing_runs",
+        "links_after_aggregation", "suffix_attach", "orphan_merge", "links_out", "bc1_out",
+        "reads_in", "reads_set_aside", "reads_out", "support_tier_links", "support_tier_bc1")})
+    prov.add_output(args.output_collapsed, rows=int(len(acc)))
+    for extra in (args.output_purity, f"{args.output_collapsed}.stats.json",
+                  f"{args.output_collapsed}.replicate_ids.tsv", f"{args.output_collapsed}.bc1_to_root.tsv",
+                  f"{args.output_collapsed}.setaside.tsv"):
+        if Path(extra).is_file():
+            prov.add_output(extra)
+    log(f"sidecar: {prov.write()}")
     log("done")
 
 
