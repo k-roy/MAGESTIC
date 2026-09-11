@@ -409,3 +409,272 @@ def attach_short_donors(df: pd.DataFrame, seq_col: str, rank_col: str,
     df["donor_suffix_ambiguous"] = amb
     df["donor_lengths_observed"] = lobs
     return df.loc[~drop].reset_index(drop=True), stats
+
+
+# ---------------------------------------------------------------------------
+# Orphan bc1 merge (the X1 defect)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. The three collapses above merge a bc1 sequencing error into its parent only when the
+# other two fields match EXACTLY (they group by (donor, bc0) and peel similar bc1 within the group). A
+# 238-nt donor read rarely repeats exactly, so a bc1 error whose donor read also carries an error is
+# never grouped with its parent and survives as its own "orphan" barcode. Evidence that the minor member
+# really is a read error of the major: planning 31b_x1_mechanism.py.
+#
+# Kevin, 2026-09-10: "can we merge them back into their parents for count purposes?" -- yes, and this is
+# where it belongs, beside the other collapses, rather than in a post-hoc script run against the shipped
+# reference table (PIPELINE_CORRECTNESS_POLICY.md §1: a repair applied after the fact protects one
+# consumer and leaves the split barcodes on disk for everyone else).
+#
+# 🔴 THE STAR-ONLY GUARD. Accepted pairs form a GRAPH: a barcode can be the minor of one pair and the
+# major of another, so naive connected components merge transitively and produce components whose
+# members are up to Hamming distance 8 apart -- far beyond anything a single read error explains. Every
+# merged member must therefore have DIRECT pairwise evidence against the component root (a "star", not a
+# chain). Measured on the 2026-09-10 reference table, that keeps 91.5% of merges and removes the chains.
+#
+# WHAT IS AND IS NOT CHANGED. Counts and the per-tier count columns are SUMMED; replicate/run/library
+# membership is bitwise-ORed, i.e. a set UNION, never a sum -- re-sequencing the same PCR replicate is
+# not new evidence, and support_tier is recomputed from the union afterwards. Measured effect on the
+# 2026-09-10 table: 1,188,500 accepted pairs remove 1,075,901 barcodes (20.2% of them) but move only
+# 1,308,605 reads (0.34%). It is a barcode-list correction, not a count correction.
+
+
+def _bc1_hamming1_pairs(bc1: np.ndarray) -> np.ndarray:
+    """Every pair of indices whose 20-nt bc1 differ by exactly one SUBSTITUTION.
+
+    Wildcard-key method: a 20-mer has 20 one-position-masked keys, and two sequences are Hamming-1 iff
+    they share a masked key. Sorting 20N keys finds every pair in O(N log N) instead of O(N^2).
+    Requires clean 20-nt ACGT barcodes; callers filter first.
+    """
+    n = len(bc1)
+    if n < 2:
+        return np.empty((0, 2), dtype=np.int64)
+    lut = np.zeros(256, dtype=np.uint64)
+    lut[[ord(c) for c in "ACGT"]] = np.arange(4, dtype=np.uint64)
+    A = lut[np.frombuffer("".join(bc1).encode(), dtype=np.uint8).reshape(n, 20)]
+    code = np.zeros(n, dtype=np.uint64)
+    for j in range(20):
+        code |= A[:, j] << np.uint64(2 * j)
+    keys = np.concatenate([(code & ~np.uint64(3 << (2 * j))) | np.uint64(j << 42) for j in range(20)])
+    idx = np.tile(np.arange(n, dtype=np.int64), 20)
+    order = np.argsort(keys, kind="stable")
+    keys, idx = keys[order], idx[order]
+    brk = np.flatnonzero(np.diff(keys)) + 1
+    out = []
+    for s, e in zip(np.r_[0, brk], np.r_[brk, len(keys)]):
+        if e - s < 2:
+            continue
+        m = idx[s:e]
+        for u in range(len(m)):
+            for v in range(u + 1, len(m)):
+                a, b = m[u], m[v]
+                out.append((a, b) if a < b else (b, a))
+    if not out:
+        return np.empty((0, 2), dtype=np.int64)
+    return np.unique(np.array(out, dtype=np.int64), axis=0)
+
+
+def _edit_le1(a: str, b: str) -> bool:
+    """True when a and b are within one substitution, insertion or deletion."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if la == lb:
+        d = 0
+        for x, y in zip(a, b):
+            if x != y:
+                d += 1
+                if d > 1:
+                    return False
+        return d == 1
+    if abs(la - lb) != 1:
+        return False
+    if la > lb:
+        a, b = b, a
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    return a[i:] == b[i + 1:]
+
+
+def _donor_compatible(x, y, max_mismatch: int) -> bool:
+    """Two donor reads can be the same molecule: identical, one a suffix of the other (a 2x150 read of a
+    2x300 parent), or the same length within ``max_mismatch`` substitutions."""
+    if not (isinstance(x, str) and isinstance(y, str)) or not x or not y:
+        return False
+    if x == y:
+        return True
+    s, l = (x, y) if len(x) <= len(y) else (y, x)
+    if len(s) != len(l):
+        return l.endswith(s)
+    d = 0
+    for p, q in zip(s, l):
+        if p != q:
+            d += 1
+            if d > max_mismatch:
+                return False
+    return True
+
+
+def merge_orphan_bc1(df: pd.DataFrame, rank_col: str, sum_cols: Sequence[str],
+                     or_cols: Sequence[str], preserve_cols: Sequence[str] = (),
+                     bc1_col: str = "bc1", donor_col: str = "donor", bc0_col: str = "bc0",
+                     donor_max_mismatch: int = 5, star_guard: bool = True):
+    """Merge orphan bc1 into their parents, then re-aggregate. Returns ``(df, stats, bc1_to_root)``.
+
+    A candidate pair is two bc1 at Hamming 1. It is ACCEPTED when **some** link of one and **some** link
+    of the other have bc0 within one edit and compatible donors -- every link of each barcode is tried,
+    not just its most abundant one, because an orphan's dominant link is not always the one carrying the
+    evidence. The accepted root link (highest-count matching row of the root) is remembered per pair.
+
+    The component root is the bc1 with the highest total ``rank_col``; ties break lexicographically so
+    reruns are reproducible. With ``star_guard`` (the default) a member joins only if the (member, root)
+    pair was itself accepted, so every merge rests on direct evidence rather than a transitive chain --
+    naive connected components produced components spanning Hamming distance 8.
+
+    Re-keying the bc1 alone does not merge the link: the premise of an orphan is that its donor AND bc0
+    reads also carry errors, which is exactly why the exact-key collapses missed it, so after re-keying
+    the rows still differ and ``aggregate_links`` keeps them apart. Each row of a re-keyed bc1 is
+    therefore snapped onto the accepted root link when it is individually compatible with it, by the same
+    two tests that accepted the pair. Any other link of that barcode keeps its own donor and bc0.
+
+    ``bc1_to_root`` is returned so downstream tables keyed on bc1 -- the screen counts matrix above all --
+    can be re-keyed identically instead of re-deriving the merge and possibly disagreeing.
+    """
+    stats: Dict[str, object] = {"rows_in": int(len(df)), "bc1_in": int(df[bc1_col].nunique()),
+                                "reads_in": int(df[rank_col].sum()), "star_guard": bool(star_guard),
+                                "donor_max_mismatch": int(donor_max_mismatch)}
+    empty_map = pd.DataFrame({bc1_col: pd.Series(dtype=str), "bc1_root": pd.Series(dtype=str)})
+
+    def _unchanged(extra=None):
+        stats.update(accepted_pairs=0, components_merged=0, bc1_removed=0, reads_moved=0,
+                     rows_snapped_to_root_link=0, rows_out=int(len(df)),
+                     bc1_out=int(df[bc1_col].nunique()) if len(df) else 0,
+                     reads_out=int(df[rank_col].sum()) if len(df) else 0)
+        if extra:
+            stats.update(extra)
+        return df, stats, empty_map
+
+    if df.empty:
+        return _unchanged()
+
+    clean_mask = df[bc1_col].astype(str).str.fullmatch("[ACGT]{20}").fillna(False).to_numpy()
+    sub = df[clean_mask]
+    bc1v = np.array(sorted(sub[bc1_col].unique()))
+    stats["bc1_clean_20nt"] = int(len(bc1v))
+    if len(bc1v) < 2:
+        return _unchanged()
+
+    pos = {b: i for i, b in enumerate(bc1v)}
+    # per-bc1 list of (donor, bc0, counts), most abundant first
+    links: List[List[Tuple[object, object, int]]] = [[] for _ in bc1v]
+    srt = sub.sort_values(rank_col, ascending=False)
+    for b, d, c0, ct in zip(srt[bc1_col].to_numpy(), srt[donor_col].to_numpy(),
+                            srt[bc0_col].to_numpy(), srt[rank_col].to_numpy()):
+        links[pos[b]].append((d, c0, int(ct)))
+    totv = np.array([sum(x[2] for x in L) for L in links], dtype=np.int64)
+
+    pairs = _bc1_hamming1_pairs(bc1v)
+    stats["hamming1_bc1_pairs"] = int(len(pairs))
+
+    accepted: Dict[Tuple[int, int], None] = {}
+    best_link: Dict[Tuple[int, int], Tuple[object, object]] = {}   # (member, root) -> root's matched link
+    for a, b in pairs:
+        a, b = int(a), int(b)
+        hit = None
+        for da, ba, _ca in links[a]:
+            for db, bb, _cb in links[b]:
+                if (isinstance(ba, str) and isinstance(bb, str) and _edit_le1(ba, bb)
+                        and _donor_compatible(da, db, donor_max_mismatch)):
+                    hit = ((da, ba), (db, bb))
+                    break
+            if hit:
+                break
+        if hit is None:
+            continue
+        accepted[(a, b)] = None
+        best_link[(a, b)] = hit[1]      # b's link, used when b is the root
+        best_link[(b, a)] = hit[0]      # a's link, used when a is the root
+    stats["accepted_pairs"] = len(accepted)
+    if not accepted:
+        return _unchanged()
+
+    parent = np.arange(len(bc1v), dtype=np.int64)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in accepted:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    comp = np.array([find(i) for i in range(len(bc1v))], dtype=np.int64)
+
+    order = np.lexsort((bc1v, -totv))
+    root_of_comp: Dict[int, int] = {}
+    for i in order:
+        c = int(comp[i])
+        if c not in root_of_comp:
+            root_of_comp[c] = int(i)
+
+    remap: Dict[str, str] = {}
+    root_link: Dict[str, Tuple[object, object]] = {}
+    dropped_by_guard = 0
+    for i in range(len(bc1v)):
+        r = root_of_comp[int(comp[i])]
+        if i == r:
+            continue
+        key = (i, r) if (i, r) in best_link else ((r, i) if (r, i) in best_link else None)
+        direct = ((min(i, r), max(i, r)) in accepted)
+        if star_guard and not direct:
+            dropped_by_guard += 1
+            continue
+        remap[bc1v[i]] = bc1v[r]
+        if direct:
+            root_link[bc1v[i]] = best_link[(i, r)]
+        else:                       # star_guard off: no direct evidence, so do not snap the link
+            root_link[bc1v[i]] = (None, None)
+    stats["members_dropped_by_star_guard"] = int(dropped_by_guard)
+    stats["bc1_remapped"] = int(len(remap))
+
+    bc1_to_root = pd.DataFrame({bc1_col: list(remap), "bc1_root": [remap[b] for b in remap]})
+    if bc1_to_root.empty:
+        return _unchanged()
+
+    totals = pd.Series(totv, index=bc1v)
+    reads_moved = int(totals.reindex(bc1_to_root[bc1_col]).fillna(0).sum())
+
+    out = df.copy()
+    bc1_arr = out[bc1_col].to_numpy()
+    aff = np.array([b in remap for b in bc1_arr])
+    snapped = 0
+    if aff.any():
+        d_new = out[donor_col].to_numpy(copy=True)
+        b_new = out[bc0_col].to_numpy(copy=True)
+        for i in np.flatnonzero(aff):
+            rd, rb = root_link[bc1_arr[i]]
+            if rd is None:
+                continue
+            if (_donor_compatible(d_new[i], rd, donor_max_mismatch)
+                    and isinstance(b_new[i], str) and isinstance(rb, str) and _edit_le1(b_new[i], rb)):
+                d_new[i], b_new[i] = rd, rb
+                snapped += 1
+        out[donor_col] = d_new
+        out[bc0_col] = b_new
+    stats["rows_snapped_to_root_link"] = int(snapped)
+    out[bc1_col] = out[bc1_col].map(lambda x: remap.get(x, x))
+    out = aggregate_links(out, [bc1_col, donor_col, bc0_col], rank_col, sum_cols, or_cols, preserve_cols)
+
+    stats.update(
+        components_merged=int(len({root_of_comp[int(comp[pos[b]])] for b in remap})),
+        bc1_removed=int(len(remap)),
+        reads_moved=reads_moved,
+        rows_out=int(len(out)), bc1_out=int(out[bc1_col].nunique()),
+        reads_out=int(out[rank_col].sum()),
+    )
+    if stats["reads_out"] != stats["reads_in"]:   # explicit: survives python -O
+        raise RuntimeError(f"orphan merge lost reads: in {stats['reads_in']} != out {stats['reads_out']}")
+    return out, stats, bc1_to_root

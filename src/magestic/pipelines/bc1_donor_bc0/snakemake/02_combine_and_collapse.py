@@ -58,7 +58,7 @@ from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS, BC1_ORIENTATION
 from magestic.pipelines.bc1_donor_bc0.readers.data_loader import (
     PCR_REPLICATE_ID_FIELDS, build_pcr_replicate_id)
 from magestic.pipelines.bc1_donor_bc0.core.link_collapse import (
-    aggregate_links, collapse_links, attach_short_donors,
+    aggregate_links, collapse_links, attach_short_donors, merge_orphan_bc1,
     mask_columns, masks_for_codes, popcount_rows, decode_masks)
 
 TIER_COLS = list(TIER_COUNT_COLUMNS)
@@ -242,6 +242,15 @@ def main():
     parser.add_argument("--allow-missing", action="store_true",
                         help="Proceed when some parsed files are absent (recorded, not silent)")
     parser.add_argument("--n-jobs", type=int, default=24)
+    parser.add_argument("--no-orphan-merge", action="store_true",
+                        help="Skip the orphan-bc1 merge (Kevin 2026-09-10, decision C). By default a bc1 at "
+                             "Hamming 1 from another whose bc0 is within one edit and whose donor is compatible "
+                             "is merged into it: the three exact-key collapses above cannot catch these because "
+                             "a 238-nt donor read rarely repeats exactly (the X1 defect).")
+    parser.add_argument("--no-orphan-star-guard", action="store_true",
+                        help="Merge whole connected components instead of requiring direct evidence against the "
+                             "component root. NOT recommended: accepted pairs form a graph, and transitive "
+                             "merging produced components spanning Hamming distance 8.")
     parser.add_argument("--attach-dominance", type=float, default=3.0,
                         help="attach a short donor to the top of several long candidates when it has >= this "
                              "multiple of the runner-up's reads (inf = never; 29_)")
@@ -328,6 +337,20 @@ def main():
                          threshold=args.bc0_edit_distance, n_jobs=args.n_jobs)
     log(f"after Step-4 collapses: {len(acc):,} links, {acc['bc1'].nunique():,} bc1")
 
+    # --- Step 5: orphan-bc1 merge (Kevin 2026-09-10, decision C) ---
+    # The collapses above group by an EXACT (donor, bc0) key, so a bc1 read error whose donor read also
+    # carries an error is never grouped with its parent and survives as its own barcode. Merge it here,
+    # beside the other collapses -- not in a post-hoc script against the shipped table.
+    orphan_stats, bc1_to_root = {"skipped": True}, pd.DataFrame(columns=["bc1", "bc1_root"])
+    if not args.no_orphan_merge:
+        acc, orphan_stats, bc1_to_root = merge_orphan_bc1(
+            acc, "counts", SUM_COLS, or_cols, px,
+            donor_max_mismatch=args.donor_edit_distance,
+            star_guard=not args.no_orphan_star_guard)
+        log(f"orphan merge: {orphan_stats.get('accepted_pairs', 0):,} accepted pairs removed "
+            f"{orphan_stats.get('bc1_removed', 0):,} bc1 and moved {orphan_stats.get('reads_moved', 0):,} reads; "
+            f"{len(acc):,} links, {acc['bc1'].nunique():,} bc1 remain")
+
     # --- replicate support: exact, labeled ---
     masks = acc[mcols].to_numpy(dtype=np.uint64)
     acc["num_PCR_replicates"] = popcount_rows(masks)
@@ -380,6 +403,10 @@ def main():
         n_samples=("sample_id", "size"), sample_ids=("sample_id", lambda s: ";".join(sorted(s))),
         sequencing_dates=("sequencing_date", lambda s: ";".join(sorted(set(s))))).reset_index()
     rep_legend.to_csv(f"{args.output_collapsed}.replicate_ids.tsv", sep="\t", index=False)
+    # The bc1 -> root map is a first-class OUTPUT, not a diagnostic: every downstream table keyed on bc1
+    # (the screen counts matrix above all) must be re-keyed with exactly this map rather than re-deriving
+    # the merge and possibly disagreeing with it.
+    bc1_to_root.to_csv(f"{args.output_collapsed}.bc1_to_root.tsv", sep="\t", index=False)
     tier_counts = acc["support_tier"].value_counts().to_dict()
     stats = {
         "argv": sys.argv, "manifest": args.manifest,
@@ -395,6 +422,8 @@ def main():
         "reads_set_aside": {k: int(aside_df[k].sum()) for k in aside_df.columns if k.startswith("reads_no_")},
         "reads_out": int(acc["counts"].sum()),
         "bc1_orientation": BC1_ORIENTATION, "tier_columns": TIER_COLS,
+        "orphan_merge": orphan_stats,
+        "bc1_to_root_map": f"{args.output_collapsed}.bc1_to_root.tsv",
         "edit_distances": thr, "attach_dominance": args.attach_dominance,
         "zero_link_samples": [a["sample_id"] for a in asides if a.get("rows_out", 0) == 0],
         "elapsed_s": round(time.time() - t0, 1),
