@@ -75,6 +75,8 @@ class PipelineConfig:
     has_2x150_data: bool = False
     has_2x300_data: bool = False
     has_gdb_data: bool = False
+    #: Result of magestic.pipelines.bc1_donor_bc0.data_sources.discover -- what was found and how.
+    data_sources: Optional[object] = None
 
     # Input paths
     data_2x150_dir: Optional[Path] = None
@@ -162,13 +164,18 @@ class PipelineConfig:
 
     @classmethod
     def from_project_dir(cls, project_dir: Path,
-                         common_dir: Optional[Path] = None) -> "PipelineConfig":
+                         common_dir: Optional[Path] = None,
+                         parsed_dir: Optional[Path] = None,
+                         data_2x150_dir: Optional[Path] = None,
+                         data_2x300_dir: Optional[Path] = None) -> "PipelineConfig":
         """
         Create configuration by auto-detecting available data sources.
 
         Args:
             project_dir: Root directory of the project
             common_dir: Directory containing common resources (oligo designs, etc.)
+            parsed_dir: Explicit directory of parsed ``*_bc1_donor_bc0.tsv`` files (overrides detection)
+            data_2x150_dir / data_2x300_dir: Explicit per-read-layout directories (override everything)
 
         Returns:
             PipelineConfig with detected settings
@@ -184,29 +191,38 @@ class PipelineConfig:
             project_dir=project_dir,
         )
 
-        # Detect 2x150 data
-        possible_2x150_paths = [
-            project_dir / "processed_data" / "bc1_donor_bc0" / "2x150",
-            project_dir / "scripts" / "bc1_donor_bc0" / "scripts" / "20251125_2x150_AVITI_run",
-        ]
-        for path in possible_2x150_paths:
-            if path.exists():
-                config.has_2x150_data = True
-                config.data_2x150_dir = path
-                logger.info(f"Found 2x150 data at {path}")
-                break
-
-        # Detect 2x300 data
-        possible_2x300_paths = [
-            project_dir / "processed_data" / "bc1_donor_bc0" / "2x300",
-            project_dir / "scripts" / "bc1_donor_bc0" / "scripts" / "20251212_2x300_AVITI_run",
-        ]
-        for path in possible_2x300_paths:
-            if path.exists():
-                config.has_2x300_data = True
-                config.data_2x300_dir = path
-                logger.info(f"Found 2x300 data at {path}")
-                break
+        # --- Detect the parsed bc1-donor-bc0 data, WHATEVER layout the screen uses -------------
+        # FIX 2026-09-11: this used to test four hard-coded paths -- `processed_data/bc1_donor_bc0/{2x150,2x300}`
+        # and two dated `scripts/...` directories. Only ONE screen on Oak (20240806_yL406) is laid out that way;
+        # four others keep their parsed TSVs in `processed_data/bc1_donor_bc0/parsed/`, so detection found
+        # nothing for them and the response was a tree of 772 SYMLINKS faking the expected layout under
+        # `bc1_donor_bc0_PACKAGE_RERUN/`. That shim violates the no-links-on-Oak policy, it had already been
+        # removed once from yL406 and come back 2.7x larger in 20250912, and -- measured -- it was ALSO silently
+        # incomplete: 192 of 768 real parsed files had no link pointing at them, so a consumer reading through it
+        # saw 576 files and no error. See magestic.pipelines.bc1_donor_bc0.data_sources for the full record.
+        # The read layout comes from the keyfile's `inner_product_size_bp`, which is text, so it never has to be
+        # encoded in a directory name.
+        from .data_sources import discover as _discover_sources
+        sources = _discover_sources(
+            project_dir,
+            parsed_dir=parsed_dir,
+            data_2x150_dir=data_2x150_dir,
+            data_2x300_dir=data_2x300_dir,
+        )
+        config.data_sources = sources
+        for layout, attr_has, attr_dir in (("2x150", "has_2x150_data", "data_2x150_dir"),
+                                           ("2x300", "has_2x300_data", "data_2x300_dir")):
+            files = sources.files_by_layout.get(layout)
+            if files:
+                setattr(config, attr_has, True)
+                setattr(config, attr_dir, sources.dirs_by_layout.get(layout, files[0].parent))
+        logger.info("bc1-donor-bc0 data sources: %s", sources.describe())
+        if sources.unclassified:
+            logger.warning(
+                "%d parsed file(s) carry a sequencing date no keyfile explains, e.g. %s -- they are NOT "
+                "loaded. Add the run to a plate keyfile (sequencing_date + inner_product_size_bp) rather "
+                "than moving or linking the files.",
+                len(sources.unclassified), sources.unclassified[0].name)
 
         # Detect gdb data
         possible_gdb_paths = [

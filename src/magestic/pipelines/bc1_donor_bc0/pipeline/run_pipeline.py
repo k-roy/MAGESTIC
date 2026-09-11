@@ -178,6 +178,23 @@ Examples:
              '(default: canonical harmonized table)'
     )
 
+    # Explicit data-source overrides (added 2026-09-11). Their ABSENCE is why a 772-symlink shim was built
+    # on Oak to fake the one directory layout the detector recognised: there was no way to point the
+    # pipeline at a directory. Policy is to fix the tool, not to shim the filesystem.
+    parser.add_argument(
+        '--parsed-dir', type=Path, default=None,
+        help='Directory of parsed *_bc1_donor_bc0.tsv files. Overrides auto-detection; the read layout is '
+             'taken from the keyfile inner_product_size_bp rather than from directory names.'
+    )
+    parser.add_argument(
+        '--data-2x150-dir', type=Path, default=None,
+        help='Explicit 2x150 parsed directory (overrides auto-detection and --parsed-dir).'
+    )
+    parser.add_argument(
+        '--data-2x300-dir', type=Path, default=None,
+        help='Explicit 2x300 parsed directory (overrides auto-detection and --parsed-dir).'
+    )
+
     return parser.parse_args()
 
 
@@ -580,7 +597,12 @@ def run_pipeline(args):
 
     # Initialize configuration
     logger.info(f"\nProject directory: {args.project_dir}")
-    config = PipelineConfig.from_project_dir(args.project_dir, args.common_dir)
+    config = PipelineConfig.from_project_dir(
+        args.project_dir, args.common_dir,
+        parsed_dir=getattr(args, 'parsed_dir', None),
+        data_2x150_dir=getattr(args, 'data_2x150_dir', None),
+        data_2x300_dir=getattr(args, 'data_2x300_dir', None),
+    )
 
     if args.output_dir:
         config.output_dir = args.output_dir
