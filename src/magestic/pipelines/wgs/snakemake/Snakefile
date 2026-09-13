@@ -209,7 +209,12 @@ INTERMEDIATE_DIR = under_root("intermediate", "intermediate_data")
 # therefore exclude `<processed>/logs/` alongside the pre-registered
 # `*.provenance.json` / `PROVENANCE.json` carve-out. Source of nondeterminism:
 # wall-clock time and per-rule scheduling. Everything else is diffed unmodified.
-LOGS_DIR = PROCESSED_DIR / LOGS_SUBDIR
+# 🔴 INTERMEDIATE, not PROCESSED — must track `config.WGSPaths.logs`. These logs are
+# written by path (B) only and carry wall-clock text, so inside `processed/` they make a
+# literal diff of the two paths' processed trees differ on every run and be reported as a
+# §4 parity violation (F6) when it is nothing of the kind. Keeping them out of the
+# compared tree removes the need for a second pre-registered carve-out.
+LOGS_DIR = INTERMEDIATE_DIR / LOGS_SUBDIR
 
 BC1_DIR = PROCESSED_DIR / BC1_SUBDIR
 DONOR_DIR = PROCESSED_DIR / DONOR_PRECALL_SUBDIR

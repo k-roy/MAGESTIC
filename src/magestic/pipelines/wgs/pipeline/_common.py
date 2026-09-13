@@ -27,6 +27,7 @@ Author: Kevin R. Roy
 from __future__ import annotations
 
 import csv
+import itertools
 import logging
 import os
 import shutil
@@ -38,6 +39,10 @@ from ..config import WGSConfig
 from ..core.manifest import WGSSample, load_manifest
 
 logger = logging.getLogger(__name__)
+
+#: Per-process counter making every `atomic()` temp file name unique, so two writers of
+#: the same destination never share a temp path (see `atomic`).
+_TMP_COUNTER = itertools.count()
 
 
 class GateError(RuntimeError):
@@ -168,7 +173,17 @@ def atomic(path: Path) -> Iterator[Path]:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    # 🔴 The temp name must be UNIQUE PER WRITER, not `<name>.tmp`.
+    # Several samples legitimately write the same shared artifact — the locus sidecar is
+    # written by EVERY per-sample task — and under the Snakemake path those tasks run
+    # concurrently. With a fixed temp name, writer A's `os.replace` consumes the very
+    # file writer B is about to replace, and B dies with
+    #   FileNotFoundError: ... 'barcode_locus.sidecar.tmp' -> 'barcode_locus.sidecar'
+    # Measured: this took down path (B) at `--cores 8` while the serial path (A) never
+    # hit it, which is exactly the §6 array-task concurrency this helper exists to
+    # survive. `os.replace` onto the shared destination stays atomic and last-writer-wins,
+    # which is correct because the content is deterministic.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{next(_TMP_COUNTER)}.tmp")
     try:
         yield tmp
         os.replace(tmp, path)

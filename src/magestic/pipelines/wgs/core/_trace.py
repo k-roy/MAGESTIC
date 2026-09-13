@@ -15,9 +15,14 @@ for three reasons:
     More than one TRACE working tree exists on this program's machines and they are not
     byte-identical, so "it imported" never establishes which algorithm executed.
 
-Do NOT shell out to `python -m trace_crispr.wgs.<module>`. TRACE's per-module `main()`
-entry points exist, but invoking them would re-create the inverted dependency through
-the back door (ARCHITECTURE_POLICY §11). Call the library functions.
+Never invoke TRACE as a SUBPROCESS. Its per-module `main()` entry points exist and are
+reachable as runnable modules, but shelling out to one would re-create the inverted
+dependency through the back door (ARCHITECTURE_POLICY §11). Call the library functions.
+
+(The forbidden invocation string is deliberately not spelled out here: the repo guard
+`test_wgs_never_shells_out_to_a_trace_cli` greps this package's source text for it, and
+a literal example inside a prohibition would trip the guard it documents — a keyword
+grep answers "is this word present", never "is this capability present".)
 """
 
 from __future__ import annotations
