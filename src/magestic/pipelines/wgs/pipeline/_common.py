@@ -355,12 +355,30 @@ def write_provenance(
     every step's importability. There is deliberately no `except ImportError`
     fallback: a missing sidecar fails acceptance criterion P6.
     """
-    from ..qc.provenance import write_step_provenance
+    from ..qc.provenance import SIDECAR_SUFFIX, write_run_provenance, write_step_provenance
 
-    return write_step_provenance(
+    sidecar = write_step_provenance(
         step,
         output,
         inputs=inputs or {},
         parameters=parameters or {},
         counts=counts or {},
     )
+
+    # Refresh the RUN-level `PROVENANCE.json` indexing every step sidecar in this
+    # directory. Done here, on every step-sidecar write, rather than at the end of
+    # `run_pipeline.run()`, because only the DIRECT path (A) executes `run()` — the
+    # SNAKEMAKE path (B) invokes per-step console scripts and would otherwise never
+    # produce a run-level sidecar at all. Acceptance criterion P6 names
+    # `PROVENANCE.json` specifically and is evaluated on path B's output, so writing it
+    # in the one place both paths reach is what makes the two paths equivalent here.
+    # Both sidecars are inside §4's single pre-registered parity carve-out, so this
+    # cannot perturb the byte-identity comparison.
+    directory = Path(output).parent
+    write_run_provenance(
+        directory,
+        run_name=directory.name,
+        step_sidecars=sorted(str(p) for p in directory.glob("*" + SIDECAR_SUFFIX)),
+        description="magestic.pipelines.wgs run-level index (refreshed by each step).",
+    )
+    return sidecar
