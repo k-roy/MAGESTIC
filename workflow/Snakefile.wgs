@@ -1,0 +1,67 @@
+"""
+MAGESTIC wgs — repo-level entry point for the WGS orchestration workflow.
+=============================================================================
+ONE packaged workflow, parameterized entirely by a per-cohort config YAML, in
+the same shape as `workflow/Snakefile` (bc1_donor_bc0): the rules live once, in
+the package, and a cohort is just a config file.
+
+Run a cohort:
+    cd <magestic>/workflow
+    snakemake --snakefile Snakefile.wgs \
+              --workflow-profile profiles/sherlock_wgs \
+              --config config=config/screens/<cohort>_wgs.yaml steps=1
+
+Add a cohort (NO Snakefile edits):
+    cp config/screens/20260728_yKR888_v11_cohort_wgs.yaml config/screens/<cohort>_wgs.yaml
+    # edit paths/, manifest, locus, resources
+    snakemake --snakefile Snakefile.wgs --config config=config/screens/<cohort>_wgs.yaml steps=1
+
+🔴 The cohort YAML is passed as `--config config=<yaml>`, NOT `--configfile <yaml>`.
+Each step CLI re-reads that same YAML through magestic's `load_config()`, which is
+what keeps path (A) and path (B) byte-identical (ARCHITECTURE_POLICY §4). Passing
+it with `--configfile` would make snakemake a second interpreter of the same file.
+`--config` also carries this workflow's own knobs, which cannot live in the cohort
+YAML because `load_config()` rejects any top-level key it does not know:
+`steps=1,3,4` mirrors path (A)'s `--steps`. Keep `--config` LAST on the command
+line — it takes a list, so a positional target written after it is swallowed as
+another `key=value` entry.
+
+The rules come from the canonical rule set in this same repo
+(src/magestic/pipelines/wgs/snakemake/Snakefile), resolved RELATIVE TO THIS FILE —
+so there is no dependency on `magestic` being importable inside the snakemake
+conda env. The step CLIs themselves, of course, need it installed.
+"""
+from pathlib import Path
+
+WORKFLOW_DIR = Path(workflow.basedir)
+WGS_SNAKEFILE = (
+    WORKFLOW_DIR.parent / "src" / "magestic" / "pipelines" / "wgs" / "snakemake" / "Snakefile"
+)
+
+
+include: str(WGS_SNAKEFILE)
+
+
+localrules:
+    wgs_all,
+
+
+rule wgs_all:
+    """Default target — the same cohort tables as the included `all` rule.
+
+    🔴 This rule is NOT redundant, and deleting it makes the workflow silently do
+    nothing. `include:` DELIBERATELY discards whatever default target the included
+    file set: `Workflow.include()` saves `self.default_target` before parsing the
+    included file and restores it afterwards unless `overwrite_default_target=True`,
+    which only the `module` mechanism passes. With no rule defined in THIS file the
+    target list is empty, so `snakemake --snakefile Snakefile.wgs` reports
+    "Nothing to be done" and exits 0 having produced nothing — measured on
+    snakemake 9.16.3, which is exactly the silent-success anti-pattern of §7.
+
+    The `module` + `use rule * from wgs as *` alternative does preserve the default
+    target, but re-instantiates the rules in THIS namespace, where the included
+    file's globals do not exist: every rule then fails at run time with
+    "NameError: The name 'CONFIG_PATH' is unknown in this context". Also measured.
+    """
+    input:
+        TARGETS,

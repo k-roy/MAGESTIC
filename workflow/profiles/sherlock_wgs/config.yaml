@@ -1,0 +1,49 @@
+# Snakemake profile for the wgs pipeline on the lab cluster
+# (snakemake 9.x + executor-plugin-slurm 2.x).
+#
+# Use:  snakemake --snakefile Snakefile.wgs \
+#                 --config config=config/screens/<cohort>_wgs.yaml steps=1 \
+#                 --workflow-profile profiles/sherlock_wgs
+#
+# 🔴 DELIBERATELY NOT INHERITED FROM profiles/sherlock/config.yaml: that profile
+# sets `slurm_extra: "--constraint=CPU_GEN:..."` as an "AVX-512 SIGILL guard".
+# That guard was RETRACTED 2026-08-06 — the lab partition's nodes carry none of
+# those CPU generations, so the constraint matches NO node in it: a job asking
+# for the lab partition hard-fails, and `<lab>,owners` is SILENTLY EVICTED to the
+# preemptible owners queue (measured). Do not add `--constraint` or `--exclude`
+# here. The wgs env is immune anyway: its numpy is built on a dynamic-arch
+# OpenBLAS that selects its kernel at run time.
+executor: slurm
+jobs: 100                       # max concurrent SLURM jobs
+
+default-resources:
+  slurm_account: "mylab"
+  slurm_partition: "mylab,owners"
+  runtime: 60                   # MINUTES — the owners queue preempts, so every task
+                                #   must be a <=60 min idempotent unit of work.
+                                #   Per-rule values come from the cohort YAML's
+                                #   `resources.<step>.time` ("HH:MM:SS"), which the
+                                #   workflow converts to minutes for this plugin.
+  mem_mb: 16000
+  cpus_per_task: 1
+
+# --- Chunking: many short per-sample tasks -> few 20-60 min cluster jobs (§6) --
+# Each per-sample rule carries a `group:`; `--group-components <group>=N` packs N
+# samples into ONE cluster job. Group size is SCHEDULING ONLY — it changes neither
+# the outputs nor their order (shards are always concatenated in manifest order).
+#
+# Arithmetic: N = target_minutes / minutes_per_sample.
+# 🔴 NOT VERIFIED — minutes_per_sample has not been measured for any stage. The
+# values below assume a placeholder ~1.5 min/sample for stage 1 and ~4 min/sample
+# for stage 3, giving ~36 min and ~32 min per job. The §7 smoke over 288 BAMs is
+# what measures it; re-derive N from that run's wall-clock before a large cohort.
+group-components:
+  - wgs_step_1=24
+  - wgs_step_2=24
+  - wgs_step_3=8
+  - wgs_step_4=24
+
+restart-times: 2                # owners-queue preemption resilience
+rerun-incomplete: true
+printshellcmds: true
+latency-wait: 60                # shared-filesystem metadata lag on job completion
