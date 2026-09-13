@@ -2,9 +2,17 @@
 magestic.pipelines.wgs.readers.wgs_calls — THE REDI SEAM (spec §6).
 
 One loader that normalizes **either** a TRACE `bc1_consensus` emit table **or** the
-legacy wide WGS table into a single schema, so `redi/wgs_check` CONSUMES the shared
-module instead of re-implementing it (ARCHITECTURE_POLICY §11: exactly one home per
-algorithm).
+legacy wide WGS table into a single schema, so that `redi/wgs_check` CAN consume the
+shared module instead of re-implementing it (ARCHITECTURE_POLICY §11: exactly one home
+per algorithm).
+
+🔴 **NOT YET WIRED, as of 2026-09-13. This file states a capability, not a fact.**
+`redi/wgs_check` still defines its own `normalize_wgs_bc1` and `compare_to_wgs`, and
+nothing outside this package imports `load_wgs_bc1_calls`. **§11's "exactly one home"
+is therefore NOT met on the REDI seam** — two homes exist today. An earlier revision of
+this docstring asserted the consumption in the present tense; that was false and is
+corrected here. Wiring the consumer is the remaining work, and until it lands this
+module is the intended seam rather than the live one.
 
 The returned frame, one row per sample:
 
