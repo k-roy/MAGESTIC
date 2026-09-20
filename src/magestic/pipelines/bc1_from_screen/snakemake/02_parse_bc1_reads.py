@@ -945,13 +945,24 @@ def main():
                     return 1
 
         except Exception as e:
-            logger.error(f"Auto-inference failed: {e}")
-            if args.bc1_prefix and args.bc1_suffix:
-                logger.warning("Falling back to provided --bc1-prefix and --bc1-suffix")
-                bc1_prefix = args.bc1_prefix
-                bc1_suffix = args.bc1_suffix
-            else:
-                return 1
+            # A FAILED INFERENCE IS NOT FATAL, and since 2026-09-09 it is barely
+            # even relevant: the inferred prefix/suffix are accepted and IGNORED,
+            # because the canonical extractor calls the layout per read from the
+            # universal downstream anchor's observed offset. Returning 1 here
+            # aborted the run BEFORE the real extractor ever executed.
+            #
+            # Measured in Phase A of the re-call (2026-09-19): 44 of 50 unit
+            # failures came through this path -- 35 on zero-byte collapsed files
+            # and 9 on near-empty wells holding a handful of off-target reads.
+            # Every one of those is an empty-well RESULT that belongs in the
+            # output as an empty table with a sidecar, not a task failure.
+            logger.warning(
+                "Auto-inference could not determine flanking sequences (%s). "
+                "Continuing anyway: the inferred values are IGNORED by the "
+                "canonical extractor, so this does not affect the call. The "
+                "anchor-tier counts below are the evidence to read.", e)
+            bc1_prefix = args.bc1_prefix or "CATGCTC"
+            bc1_suffix = args.bc1_suffix or "CCCTAGG"
     else:
         # Explicit sequences mode
         if not args.bc1_prefix or not args.bc1_suffix:
