@@ -1,4 +1,21 @@
 """
+⚠️ DEPRECATED / DEAD COPY — do not build on this file (annotated 2026-08-03).
+
+Byte-identical (md5 22ffad8b54b2732b07f86ac632d930fd) to the sibling copy in the other
+workspace, and BOTH have ZERO consumer callers: the only references are their own
+plotting/__init__.py and panels/__init__.py re-exports. Verified by grep across ~/work
+excluding .claude/worktrees/.
+
+The MAINTAINED implementation is rectify/rectify/visualize/gene_track.py (478 lines, live,
+exercised by rectify/tests/test_visualize_multi_track.py). For NEW locus/gene-model panels
+prefer DNA Features Viewer (MIT, renders into an existing matplotlib Axes) — see the
+`figure-standard` skill §5b.
+
+NOT deleted, and deliberately NOT de-duplicated across workspaces: ~/work/CLAUDE.md keeps
+workspaces distinct, so this stays as a vendored copy with provenance recorded here.
+Context: ~/work/planning/10_panel_harvest.md §3.
+"""
+"""
 Gene track panel drawing functions.
 
 This module provides functions for drawing gene structure tracks with
