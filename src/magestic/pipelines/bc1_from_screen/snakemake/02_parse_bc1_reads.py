@@ -671,6 +671,15 @@ Examples:
         "--bc1-length", type=int, default=20,
         help="BC1 barcode length (default: 20)"
     )
+    parser.add_argument(
+        "--length-tolerance", type=int, default=0,
+        help="Accept a bc1 this many bp either side of --bc1-length. DEFAULT 0 "
+             "= the exact-N20 filter. Reads rejected on length are reported in "
+             "the log and the provenance sidecar, never silently dropped. Was "
+             "an un-overridable +/-1 before 2026-09-19, which admitted 19 and "
+             "21 bp calls into every downstream statistic "
+             "(memory filter-bc1-to-exact-n20-before-any-stat)."
+    )
 
     # Auto-inference arguments
     parser.add_argument(
@@ -809,18 +818,30 @@ def parse_collapsed_fastq(
     Parse collapsed FASTQ and extract BC1 counts.
 
     Returns:
-        Tuple of (bc1_counts, total_reads, matched_reads, length_stats,
-                  tier_stats, n_records, header_formats)
-        where length_stats is a Counter of BC1 lengths, n_records is the number
-        of collapsed RECORDS read (total_reads is the number of READS they
-        represent -- the two differ by the collapse factor and conflating them
-        is the defect fixed on 2026-09-19) and header_formats is the per-record
-        tally of read-name formats, for the provenance sidecar.
+        A dict. ``n_records`` is the number of collapsed RECORDS read;
+        ``total_reads`` is the number of READS they represent. The two differ by
+        the collapse factor and conflating them was the defect fixed on
+        2026-09-19 (planning/210_bc1_recall_code_gate.md).
+
+        bc1_counts        {bc1: reads}
+        bc1_tiers         {bc1: Counter(anchor_tier -> reads)}
+        bc1_orientations  {bc1: Counter(orientation -> reads)}
+        total_reads, matched_reads, n_records
+        length_stats      Counter(accepted bc1 length -> reads)
+        reject_lengths    Counter(REJECTED bc1 length -> reads) -- never silently
+                          dropped, per handoff §4.1
+        n_rejected_n_base reads whose bc1 contained an N
+        tier_stats        Counter(anchor_tier -> reads), all reads
+        header_formats    Counter(read-name format -> records)
     """
     bc1_counts = defaultdict(int)
+    bc1_tiers = defaultdict(Counter)
+    bc1_orientations = defaultdict(Counter)
     total_reads = 0
     matched_reads = 0
     length_stats = Counter()
+    reject_lengths = Counter()
+    n_rejected_n_base = 0
     tier_stats = Counter()
     header_formats = Counter()
     n_records = 0
@@ -845,15 +866,28 @@ def parse_collapsed_fastq(
         )
         tier_stats[anchor_tier] += count
 
-        if bc1 and "N" not in bc1:
-            # Validate length is within tolerance
-            if min_bc1_len <= actual_length <= max_bc1_len:
-                bc1_counts[bc1] += count
-                matched_reads += count
-                length_stats[actual_length] += count
+        if not bc1:
+            continue
+        if "N" in bc1:
+            n_rejected_n_base += count
+            continue
+        if min_bc1_len <= actual_length <= max_bc1_len:
+            bc1_counts[bc1] += count
+            bc1_tiers[bc1][anchor_tier] += count
+            bc1_orientations[bc1][orientation] += count
+            matched_reads += count
+            length_stats[actual_length] += count
+        else:
+            reject_lengths[actual_length] += count
 
-    return (bc1_counts, total_reads, matched_reads, length_stats, tier_stats,
-            n_records, header_formats)
+    return dict(
+        bc1_counts=bc1_counts, bc1_tiers=bc1_tiers,
+        bc1_orientations=bc1_orientations, total_reads=total_reads,
+        matched_reads=matched_reads, n_records=n_records,
+        length_stats=length_stats, reject_lengths=reject_lengths,
+        n_rejected_n_base=n_rejected_n_base, tier_stats=tier_stats,
+        header_formats=header_formats,
+    )
 
 
 def main():
@@ -954,14 +988,21 @@ def main():
                            f"MIXED. The layout call is least trustworthy here.")
 
     # PASS 2 -- extract with that offset established.
-    (bc1_counts, total_reads, matched_reads, length_stats, tier_stats,
-     n_records, header_formats) = parse_collapsed_fastq(
+    stats = parse_collapsed_fastq(
         args.input,
         bc1_prefix,
         bc1_suffix,
         args.bc1_length,
+        length_tolerance=args.length_tolerance,
         established_offset=est_off
     )
+    bc1_counts = stats["bc1_counts"]
+    total_reads = stats["total_reads"]
+    matched_reads = stats["matched_reads"]
+    length_stats = stats["length_stats"]
+    tier_stats = stats["tier_stats"]
+    n_records = stats["n_records"]
+    header_formats = stats["header_formats"]
 
     match_rate = 100 * matched_reads / total_reads if total_reads > 0 else 0
     # READS and RECORDS are different quantities. Log both, always: a run whose
@@ -1010,18 +1051,61 @@ def main():
                 f"barcodes on 2021-era layouts -- check the layout call."
             )
 
+    # Reads whose bc1 was the WRONG LENGTH are reported, never silently dropped
+    # (handoff §4.1 / memory filter-bc1-to-exact-n20-before-any-stat). With the
+    # default --length-tolerance 0 this is the exact-N20 filter.
+    reject_lengths = stats["reject_lengths"]
+    n_rejected_length = sum(reject_lengths.values())
+    logger.info(f"  Length filter: tolerance +/-{args.length_tolerance} around "
+                f"{args.bc1_length} bp")
+    if n_rejected_length:
+        logger.info(f"  Rejected on length: {n_rejected_length:,} reads "
+                    f"({100*n_rejected_length/total_reads:.3f}%) -- distribution:")
+        for length in sorted(reject_lengths):
+            n = reject_lengths[length]
+            logger.info(f"    {length}bp: {n:,} ({100*n/total_reads:.3f}%)")
+    else:
+        logger.info("  Rejected on length: 0 reads")
+    if stats["n_rejected_n_base"]:
+        logger.info(f"  Rejected for an N base: {stats['n_rejected_n_base']:,} reads")
+
+    # Singleton tail and reads-per-lineage, per sample. Handoff §4.2: richness
+    # moves the WRONG WAY across an outgrowth without an error-aware view of
+    # this tail, so it is reported on every sample rather than derived later.
+    n_lineages = len(bc1_counts)
+    n_singletons = sum(1 for v in bc1_counts.values() if v == 1)
+    singleton_fraction = n_singletons / n_lineages if n_lineages else 0
+    reads_per_lineage = matched_reads / n_lineages if n_lineages else 0
+    logger.info(f"  Singletons: {n_singletons:,} of {n_lineages:,} lineages "
+                f"({100*singleton_fraction:.1f}%)")
+    logger.info(f"  Reads per lineage: {reads_per_lineage:.2f}")
+
     # Filter by minimum counts
+    n_before_min_counts = len(bc1_counts)
     if args.min_counts > 1:
         bc1_counts = {k: v for k, v in bc1_counts.items() if v >= args.min_counts}
         logger.info(f"  After min_counts filter: {len(bc1_counts):,}")
 
-    # Create output DataFrame
+    # Create output DataFrame. The anchor tier, the orientation and the layout
+    # call were computed and then DISCARDED before 2026-09-19, which is why the
+    # legacy count tables cannot be compared to each other -- a confirmed read
+    # and an unconfirmed prefix_only guess were the same row. All seven emitting
+    # tiers are written always, even when zero, so files stay joinable.
     import pandas as pd
 
-    output_df = pd.DataFrame([
-        {"bc1": bc1, "sample_name": sample_name, "counts": count}
-        for bc1, count in bc1_counts.items()
-    ])
+    bc1_tiers = stats["bc1_tiers"]
+    bc1_orientations = stats["bc1_orientations"]
+    rows = []
+    for bc1, count in bc1_counts.items():
+        tiers = bc1_tiers[bc1]
+        orients = bc1_orientations[bc1]
+        row = {"bc1": bc1, "sample_name": sample_name, "counts": count}
+        for tier in EMITTING_TIERS:
+            row[f"n_{tier}"] = tiers.get(tier, 0)
+        row["n_forward"] = orients.get("forward", 0) or orients.get("fwd", 0)
+        row["n_reverse"] = orients.get("reverse", 0) or orients.get("rev", 0)
+        rows.append(row)
+    output_df = pd.DataFrame(rows)
 
     # Sort by counts descending
     output_df = output_df.sort_values("counts", ascending=False)
@@ -1032,6 +1116,68 @@ def main():
     # Save output
     logger.info(f"Saving {len(output_df):,} BC1s to {args.output}")
     output_df.to_csv(args.output, sep="\t", index=False)
+
+    # counts == sum of the per-tier columns, on every row. If this ever fails the
+    # table is not internally consistent and nothing downstream should trust it.
+    if len(output_df):
+        tier_sum = output_df[[f"n_{t}" for t in EMITTING_TIERS]].sum(axis=1)
+        n_bad = int((tier_sum != output_df["counts"]).sum())
+        if n_bad:
+            logger.error(f"  TIER COLUMN ACCOUNTING BROKEN on {n_bad:,} rows: "
+                         f"counts != sum(n_<tier>).")
+
+    # Provenance sidecar (planning/policies/PIPELINE_CORRECTNESS_POLICY.md §2).
+    # Without this the outputs of two runs cannot be told apart, which is exactly
+    # why the legacy counts are not comparable (handoff §4.5).
+    try:
+        from magestic.utils.provenance import StepProvenance
+        prov = StepProvenance(
+            pipeline="bc1_from_screen", step="02_parse_bc1_reads",
+            output=args.output)
+        prov.add_input(args.input, role="collapsed_fastq")
+        prov.set_parameters(
+            sample_name=sample_name,
+            bc1_length=args.bc1_length,
+            length_tolerance=args.length_tolerance,
+            min_counts=args.min_counts,
+            auto_infer=args.auto_infer,
+            established_offset=est_off,
+            layout_call=layout if est_off is not None else None,
+            offset_purity=round(off_purity, 4) if est_off is not None else None,
+            anchors="canonical (magestic.utils.bc1_extraction)",
+            reported_inference_prefix=bc1_prefix,
+            reported_inference_suffix=bc1_suffix,
+        )
+        prov.note(
+            "--bc1-prefix/--bc1-suffix and any --auto-infer result are ACCEPTED "
+            "AND IGNORED since 2026-09-09: the layout is called per read from "
+            "the universal downstream anchor's observed offset. The inference "
+            "values recorded here are what the log printed, NOT what ran."
+        )
+        prov.set_counts(
+            collapsed_records=n_records,
+            total_reads=total_reads,
+            collapse_factor=round(collapse_factor, 4),
+            matched_reads=matched_reads,
+            rejected_on_length=n_rejected_length,
+            rejected_length_distribution={str(k): v for k, v in
+                                          sorted(reject_lengths.items())},
+            rejected_n_base=stats["n_rejected_n_base"],
+            read_name_formats=dict(header_formats),
+            anchor_tiers={t: tier_stats.get(t, 0) for t in ANCHOR_TIERS},
+            lineages=n_lineages,
+            lineages_before_min_counts=n_before_min_counts,
+            lineages_written=len(output_df),
+            singletons=n_singletons,
+            singleton_fraction=round(singleton_fraction, 6),
+            reads_per_lineage=round(reads_per_lineage, 4),
+        )
+        prov.add_output(args.output, rows=len(output_df))
+        sidecar = prov.write()
+        logger.info(f"  Provenance sidecar: {sidecar}")
+    except Exception as e:                       # never lose the data over this
+        logger.error(f"  FAILED to write the provenance sidecar: {e!r}. The "
+                     f"counts were written but are NOT provenance-backed.")
 
     logger.info("Step 02: Parsing complete")
     return 0
