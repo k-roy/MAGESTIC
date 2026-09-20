@@ -47,8 +47,10 @@ from typing import Iterator, Tuple, Union
 #: because a ``@seq_1_count=208`` name also contains digits. Extend this tuple
 #: -- do not add another ``elif`` at a call site.
 COLLAPSED_HEADER_FORMATS = (
-    # @seq_1_count=208  (01_trim_merge_collapse.sh)
-    ("count_kv", re.compile(r"count=(\d+)(?:\s|$)")),
+    # @seq_1_count=208  (01_trim_merge_collapse.sh). Anchored at the END so a
+    # producer that ever appends a field cannot have a LATER number silently
+    # read as the count -- it raises instead.
+    ("count_kv", re.compile(r"count=(\d+)\s*$")),
     # @12              (collapse_identical_merged_reads_min_counts.py)
     ("bare_int", re.compile(r"^@?(\d+)\s*$")),
 )
@@ -71,7 +73,21 @@ def parse_collapsed_header_count(header: str) -> Tuple[int, str]:
     for name, pattern in COLLAPSED_HEADER_FORMATS:
         m = pattern.search(h)
         if m:
-            return int(m.group(1)), name
+            count = int(m.group(1))
+            # A zero-count record is not a thing either producer writes (both
+            # filter on ``count >= min_counts``, min 1). If one appears, the
+            # read name does not mean what we think it means -- and a
+            # 0-weighted record would contribute nothing while still counting
+            # toward n_records, depressing the collapse factor. That is the
+            # same silent-miscount class this module exists to prevent.
+            if count < 1:
+                raise CollapsedHeaderError(
+                    "collapsed-FASTQ read name %r parsed as count=%d via the "
+                    "%r format. A collapsed record represents at least one "
+                    "read, so this read name does not mean what the parser "
+                    "assumes." % (header, count, name)
+                )
+            return count, name
     raise CollapsedHeaderError(
         "unrecognized collapsed-FASTQ read name: %r. Known formats: %s. "
         "A collapsed read name MUST carry the number of reads collapsed into "
@@ -134,3 +150,25 @@ def iter_collapsed_fastq(
                 format_counter[fmt] += 1
             n += 1
             yield sequence, count, quality, fmt
+
+
+def _self_test():
+    """Assertions on the contract. Run as ``python -m magestic.utils.collapsed_fastq``."""
+    assert parse_collapsed_header_count("@seq_1_count=208") == (208, "count_kv")
+    assert parse_collapsed_header_count("@12") == (12, "bare_int")
+    assert parse_collapsed_header_count("12") == (12, "bare_int")
+    # ordering: a count= name also contains digits, and must not read as bare_int
+    assert parse_collapsed_header_count("@seq_7_count=3")[0] == 3
+    for bad in ("@0", "@seq_1_count=0", "@read_abc/1", "@", "@seq_1_count=208 extra",
+                "@M01234:5:000-ABCDE:1:1101:15589:1332"):
+        try:
+            parse_collapsed_header_count(bad)
+        except CollapsedHeaderError:
+            pass
+        else:
+            raise AssertionError("should have raised on %r" % (bad,))
+    print("collapsed_fastq self-test OK")
+
+
+if __name__ == "__main__":
+    _self_test()

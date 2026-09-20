@@ -1102,8 +1102,11 @@ def main():
         row = {"bc1": bc1, "sample_name": sample_name, "counts": count}
         for tier in EMITTING_TIERS:
             row[f"n_{tier}"] = tiers.get(tier, 0)
-        row["n_forward"] = orients.get("forward", 0) or orients.get("fwd", 0)
-        row["n_reverse"] = orients.get("reverse", 0) or orients.get("rev", 0)
+        # The orientation vocabulary is the module's: fwd | rev (Bc1Call
+        # .orientation, bc1_extraction.py:107). Spelling it "forward"/"reverse"
+        # here would make both columns silently zero.
+        row["n_fwd"] = orients.get("fwd", 0)
+        row["n_rev"] = orients.get("rev", 0)
         rows.append(row)
     output_df = pd.DataFrame(rows)
 
@@ -1117,14 +1120,23 @@ def main():
     logger.info(f"Saving {len(output_df):,} BC1s to {args.output}")
     output_df.to_csv(args.output, sep="\t", index=False)
 
-    # counts == sum of the per-tier columns, on every row. If this ever fails the
-    # table is not internally consistent and nothing downstream should trust it.
+    # counts == sum of the per-tier columns AND == n_fwd + n_rev, on every row.
+    # If either fails the table is not internally consistent and nothing
+    # downstream should trust it. The orientation check is what would have caught
+    # the "forward"/"fwd" vocabulary slip that made both columns read zero.
     if len(output_df):
         tier_sum = output_df[[f"n_{t}" for t in EMITTING_TIERS]].sum(axis=1)
         n_bad = int((tier_sum != output_df["counts"]).sum())
         if n_bad:
             logger.error(f"  TIER COLUMN ACCOUNTING BROKEN on {n_bad:,} rows: "
                          f"counts != sum(n_<tier>).")
+        orient_sum = output_df["n_fwd"] + output_df["n_rev"]
+        n_bad_or = int((orient_sum != output_df["counts"]).sum())
+        if n_bad_or:
+            logger.error(f"  ORIENTATION COLUMN ACCOUNTING BROKEN on "
+                         f"{n_bad_or:,} rows: counts != n_fwd + n_rev.")
+        logger.info(f"  Orientation: fwd {int(output_df['n_fwd'].sum()):,} / "
+                    f"rev {int(output_df['n_rev'].sum()):,} reads")
 
     # Provenance sidecar (planning/policies/PIPELINE_CORRECTNESS_POLICY.md §2).
     # Without this the outputs of two runs cannot be told apart, which is exactly
