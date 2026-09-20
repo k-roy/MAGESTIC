@@ -1,0 +1,649 @@
+"""
+Snakemake workflow for the MAGESTIC wgs pipeline (per-sample fan-out over BAMs).
+===============================================================================
+
+PATH (B) of the dual-path program (ARCHITECTURE_POLICY §2/§4). Every rule's
+`shell:` block invokes the INSTALLED console script that path (A) also calls, so
+there is exactly ONE entry point per step and byte-identical output is
+STRUCTURAL rather than a convention someone has to maintain. This is the "REDI
+pattern" of §9, and it is why no rule here passes an analysis parameter on a
+command line (see PARITY RULE below).
+
+Unlike the REDI exemplar, this workflow ships a rule for EVERY step including the
+last — redi's `rule all` stops at step_e while steps f/g/h have console scripts
+but no rules, so the exemplar violates its own §2/§4.
+
+Invocation (either form resolves to this file):
+
+    snakemake --snakefile workflow/Snakefile.wgs \
+              --workflow-profile workflow/profiles/sherlock_wgs \
+              --config config=workflow/config/screens/<cohort>_wgs.yaml steps=1
+
+    snakemake --snakefile $(python -c "import magestic.pipelines.wgs.snakemake as m; print(m.__path__[0])")/Snakefile \
+              -j 24 --config config=/path/to/<cohort>_wgs.yaml steps=1
+
+🔴 `--config config=<yaml>`, NOT `--configfile <yaml>`.
+The cohort YAML is interpreted by `magestic.pipelines.wgs.config.load_config()`
+inside each step CLI. This workflow reads the same document only to compose file
+names, the fan-out list and scheduling resources — never to make an analysis
+decision. `--configfile` would make snakemake a second, divergent interpreter of
+it (different defaults, different coercions) and would break §4 parity silently.
+It also would not work: `load_config()` REJECTS any top-level key it does not
+know, so the workflow's own knobs (`steps`) cannot live in that document and are
+passed as snakemake config entries instead.
+
+PARITY RULE (do not weaken it)
+------------------------------
+Every rule's command is exactly
+
+    magestic-wgs-<step> --config {CONFIG_PATH} [--sample {wildcards.sample}] 2>&1 | tee {log}
+
+No value read from the cohort YAML may ever reach a command string — not a
+threshold, not a window size, not `{threads}`. The moment a rule renders
+`--min-support {params.x}`, path A (via `load_config`) and path B (via
+`yaml.safe_load` here) can disagree, and the dual-path parity test dies quietly.
+`threads:` / `resources:` from the YAML are fine: they are scheduling, and they
+never appear in a command.
+
+CONTRACT WITH THE STEP CLIs (implemented in `pipeline/`, called from here)
+-------------------------------------------------------------------------
+1. `magestic-wgs-<step> --config <yaml> --sample <S>` writes exactly that
+   sample's shard(s). It is idempotent and skip-checks its own outputs at task
+   start (§6), which is what makes an interrupted SLURM array task resumable;
+   snakemake's DAG gives the same skip independently.
+2. `magestic-wgs-<step> --config <yaml>` with NO `--sample` is the cohort fan-in:
+   it computes only the shards that are missing and then concatenates every
+   shard IN MANIFEST ORDER. Under path (B) the per-sample rules have already
+   produced them all, so it degenerates to a pure ordered concatenation — one
+   code path for both orchestrators, which is what makes §4 structural.
+   A missing shard must RAISE (`_common.collect_shards` does), never yield a
+   short cohort table.
+3. Row order in every cohort table is MANIFEST order in both paths. Not glob
+   order, not sorted basename — sorted basename puts `clone_10` before `clone_2`,
+   and the two paths would then differ for an entirely boring reason.
+
+PATHS ARE COMPOSED FROM `config.py`'s LITERALS
+----------------------------------------------
+This file cannot import magestic (the snakemake env need not have it), so it
+re-derives the output layout from the same subdirectory literals `config.py`
+declares (`BC1_SUBDIR` = "bc1_calls", …) and the same `_under_root` defaulting
+`load_config()` applies. If the two derivations drift, the paths write to
+different directories and the §4 test fails looking like a DATA difference
+rather than a path bug. Anything changed there must be changed here in the same
+commit — config.py's own comment says so from the other side.
+
+CHUNKED / ARRAY EXECUTION (§5, §6)
+----------------------------------
+Each per-sample rule carries a `group:`. Set `--group-components <group>=N` (see
+workflow/profiles/sherlock_wgs/config.yaml) to pack N samples into one cluster
+job and land in the 20–60 min window the preemptible queue requires. N is
+scheduling only: it changes neither the outputs nor their order.
+
+SNAKEMAKE CONFIG ENTRIES (passed with `--config`, NOT in the cohort YAML)
+-------------------------------------------------------------------------
+    config=<path>   REQUIRED. The cohort YAML both paths read.
+    steps=1,3,4     Optional. Mirrors path (A)'s `--steps`. Default "1,2,3,4,5",
+                    the same default `run_pipeline.main` applies
+                    (`--from-step 1 --end-step 5`). 🔴 If the two paths select
+                    different steps they emit different FILE SETS, and the parity
+                    diff reports a config mismatch as a §4 violation.
+
+NOT SUPPORTED HERE: `--use-scratch`. The per-step CLIs expose no such flag (only
+the `magestic-wgs` umbrella does), so path (B) always writes to
+`paths.processed`. Running path (A) with `--use-scratch` and path (B) without it
+compares two different trees.
+
+Author: Kevin R. Roy
+"""
+
+import re
+from pathlib import Path
+
+import pandas as pd
+import yaml
+
+# `2>&1 | tee {log}` returns *tee's* exit status, so without pipefail a step CLI
+# that writes a header-only table and then crashes exits 0, snakemake sees the
+# declared output present, and the job "succeeds" — acceptance criterion F1
+# laundered through a pipe.
+#
+# Snakemake DOES apply "set -euo pipefail; " by default, but only for as long as
+# no Snakefile calls shell.prefix() (snakemake/shell.py::_get_process_prefix:
+# the default applies while `_process_prefix is None`). Declaring it explicitly
+# changes nothing today (measured: identical behavior with and without) and makes
+# the guarantee visible and load-bearing, so a later
+# `shell.prefix("conda activate ...; ")` cannot silently delete strict mode.
+#
+# Verified on snakemake 9.16.3 with a stub CLI that writes a header-only table
+# and then exits 3: the job fails AND snakemake removes the truncated output
+# ("Removing output files of failed job … since they might be corrupted").
+# What this canNOT catch is a step CLI that writes a header-only table and exits
+# 0 — that is the row-count gate's job (qc/pipeline_qc.py), not the workflow's.
+shell.prefix("set -euo pipefail; ")
+
+
+# =============================================================================
+# Layout literals — MUST match magestic.pipelines.wgs.config (see header)
+# =============================================================================
+BC1_SUBDIR = "bc1_calls"
+DONOR_PRECALL_SUBDIR = "donor_precall"
+SV_PLASMID_SUBDIR = "sv_plasmid"
+RECONCILE_SUBDIR = "reconcile"
+LOGS_SUBDIR = "logs"
+
+# Per-sample shard suffixes and cohort table names, from the step modules.
+BC1_SHARD_SUFFIX = ".bc1_calls.tsv"
+BC1_TRACKS_SHARD_SUFFIX = ".bc1_tracks.tsv"
+BC1_TABLE_NAME = "bc1_calls.tsv"
+BC1_TRACKS_TABLE_NAME = "bc1_tracks.tsv"
+DONOR_SHARD_SUFFIX = ".donor_outcome.tsv"
+DONOR_TABLE_NAME = "donor_outcome.tsv"
+SV_SHARD_SUFFIX = ".sv_plasmid.tsv"
+SV_TABLE_NAME = "sv_plasmid_calls.tsv"
+SV_INTEGRATION_TABLE_NAME = "plasmid_integration_summary.tsv"
+RECONCILE_SHARD_SUFFIX = ".reconcile.tsv"
+RECONCILE_TABLE_NAME = "reconcile_calls.tsv"
+JOIN_TABLE_NAME = "outcome_join.tsv"
+JOIN_MATRIX_NAME = "outcome_agreement_matrix.tsv"
+JOIN_DISAGREEMENT_NAME = "outcome_disagreements.tsv"
+
+# One key per stage, matching config.STEP_RESOURCE_KEYS. `load_config()` reports
+# an unrecognized resources key as a validation error, so this list is closed.
+STEP_RESOURCE_KEYS = (
+    "step_1_bc1",
+    "step_2_donor_precall",
+    "step_3_sv_plasmid",
+    "step_4_reconcile",
+    "step_5_join",
+)
+DEFAULT_RESOURCES = {
+    "step_1_bc1": {"mem_mb": 8000, "time": "01:00:00", "cpus": 1},
+    "step_2_donor_precall": {"mem_mb": 16000, "time": "02:00:00", "cpus": 1},
+    "step_3_sv_plasmid": {"mem_mb": 16000, "time": "02:00:00", "cpus": 2},
+    "step_4_reconcile": {"mem_mb": 8000, "time": "01:00:00", "cpus": 1},
+    "step_5_join": {"mem_mb": 8000, "time": "00:30:00", "cpus": 1},
+}
+
+
+# =============================================================================
+# Cohort config — read for FILE NAMES and SCHEDULING ONLY (see PARITY RULE)
+# =============================================================================
+if "config" not in config:
+    raise ValueError(
+        "The cohort YAML must be passed as `--config config=/path/to/<cohort>_wgs.yaml`, "
+        "not as `--configfile`. Both paths must read it through "
+        "magestic.pipelines.wgs.config.load_config(); see the PARITY RULE in this "
+        "workflow's docstring."
+    )
+
+CONFIG_PATH = Path(config["config"]).expanduser().resolve()
+if not CONFIG_PATH.is_file():
+    raise ValueError(f"cohort config not found: {CONFIG_PATH}")
+
+with CONFIG_PATH.open() as fh:
+    CFG = yaml.safe_load(fh) or {}
+
+PATHS = CFG.get("paths") or {}
+if not PATHS.get("project_root"):
+    raise ValueError(f"{CONFIG_PATH}: `paths.project_root` is required")
+
+PROJECT_ROOT = Path(PATHS["project_root"]).expanduser()
+
+
+def under_root(key, default):
+    """Resolve one `paths:` key, mirroring `config.load_config`'s `_under_root`."""
+    raw = Path(PATHS.get(key) or default).expanduser()
+    return raw if raw.is_absolute() else PROJECT_ROOT / raw
+
+
+MANIFEST_PATH = under_root("manifest", "keyfiles/sample_manifest.tsv")
+PROCESSED_DIR = under_root("processed", "processed_data")
+INTERMEDIATE_DIR = under_root("intermediate", "intermediate_data")
+
+# `paths.logs` is a DERIVED property in config.py (`processed / "logs"`), not a
+# YAML key — so it is composed, never read.
+#
+# 🔴 Consequence for the §4 parity diff, stated here because it is not free: the
+# logs live INSIDE paths.processed, and only path (B) writes them (`2>&1 | tee
+# {log}`), with wall-clock text inside. A diff of the two processed trees must
+# therefore exclude `<processed>/logs/` alongside the pre-registered
+# `*.provenance.json` / `PROVENANCE.json` carve-out. Source of nondeterminism:
+# wall-clock time and per-rule scheduling. Everything else is diffed unmodified.
+# 🔴 INTERMEDIATE, not PROCESSED — must track `config.WGSPaths.logs`. These logs are
+# written by path (B) only and carry wall-clock text, so inside `processed/` they make a
+# literal diff of the two paths' processed trees differ on every run and be reported as a
+# §4 parity violation (F6) when it is nothing of the kind. Keeping them out of the
+# compared tree removes the need for a second pre-registered carve-out.
+LOGS_DIR = INTERMEDIATE_DIR / LOGS_SUBDIR
+
+BC1_DIR = PROCESSED_DIR / BC1_SUBDIR
+DONOR_DIR = PROCESSED_DIR / DONOR_PRECALL_SUBDIR
+SV_DIR = PROCESSED_DIR / SV_PLASMID_SUBDIR
+RECONCILE_DIR = PROCESSED_DIR / RECONCILE_SUBDIR
+
+# Cohort tables sit at the processed root (`_common.cohort_table`).
+BC1_TABLE = PROCESSED_DIR / BC1_TABLE_NAME
+BC1_TRACKS_TABLE = PROCESSED_DIR / BC1_TRACKS_TABLE_NAME
+DONOR_TABLE = PROCESSED_DIR / DONOR_TABLE_NAME
+SV_TABLE = PROCESSED_DIR / SV_TABLE_NAME
+SV_INTEGRATION_TABLE = PROCESSED_DIR / SV_INTEGRATION_TABLE_NAME
+RECONCILE_TABLE = PROCESSED_DIR / RECONCILE_TABLE_NAME
+JOIN_TABLE = PROCESSED_DIR / JOIN_TABLE_NAME
+JOIN_MATRIX = PROCESSED_DIR / JOIN_MATRIX_NAME
+JOIN_DISAGREEMENTS = PROCESSED_DIR / JOIN_DISAGREEMENT_NAME
+
+PLATE_VCFS = [
+    str(Path(p).expanduser()) for p in (CFG.get("donor_precall") or {}).get("plate_vcfs", [])
+]
+
+
+# =============================================================================
+# Fan-out — from the MANIFEST (D1), never from a glob
+# =============================================================================
+# A wrong column name or an empty manifest must NOT degrade to `SAMPLES = []`: a
+# vacuous `rule all` lets snakemake exit 0 having done nothing, the same
+# silent-empty failure as TRACE's `bam_suffix` glob. Every branch below raises.
+# Schema and resolution rules mirror `core/manifest.py` (its REQUIRED_COLUMNS /
+# OPTIONAL_COLUMNS and `_resolve` are the single home of both).
+MANIFEST_REQUIRED_COLUMNS = ("sample", "bam", "reference")
+MANIFEST_OPTIONAL_COLUMNS = ("cohort", "plate", "background")
+
+if not MANIFEST_PATH.is_file():
+    raise ValueError(f"{CONFIG_PATH}: paths.manifest does not exist: {MANIFEST_PATH}")
+
+MANIFEST = pd.read_csv(MANIFEST_PATH, sep="\t", dtype=str, comment="#").fillna("")
+
+_missing_cols = [c for c in MANIFEST_REQUIRED_COLUMNS if c not in MANIFEST.columns]
+if _missing_cols:
+    raise ValueError(
+        f"{MANIFEST_PATH}: missing required column(s) {_missing_cols}; "
+        f"required={list(MANIFEST_REQUIRED_COLUMNS)} "
+        f"optional={list(MANIFEST_OPTIONAL_COLUMNS)} (found={list(MANIFEST.columns)})"
+    )
+
+SAMPLES = [s.strip() for s in MANIFEST["sample"].tolist() if s.strip()]
+if not SAMPLES:
+    raise ValueError(
+        f"{MANIFEST_PATH}: 0 usable rows — the fan-out would be empty and `rule all` "
+        "would succeed having produced nothing."
+    )
+
+_duplicates = sorted({s for s in SAMPLES if SAMPLES.count(s) > 1})
+if _duplicates:
+    raise ValueError(
+        f"{MANIFEST_PATH}: duplicate sample id(s) {_duplicates} — one shard path would "
+        "be claimed by two rows and the cohort row count would not match the manifest."
+    )
+
+for _column in MANIFEST_REQUIRED_COLUMNS:
+    _blank = [
+        row["sample"] for _, row in MANIFEST.iterrows() if row["sample"] and not row[_column].strip()
+    ]
+    if _blank:
+        raise ValueError(
+            f"{MANIFEST_PATH}: {len(_blank)} row(s) have a blank {_column!r} "
+            f"(first: {_blank[0]}). Reference in particular is a per-SAMPLE attribute "
+            "(D1) — one BAM directory was measured to span two references, so a blank "
+            "cannot be defaulted to the cohort's."
+        )
+
+BAM_BY_SAMPLE = dict(zip(MANIFEST["sample"].str.strip(), MANIFEST["bam"].str.strip()))
+
+
+def bam_path(sample):
+    """Absolute BAM path for a sample.
+
+    Relative manifest values resolve against the MANIFEST'S OWN PARENT, exactly as
+    `core.manifest._resolve` does (so a manifest can be relocated with its data).
+    Resolving them against `paths.processed` or a `bam_dir` key would silently
+    disagree with path (A) — and `bam_dir` is a forbidden config key precisely
+    because BAMs are never discovered by glob.
+    """
+    raw = Path(BAM_BY_SAMPLE[sample]).expanduser()
+    return raw if raw.is_absolute() else MANIFEST_PATH.parent / raw
+
+
+def bam_index_path(sample):
+    """Index for a sample's BAM.
+
+    Stages 1, 3 and 4 all reach the BAM through `fetch`/`pileup`, which require an
+    index, and TRACE documents neither requirement. Declaring the index as a rule
+    input turns a missing `.bai` into a loud DAG error before any compute instead
+    of an opaque pysam failure inside a cluster job. Both house conventions are
+    accepted (`<name>.bam.bai` and `<name>.bai`); when neither exists the
+    companion form is returned so the error names the expected path.
+    """
+    bam = bam_path(sample)
+    companion = Path(str(bam) + ".bai")
+    sibling = bam.with_suffix(".bai")
+    if companion.exists() or not sibling.exists():
+        return companion
+    return sibling
+
+
+wildcard_constraints:
+    # Only manifest samples are addressable: an unknown wildcard cannot silently
+    # create a shard path, and a sample id containing "/" cannot escape its directory.
+    sample="|".join(re.escape(s) for s in SAMPLES),
+
+
+# =============================================================================
+# Steps — the DAG targets, and the dependencies the diamond makes non-optional
+# =============================================================================
+# The stages are a DIAMOND, not a chain (spec §3):
+#   1 -> 4 is HARD: reconcile_cell() takes the barcode counts and confidence that
+#        Stage 1 writes to its per-track shard, and their defaults (0/0/"high")
+#        are not neutral — they INFLATE confidence.
+#   2 ⟂ 3 ⟂ 4: donor pre-calling, SV/plasmid and reconciliation share no inputs.
+#   5 is the orchestration-owned Stage 2 x Stage 4 join, so it needs BOTH.
+STEP_TARGETS = {
+    "1": [BC1_TABLE, BC1_TRACKS_TABLE],
+    "2": [DONOR_TABLE],
+    "3": [SV_TABLE, SV_INTEGRATION_TABLE],
+    "4": [RECONCILE_TABLE],
+    "5": [JOIN_TABLE, JOIN_MATRIX, JOIN_DISAGREEMENTS],
+}
+STEP_REQUIRES = {"4": ("1",), "5": ("2", "4")}
+
+_steps_arg = config.get("steps", ",".join(sorted(STEP_TARGETS)))
+STEPS = [s.strip() for s in str(_steps_arg).replace(" ", ",").split(",") if s.strip()]
+
+_unknown_steps = [s for s in STEPS if s not in STEP_TARGETS]
+if _unknown_steps:
+    raise ValueError(
+        f"unknown step(s) {_unknown_steps} in `--config steps={_steps_arg}`; "
+        f"valid steps are {sorted(STEP_TARGETS)}"
+    )
+
+for _step, _needed in STEP_REQUIRES.items():
+    if _step in STEPS:
+        _absent = [s for s in _needed if s not in STEPS]
+        if _absent:
+            raise ValueError(
+                f"step {_step} requires step(s) {_absent}, which `--config "
+                f"steps={_steps_arg}` does not select. Step 4 consumes Stage 1's "
+                "barcode counts (whose defaults inflate confidence rather than being "
+                "neutral); step 5 IS the Stage 2 x Stage 4 join and is meaningless "
+                "without both."
+            )
+
+STEPS = [s for s in sorted(STEP_TARGETS) if s in STEPS]  # canonical order
+TARGETS = [target for step in STEPS for target in STEP_TARGETS[step]]
+
+
+# =============================================================================
+# Scheduling resources — never analysis parameters (see PARITY RULE)
+# =============================================================================
+_unknown_resources = sorted(set(CFG.get("resources") or {}) - set(STEP_RESOURCE_KEYS))
+if _unknown_resources:
+    raise ValueError(
+        f"{CONFIG_PATH}: `resources:` has unrecognized key(s) {_unknown_resources}; "
+        f"valid keys are {list(STEP_RESOURCE_KEYS)}. `load_config().validate()` "
+        "reports the same thing — a typo must not be silently replaced by a default."
+    )
+
+
+def res(step_key, field):
+    """Scheduling value for a step, cohort YAML overriding `DEFAULT_RESOURCES`."""
+    value = (CFG.get("resources") or {}).get(step_key, {}).get(field)
+    return DEFAULT_RESOURCES[step_key][field] if value is None else value
+
+
+def runtime_min(step_key):
+    """Walltime in MINUTES for the slurm executor plugin.
+
+    The cohort YAML carries `time: "HH:MM:SS"` (config.py's vocabulary, shared with
+    the older rule libraries), but snakemake's slurm executor reads `runtime` in
+    minutes — the mismatch recorded in the CAVEAT at the bottom of
+    workflow/profiles/sherlock/config.yaml. Converting here keeps ONE vocabulary in
+    the config and still hands the plugin what it actually reads.
+    """
+    raw = str(res(step_key, "time")).strip()
+    if raw.isdigit():
+        return int(raw)
+    parts = raw.split(":")
+    if not (2 <= len(parts) <= 3) or not all(p.isdigit() for p in parts):
+        raise ValueError(
+            f"{CONFIG_PATH}: resources.{step_key}.time = {raw!r} is neither minutes "
+            'nor "HH:MM:SS"/"MM:SS"'
+        )
+    parts = [int(p) for p in parts]
+    hours, minutes, seconds = ([0] + parts)[-3:]
+    return max(1, hours * 60 + minutes + (1 if seconds else 0))
+
+
+localrules:
+    all,
+
+
+rule all:
+    """Default target — the cohort tables for the steps selected by `--config steps=`.
+
+    `default_target: True` makes this the target wherever it sits in the file, but
+    ONLY when this Snakefile is run directly. It does NOT survive an `include:`
+    (snakemake restores the includer's default target afterwards), so
+    workflow/Snakefile.wgs declares its own `wgs_all` over the same TARGETS — read
+    the comment there before deleting either one.
+    """
+    default_target: True
+    input:
+        TARGETS,
+
+
+# =============================================================================
+# Stage 1 — de novo bc1 calling (TRACE bc1_consensus)
+# =============================================================================
+rule wgs_step_1_bc1_call:
+    """Stage 1 — call bc1 for ONE sample from its indexed BAM.
+
+    Two shards, both consumed downstream: the 17-column TRACE emit row, and the
+    per-track diagnostic carrying the barcode counts Stage 4 needs and the
+    genome-vs-plasmid canonical agreement acceptance criterion P5 is defined over.
+    """
+    input:
+        bam=lambda wildcards: bam_path(wildcards.sample),
+        bai=lambda wildcards: bam_index_path(wildcards.sample),
+    output:
+        shard=BC1_DIR / ("{sample}" + BC1_SHARD_SUFFIX),
+        tracks=BC1_DIR / ("{sample}" + BC1_TRACKS_SHARD_SUFFIX),
+    log:
+        LOGS_DIR / "step_1_bc1_{sample}.log",
+    group:
+        "wgs_step_1"
+    threads: res("step_1_bc1", "cpus")
+    resources:
+        mem_mb=res("step_1_bc1", "mem_mb"),
+        runtime=runtime_min("step_1_bc1"),
+    shell:
+        "magestic-wgs-bc1 --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+
+
+rule wgs_step_1_combine:
+    """Stage 1 fan-in — concatenate the bc1 shards in manifest order."""
+    input:
+        shards=expand(str(BC1_DIR / ("{sample}" + BC1_SHARD_SUFFIX)), sample=SAMPLES),
+        tracks=expand(str(BC1_DIR / ("{sample}" + BC1_TRACKS_SHARD_SUFFIX)), sample=SAMPLES),
+    output:
+        table=BC1_TABLE,
+        tracks_table=BC1_TRACKS_TABLE,
+    log:
+        LOGS_DIR / "step_1_bc1_combine.log",
+    threads: res("step_1_bc1", "cpus")
+    resources:
+        mem_mb=res("step_1_bc1", "mem_mb"),
+        runtime=runtime_min("step_1_bc1"),
+    shell:
+        "magestic-wgs-bc1 --config {CONFIG_PATH} 2>&1 | tee {log}"
+
+
+# =============================================================================
+# Stage 2 — donor-window editing outcome (TRACE donor_outcome)  🔴 GATED
+# =============================================================================
+# Stage 2 ships GATED three ways (spec §8.1–§8.3) and cannot run on the cohorts
+# inventoried so far. The rules exist because §4 requires a rule per step, and
+# because enforcing the gates is the step CLI's job, not the workflow's:
+#   GATE 1  no per-oligo step-2 donor exists for the 2021 pool, so the
+#           SYNTHETIC_ERROR axis is disabled and the output must be STAMPED so;
+#   GATE 2  no gVCF exists anywhere, so `unedited` cannot be separated from
+#           `unknown`;
+#   GATE 3  `precall_sample` re-parses its own `chrom_pos_ref_to_alt` id with
+#           split("_") and crashes on the `integrated_plasmid_<oligo>` contigs the
+#           composite-reference standard puts in EVERY reference.
+# Selecting step 2 before those close is expected to fail loudly in the CLI.
+rule wgs_step_2_donor_precall:
+    """Stage 2 — donor-window editing outcome for ONE sample (GATED; see §8).
+
+    The per-plate 96-sample bcftools VCFs come from `donor_precall.plate_vcfs` in
+    the cohort YAML (`core/vcf_adapter.py` splits them per sample and remaps AD
+    from FORMAT slot 4 to slot 2). They are declared as inputs so the DAG reruns
+    when a VCF changes; the list is legitimately empty on a cohort that has none.
+    """
+    input:
+        plate_vcfs=PLATE_VCFS,
+    output:
+        shard=DONOR_DIR / ("{sample}" + DONOR_SHARD_SUFFIX),
+    log:
+        LOGS_DIR / "step_2_donor_{sample}.log",
+    group:
+        "wgs_step_2"
+    threads: res("step_2_donor_precall", "cpus")
+    resources:
+        mem_mb=res("step_2_donor_precall", "mem_mb"),
+        runtime=runtime_min("step_2_donor_precall"),
+    shell:
+        "magestic-wgs-donor-precall --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+
+
+rule wgs_step_2_combine:
+    """Stage 2 fan-in — concatenate the donor-outcome shards (GATED; see §8)."""
+    input:
+        shards=expand(str(DONOR_DIR / ("{sample}" + DONOR_SHARD_SUFFIX)), sample=SAMPLES),
+    output:
+        table=DONOR_TABLE,
+    log:
+        LOGS_DIR / "step_2_donor_combine.log",
+    threads: res("step_2_donor_precall", "cpus")
+    resources:
+        mem_mb=res("step_2_donor_precall", "mem_mb"),
+        runtime=runtime_min("step_2_donor_precall"),
+    shell:
+        "magestic-wgs-donor-precall --config {CONFIG_PATH} 2>&1 | tee {log}"
+
+
+# =============================================================================
+# Stage 3 — plasmid integration + donor-read cleaning (TRACE sv_plasmid)
+# =============================================================================
+# Half B also writes TRACE's `{out_bam}.target_filtering.anno` and a cleaned BAM
+# beside the shard. Those are deliberately NOT declared as rule outputs: they
+# exist only for samples that have a donor window, and declaring them would turn
+# an expected condition into a "missing output" failure. They are still covered
+# by the §4 parity diff, which walks paths.processed rather than the declared
+# outputs.
+rule wgs_step_3_sv_plasmid:
+    """Stage 3 — plasmid-integration counts and donor-read cleaning for ONE sample."""
+    input:
+        bam=lambda wildcards: bam_path(wildcards.sample),
+        bai=lambda wildcards: bam_index_path(wildcards.sample),
+    output:
+        shard=SV_DIR / ("{sample}" + SV_SHARD_SUFFIX),
+    log:
+        LOGS_DIR / "step_3_sv_{sample}.log",
+    group:
+        "wgs_step_3"
+    threads: res("step_3_sv_plasmid", "cpus")
+    resources:
+        mem_mb=res("step_3_sv_plasmid", "mem_mb"),
+        runtime=runtime_min("step_3_sv_plasmid"),
+    shell:
+        "magestic-wgs-sv-plasmid --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+
+
+rule wgs_step_3_combine:
+    """Stage 3 fan-in — cohort SV table plus the plasmid-integration summary.
+
+    TRACE's `summarize_plasmid_integration` RETURNS rows; writing
+    `plasmid_integration_summary.tsv` is orchestration-owned (spec §2.5).
+    """
+    input:
+        shards=expand(str(SV_DIR / ("{sample}" + SV_SHARD_SUFFIX)), sample=SAMPLES),
+    output:
+        table=SV_TABLE,
+        integration=SV_INTEGRATION_TABLE,
+    log:
+        LOGS_DIR / "step_3_sv_combine.log",
+    threads: res("step_3_sv_plasmid", "cpus")
+    resources:
+        mem_mb=res("step_3_sv_plasmid", "mem_mb"),
+        runtime=runtime_min("step_3_sv_plasmid"),
+    shell:
+        "magestic-wgs-sv-plasmid --config {CONFIG_PATH} 2>&1 | tee {log}"
+
+
+# =============================================================================
+# Stage 4 — per-cell edit reconciliation (TRACE reconcile primitives)
+# =============================================================================
+rule wgs_step_4_reconcile:
+    """Stage 4 — reconcile edits for ONE sample against its Stage 1 barcode counts."""
+    input:
+        bam=lambda wildcards: bam_path(wildcards.sample),
+        bai=lambda wildcards: bam_index_path(wildcards.sample),
+        # The per-TRACK shard, not the cohort table: it carries this sample's
+        # n_genome_bc / n_plasmid_bc / bc_confidence, so the fan-out stays
+        # pipelined instead of stalling on a cohort-wide barrier.
+        bc1_tracks=BC1_DIR / ("{sample}" + BC1_TRACKS_SHARD_SUFFIX),
+    output:
+        shard=RECONCILE_DIR / ("{sample}" + RECONCILE_SHARD_SUFFIX),
+    log:
+        LOGS_DIR / "step_4_reconcile_{sample}.log",
+    group:
+        "wgs_step_4"
+    threads: res("step_4_reconcile", "cpus")
+    resources:
+        mem_mb=res("step_4_reconcile", "mem_mb"),
+        runtime=runtime_min("step_4_reconcile"),
+    shell:
+        "magestic-wgs-reconcile --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+
+
+rule wgs_step_4_combine:
+    """Stage 4 fan-in — concatenate the reconciliation shards in manifest order."""
+    input:
+        shards=expand(str(RECONCILE_DIR / ("{sample}" + RECONCILE_SHARD_SUFFIX)), sample=SAMPLES),
+    output:
+        table=RECONCILE_TABLE,
+    log:
+        LOGS_DIR / "step_4_reconcile_combine.log",
+    threads: res("step_4_reconcile", "cpus")
+    resources:
+        mem_mb=res("step_4_reconcile", "mem_mb"),
+        runtime=runtime_min("step_4_reconcile"),
+    shell:
+        "magestic-wgs-reconcile --config {CONFIG_PATH} 2>&1 | tee {log}"
+
+
+# =============================================================================
+# Stage 5 — the Stage 2 x Stage 4 join (ORCHESTRATION-OWNED; no TRACE call)
+# =============================================================================
+# Stage 2 calls the edit from variant records in the donor window; Stage 4 calls
+# it from a pileup VAF over the same window. Two independent estimates of one
+# quantity, joined here on `sample`. Cohort-level: joining ACROSS reference groups
+# on `sample` is allowed, comparing coordinates across them is not (chrVIII is
+# CUP1-contracted and no single offset exists) — that refusal lives in
+# core/manifest.py, not in a rule.
+rule wgs_step_5_join_outcomes:
+    """Stage 5 — agreement matrix and disagreement list for Stage 2 vs Stage 4."""
+    input:
+        donor=DONOR_TABLE,
+        reconcile=RECONCILE_TABLE,
+    output:
+        join=JOIN_TABLE,
+        matrix=JOIN_MATRIX,
+        disagreements=JOIN_DISAGREEMENTS,
+    log:
+        LOGS_DIR / "step_5_join.log",
+    threads: res("step_5_join", "cpus")
+    resources:
+        mem_mb=res("step_5_join", "mem_mb"),
+        runtime=runtime_min("step_5_join"),
+    shell:
+        "magestic-wgs-join --config {CONFIG_PATH} 2>&1 | tee {log}"

@@ -1,0 +1,9 @@
+# Documentation build dependencies (MkDocs Material + mkdocstrings).
+# The MAGESTIC package itself is installed separately by .readthedocs.yaml
+# (post_install: pip install --no-deps .) so the API pages resolve against
+# the real package; griffe uses static analysis of src/ for the rest.
+mkdocs>=1.6
+mkdocs-material>=9.5
+mkdocstrings[python]>=0.26
+mkdocs-autorefs>=1.2
+pymdown-extensions>=10.0

@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="430" viewBox="0 0 1060 430">
+<defs><marker id="arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L0,7 L7,3.5 z" fill="#94a3b8"/></marker><marker id="arrb" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L0,7 L7,3.5 z" fill="#ff6aa0"/></marker></defs>
+<rect width="1060" height="430" fill="#0f172a"/>
+<g font-family="Inter, Helvetica Neue, Helvetica, Arial, sans-serif">
+<text x="40.0" y="34.0" font-size="18" fill="#f1f5f9" font-weight="700" text-anchor="start">100% barcode integration at the barcode locus</text>
+<text x="40.0" y="56.0" font-size="12.5" fill="#94a3b8" font-weight="400" text-anchor="start">I-SceI + SaCas9 cut both the plasmid and the barcode locus — forcing BC1 integration and removing the plasmid</text>
+<circle cx="150" cy="252" r="64" fill="none" stroke="#1e293b" stroke-width="8"/>
+<path d="M92.00 224.95 A64 64 0 0 1 208.00 224.95" stroke="#fbbf24" stroke-width="8" fill="none" stroke-linecap="butt"/>
+<line x1="95.6" y1="226.6" x2="88.4" y2="223.3" stroke="#fbbf24" stroke-width="1.6" stroke-linecap="round"/>
+<line x1="108.8" y1="208.4" x2="103.3" y2="202.5" stroke="#0f172a" stroke-width="1.6" stroke-linecap="round"/>
+<line x1="127.8" y1="196.2" x2="124.9" y2="188.8" stroke="#fbbf24" stroke-width="1.6" stroke-linecap="round"/>
+<line x1="150.0" y1="192.0" x2="150.0" y2="184.0" stroke="#0f172a" stroke-width="1.6" stroke-linecap="round"/>
+<line x1="172.2" y1="196.2" x2="175.1" y2="188.8" stroke="#fbbf24" stroke-width="1.6" stroke-linecap="round"/>
+<line x1="191.2" y1="208.4" x2="196.7" y2="202.5" stroke="#0f172a" stroke-width="1.6" stroke-linecap="round"/>
+<line x1="204.4" y1="226.6" x2="211.6" y2="223.3" stroke="#fbbf24" stroke-width="1.6" stroke-linecap="round"/>
+<text x="150.0" y="176.0" font-size="10.5" fill="#fbbf24" font-weight="700" text-anchor="middle">barcode</text>
+<path d="M82.85967226970186 214.11071082715722 L92.85967226970186 226.11071082715722 L84.85967226970186 234.11071082715722 L96.85967226970186 246.11071082715722" stroke="#fbbf24" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="33.9" y="238.6" width="56.0" height="19.0" rx="7.22" ry="7.22" fill="#43122a" stroke="#ff6aa0" stroke-width="2"/>
+<text x="61.9" y="251.3" font-size="9.5" fill="#ff6aa0" font-weight="700" text-anchor="middle">I-SceI</text>
+<path d="M203.14032773029814 214.11071082715722 L213.14032773029814 226.11071082715722 L205.14032773029814 234.11071082715722 L217.14032773029814 246.11071082715722" stroke="#fbbf24" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="210.1" y="238.6" width="56.0" height="19.0" rx="7.22" ry="7.22" fill="#06323f" stroke="#34c6e6" stroke-width="2"/>
+<text x="238.1" y="251.3" font-size="9.5" fill="#34c6e6" font-weight="700" text-anchor="middle">SaCas9</text>
+<text x="150.0" y="346.0" font-size="11.5" fill="#cbd5e1" font-weight="700" text-anchor="middle">barcoded plasmid</text>
+<line x1="226.0" y1="252.0" x2="330.0" y2="252.0" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" marker-end="url(#arr)"/>
+<text x="300.0" y="242.0" font-size="9.5" fill="#64748b" font-weight="400" text-anchor="middle" font-style="italic">cut both</text>
+<line x1="372.0" y1="250.0" x2="536.0" y2="250.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="372.0" y1="264.0" x2="536.0" y2="264.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="560.0" y1="250.0" x2="720.0" y2="250.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="560.0" y1="264.0" x2="720.0" y2="264.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<path d="M541 238 L551 250 L543 258 L555 270" stroke="#fbbf24" stroke-width="2.6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="486.0" y="214.5" width="56.0" height="19.0" rx="7.22" ry="7.22" fill="#43122a" stroke="#ff6aa0" stroke-width="2"/>
+<text x="514.0" y="227.2" font-size="9.5" fill="#ff6aa0" font-weight="700" text-anchor="middle">I-SceI</text>
+<rect x="556.0" y="214.5" width="56.0" height="19.0" rx="7.22" ry="7.22" fill="#06323f" stroke="#34c6e6" stroke-width="2"/>
+<text x="584.0" y="227.2" font-size="9.5" fill="#34c6e6" font-weight="700" text-anchor="middle">SaCas9</text>
+<text x="548.0" y="286.0" font-size="10.5" fill="#64748b" font-weight="400" text-anchor="middle">barcode locus</text>
+<text x="548.0" y="308.0" font-size="11" fill="#cbd5e1" font-weight="400" text-anchor="middle" font-family="SF Mono, Menlo, Consolas, monospace">gTatccTAGGGATAACAGGGTAATgagtAC</text>
+<line x1="488.6" y1="313.0" x2="607.4" y2="313.0" stroke="#fbbf24" stroke-width="2.4" stroke-linecap="round"/>
+<text x="548.0" y="325.0" font-size="8.5" fill="#fbbf24" font-weight="400" text-anchor="middle" font-style="italic">18-bp I-SceI site (SaCas9 guide X overlaps)</text>
+<line x1="728.0" y1="257.0" x2="812.0" y2="257.0" stroke="#94a3b8" stroke-width="2.2" stroke-linecap="round" marker-end="url(#arr)"/>
+<text x="770.0" y="246.0" font-size="11" fill="#cbd5e1" font-weight="700" text-anchor="middle">integrate</text>
+<line x1="818.0" y1="250.0" x2="898.0" y2="250.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="818.0" y1="264.0" x2="898.0" y2="264.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="950.0" y1="250.0" x2="1030.0" y2="250.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<line x1="950.0" y1="264.0" x2="1030.0" y2="264.0" stroke="#9aa8c0" stroke-width="3" stroke-linecap="round"/>
+<rect x="900.0" y="245.0" width="4.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<rect x="906.5" y="245.0" width="3.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<rect x="912.0" y="245.0" width="5.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<rect x="919.5" y="245.0" width="3.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<rect x="925.0" y="245.0" width="4.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<rect x="931.5" y="245.0" width="6.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<rect x="940.0" y="245.0" width="3.0" height="24.0" rx="1" ry="1" fill="#fbbf24"/>
+<text x="924.0" y="228.0" font-size="11.5" fill="#fbbf24" font-weight="700" text-anchor="middle">BC1 integrated</text>
+<text x="924.0" y="290.0" font-size="10.5" fill="#64748b" font-weight="400" text-anchor="middle" font-style="italic">~100% efficiency</text>
+<circle cx="832" cy="352" r="15" fill="none" stroke="#1e293b" stroke-width="4"/>
+<line x1="823.0" y1="343.0" x2="841.0" y2="361.0" stroke="#ff6aa0" stroke-width="2.4" stroke-linecap="round"/>
+<line x1="841.0" y1="343.0" x2="823.0" y2="361.0" stroke="#ff6aa0" stroke-width="2.4" stroke-linecap="round"/>
+<text x="856.0" y="356.0" font-size="9.5" fill="#64748b" font-weight="400" text-anchor="start">plasmid removed (SaCas9)</text>
+<text x="40.0" y="418.0" font-size="8.5" fill="#64748b" font-weight="400" text-anchor="start" font-style="italic">Roy et al., bioRxiv (2024)</text>
+<text x="1052.0" y="423.0" font-size="6" fill="#64748b" font-weight="400" text-anchor="end">barcode_integration.py · MAGESTIC v3.0.0 · schematic · rendered 2026-06-08</text>
+</g>
+</svg>

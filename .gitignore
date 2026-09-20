@@ -13,4 +13,12 @@ __pycache__/
 # Generated pipeline outputs under reproduce/ (large regenerable data,
 # keep only the source config/run scripts/README/checksums)
 reproduce/*/output/
+# Local virtualenvs
 .venv
+
+# macOS finder droppings
+.DS_Store
+**/.DS_Store
+
+# MkDocs build output (source lives in docs/)
+site/

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MAGESTIC">
+  <metadata>MAGESTIC mark — style "Journal Plate". Duotone: ink navy #16263f (genome duplex + homology arms + barcode), vermillion #e2502a (the edit), paper #f3efe6 tile. DSB shown as gaps in a bold two-strand DNA bar; donor edit seated in the cut, overlapping the broken ends; integrated barcode below. journal_clean/mark.svg, 2026-06-07.</metadata>
+
+  <!-- paper tile -->
+  <rect x="8" y="8" width="240" height="240" rx="50" ry="50" fill="#f3efe6"/>
+  <rect x="8" y="8" width="240" height="240" rx="50" ry="50" fill="none" stroke="#16263f" stroke-width="3" opacity="0.12"/>
+
+  <!-- ============ GENOMIC DUPLEX — bold two-strand bar with a clean DSB ============ -->
+  <!-- strands: 18px tall, 18px gap between them => survives 64px as two distinct bars -->
+  <!-- LEFT genome segment (homology arm = same ink as genome) -->
+  <rect x="38"  y="100" width="60" height="18" rx="9" fill="#16263f"/>
+  <rect x="38"  y="138" width="60" height="18" rx="9" fill="#16263f"/>
+
+  <!-- RIGHT genome segment -->
+  <rect x="158" y="100" width="60" height="18" rx="9" fill="#16263f"/>
+  <rect x="158" y="138" width="60" height="18" rx="9" fill="#16263f"/>
+
+  <!-- ============ DONOR EDIT — accent insert seated in the break ============ -->
+  <!-- narrower than the gap (gap 98->158 = 60px; donor 104->152 = 48px) so paper slivers -->
+  <!-- on each side keep the BREAK visible: cut + bridge, not one continuous bar -->
+  <rect x="104" y="100" width="48" height="18" rx="9" fill="#e2502a"/>
+  <rect x="104" y="138" width="48" height="18" rx="9" fill="#e2502a"/>
+
+  <!-- ============ INTEGRATED BARCODE — bold variable-width stripes at repaired site ============ -->
+  <rect x="101" y="176" width="11" height="40" rx="3" fill="#16263f"/>
+  <rect x="117" y="176" width="6"  height="40" rx="3" fill="#16263f"/>
+  <rect x="128" y="176" width="15" height="40" rx="3" fill="#e2502a"/>
+  <rect x="148" y="176" width="7"  height="40" rx="3" fill="#16263f"/>
+</svg>

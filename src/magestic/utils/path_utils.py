@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 # Base directories. Defaults are public placeholders; set MAGESTIC_BASE_DIR /
 # MAGESTIC_COMMON_DIR (e.g. in ~/.bashrc on the deployment host) to point at the
-# real common/ tree without editing package code.
+# real common/ tree without editing package code. The placeholder is deliberate:
+# this repo is public, and 020c11b fixed the integration tests to locate their
+# data through it rather than a hardcoded Oak path.
 DEFAULT_BASE_DIR = Path(
     os.environ.get("MAGESTIC_BASE_DIR", "/path/to")
 )

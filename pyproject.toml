@@ -62,9 +62,25 @@ redi = [
     "pyarrow>=14",
     "python-levenshtein>=0.21",
 ]
+# WGS submodule (ARCHITECTURE_POLICY §11) — orchestration over a PINNED TRACE.
+# The dependency is ONE-DIRECTIONAL: TRACE owns the algorithms and never imports magestic.
+# rapidfuzz is HARD, not optional: donor_outcome defines `levenshtein` twice (a rapidfuzz
+# wrapper and a pure-Python fallback under `except ImportError`), and dual-path parity
+# requires both paths provably use one implementation.
+# NOTE: `samtools` must also be on PATH — sv_plasmid shells out to it three times. That is
+# not expressible as a Python dependency; step_3 preflights the binary instead.
+# ⚠️ The TRACE pin is INERT until trace `main` is pushed: the sha exists only on a local
+# branch, so `pip install 'magestic[wgs]'` (and hence `[full]`) will FAIL TO RESOLVE today.
+# That loud failure is deliberate — the previous TRACE HEAD silently ships 1 of the 4 wgs
+# modules (a 9-name `trace_crispr.wgs.__all__`), and a quiet 1-of-4 API is worse.
+wgs = [
+    "pysam>=0.21",
+    "rapidfuzz>=3.0",
+    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@7c4c10f1d1a79acd231ba45176daaa40747d30fc",
+]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [
-    "magestic[align,screen,snakemake,redi]",
+    "magestic[align,screen,snakemake,redi,wgs]",
 ]
 # Development and testing
 dev = [
@@ -94,6 +110,13 @@ magestic-redi-annotate     = "magestic.pipelines.redi._cli:annotate_main"
 magestic-redi-cross-array  = "magestic.pipelines.redi._cli:cross_array_main"
 magestic-redi-wgs-check    = "magestic.pipelines.redi._cli:wgs_check_main"
 magestic-redi-rearray      = "magestic.pipelines.redi._cli:rearray_main"
+# WGS submodule (ARCHITECTURE_POLICY §11) — umbrella + per-step CLIs
+magestic-wgs               = "magestic.pipelines.wgs._cli:umbrella_main"
+magestic-wgs-bc1           = "magestic.pipelines.wgs._cli:bc1_main"
+magestic-wgs-donor-precall = "magestic.pipelines.wgs._cli:donor_precall_main"
+magestic-wgs-sv-plasmid    = "magestic.pipelines.wgs._cli:sv_plasmid_main"
+magestic-wgs-reconcile     = "magestic.pipelines.wgs._cli:reconcile_main"
+magestic-wgs-join          = "magestic.pipelines.wgs._cli:join_outcomes_main"
 
 # Annotation utilities
 magestic-harmonize-oligos  = "magestic.utils.harmonize_oligos:_cli"
@@ -103,6 +126,17 @@ magestic-annotate-deseq2  = "magestic.utils.annotate_deseq2:_cli"
 Homepage = "https://github.com/kevinroy-lab/magestic"
 Repository = "https://github.com/kevinroy-lab/magestic"
 "Bug Tracker" = "https://github.com/kevinroy-lab/magestic/issues"
+
+[tool.hatch.metadata]
+# Required by the `wgs` extra's PEP 508 direct reference (the pinned TRACE sha).
+# 🔴 Without this, hatchling refuses to generate metadata AT ALL — so `pip install -e .`
+# fails for EVERY lane, not just for `[wgs]`, and fails even under `--no-deps`, because
+# extras are validated during metadata generation rather than during resolution. Measured:
+#   ValueError: Dependency #3 of option `wgs` of field `project.optional-dependencies`
+#   cannot be a direct reference unless field `tool.hatch.metadata.allow-direct-references`
+#   is set to `true`
+# This permits the direct reference; it does not relax the pin, which stays exact.
+allow-direct-references = true
 
 [tool.hatch.version]
 path = "src/magestic/__init__.py"

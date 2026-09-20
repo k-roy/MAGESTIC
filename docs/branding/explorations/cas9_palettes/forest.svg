@@ -1,0 +1,37 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MAGESTIC Cas9 cleavage mark">
+<defs><linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#173a2e"/><stop offset="1" stop-color="#0a1c17"/></linearGradient><linearGradient id="lobe" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3ddc84"/><stop offset="1" stop-color="#16a35a"/></linearGradient><linearGradient id="lobe2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6ef0a8"/><stop offset="1" stop-color="#2fce98"/></linearGradient><radialGradient id="spark" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fff4d4"/><stop offset="0.45" stop-color="#ffc24b"/><stop offset="1" stop-color="#ffc24b" stop-opacity="0"/></radialGradient></defs>
+<rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="url(#tile)"/>
+
+<!-- DNA duplex, cleaved -->
+<rect x="22"  y="150" width="86" height="9" rx="4.5" fill="#e3f1ec"/>
+<rect x="22"  y="167" width="86" height="9" rx="4.5" fill="#a8cbc0"/>
+<g stroke="#6f998c" stroke-width="3" stroke-linecap="round"><line x1="34" y1="159" x2="34" y2="167"/><line x1="50" y1="159" x2="50" y2="167"/><line x1="66" y1="159" x2="66" y2="167"/><line x1="82" y1="159" x2="82" y2="167"/><line x1="98" y1="159" x2="98" y2="167"/></g>
+<rect x="148" y="150" width="86" height="9" rx="4.5" fill="#e3f1ec"/>
+<rect x="148" y="167" width="86" height="9" rx="4.5" fill="#a8cbc0"/>
+<g stroke="#6f998c" stroke-width="3" stroke-linecap="round"><line x1="158" y1="159" x2="158" y2="167"/><line x1="174" y1="159" x2="174" y2="167"/><line x1="190" y1="159" x2="190" y2="167"/><line x1="206" y1="159" x2="206" y2="167"/><line x1="222" y1="159" x2="222" y2="167"/></g>
+
+<!-- guide RNA (sgRNA): clean continuous strand threading into the cleft -->
+<path d="M44 56 Q92 78 120 128" stroke="#7fe6d0" stroke-width="5" fill="none"
+      stroke-linecap="round" opacity="0.95" stroke-dasharray="11 7"/>
+
+<!-- cleavage flash -->
+<circle cx="128" cy="163" r="34" fill="url(#spark)"/>
+<path d="M128 136 L121 156 L133 163 L121 170 L128 190"
+      stroke="#fff4d4" stroke-width="6" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+
+<!-- bilobed Cas9 -->
+<path d="M70 92 C58 70 78 50 104 54 C128 58 134 82 124 104 C118 118 96 124 84 116 C74 110 74 102 70 92 Z"
+      fill="url(#lobe2)" stroke="#0f8f6e" stroke-width="3"/>
+<path d="M118 92 C112 66 140 50 168 58 C196 66 200 100 184 124 C172 142 146 148 128 138 C112 130 116 110 118 92 Z"
+      fill="url(#lobe)" stroke="#0a5c3c" stroke-width="3"/>
+<path d="M120 122 L128 150 L140 124" fill="#0a1c17" opacity="0.85"/>
+
+<!-- integrated barcode -->
+<g>
+  <rect x="104" y="198" width="8"  height="36" rx="2.5" fill="#3ddc84"/>
+  <rect x="116" y="198" width="4"  height="36" rx="2"   fill="#e3f1ec"/>
+  <rect x="124" y="198" width="11" height="36" rx="2.5" fill="#7fe6d0"/>
+  <rect x="139" y="198" width="4"  height="36" rx="2"   fill="#e3f1ec"/>
+  <rect x="147" y="198" width="8"  height="36" rx="2.5" fill="#ffc24b"/>
+</g>
+</svg>

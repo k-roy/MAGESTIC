@@ -1,0 +1,161 @@
+# =============================================================================
+# MAGESTIC wgs — per-cohort config (WGS barcoded-alignment orchestration)
+# =============================================================================
+# Worked example AND template: the yKR888 v11 validation cohort (288 clonal WGS
+# BAMs, plate_{1B,2B,2D}_clone_{1..96}). To add a cohort, copy this file to
+# config/screens/<cohort>_wgs.yaml and edit paths + manifest; the workflow
+# (workflow/Snakefile.wgs) is identical for every cohort.
+#
+# 🔴 THIS FILE IS READ TWICE, BY TWO DIFFERENT READERS, AND THAT IS THE POINT:
+#   - every step CLI parses it with `magestic.pipelines.wgs.config.load_config()`
+#     — the only interpreter that makes an analysis decision;
+#   - workflow/Snakefile.wgs reads the same document with `yaml.safe_load` for
+#     file names, the fan-out list and scheduling resources, never for analysis.
+# It is therefore passed as `--config config=<this file>` and NEVER as
+# `--configfile <this file>` (ARCHITECTURE_POLICY §4).
+#
+# 🔴 THE TOP-LEVEL KEY SET IS CLOSED. `load_config()` RAISES on any key it does
+# not know, so the workflow's own knobs are NOT here: step selection is a
+# snakemake config entry (`--config steps=1`), mirroring path (A)'s `--steps 1`.
+# It also raises on `genome:` / `reference:` / `bam_dir:` — reference is a
+# per-SAMPLE attribute (D1) and BAMs are never discovered by glob.
+#
+# 🔴 No real cluster paths, usernames or accounts in a committed config — every
+# path below is a `/path/to/...` PLACEHOLDER (ARCHITECTURE_POLICY §8).
+# =============================================================================
+
+cohort_name: "yKR888_v11_cohort"
+sequencing_date: "20260728"
+
+# --- Paths -------------------------------------------------------------------
+# Only `project_root` and `manifest` are required; relative values resolve under
+# project_root, and every output location is derived from `processed`
+# (bc1_calls/, donor_precall/, sv_plasmid/, reconcile/, logs/ …), never named here.
+paths:
+  project_root:   "/path/to/projects/QTL/WGS_barcoded_alignment/validation_yKR888_20260728"
+  manifest:       "keyfiles/v11_cohort_manifest.tsv"
+  intermediate:   "intermediate_data"
+  processed:      "processed_data"
+  keyfiles:       "keyfiles"
+  # Search root for RELATIVE `reference` values in the manifest. NOT "the"
+  # reference — there is no such thing at cohort level (D1).
+  reference_root: "/path/to/projects/QTL/WGS_barcoded_alignment/t2t"
+
+# --- MANIFEST (paths.manifest) -----------------------------------------------
+# A header'd TSV, one row per sample. The fan-out comes from here and NEVER from
+# a glob over a BAM directory.
+#   required: sample, bam, reference      optional: cohort, plate, background
+# Relative `bam` / `reference` values resolve against the MANIFEST'S OWN parent
+# directory, so a manifest relocates with its data.
+#
+# 🔴 `reference` is per SAMPLE. Measured over 1137 BAMs: 480 on the yKR888 v11
+# reference, 315 on yKR900, 342 on yKR901 — and one BAM directory (the 20260911
+# rearray cohort) spans two of them. core/manifest.py cross-checks each row
+# against the BAM's own `@PG ID:bwa` line and fails loudly on a mismatch.
+
+# --- Stage 1: bc1 calling (TRACE bc1_consensus) ------------------------------
+bc1:
+  # TRACE defaults to ".sort.dedup.recal2.bam", which matches NONE of our
+  # `plate_1B_clone_1.bam` files. Stated explicitly so the default never applies.
+  bam_suffix: ".bam"
+  use_plasmid: true
+  # null = BRIDGE-LESS. Pre-registered consequence: `bridge_tier == "NONE"` on
+  # every row and a depressed `confidence` column. That is expected, not a
+  # defect — it isolates the caller from the bridge, which is what §7 P3 tests.
+  bridge_table: null
+  bridge_bc1_col: "bc1"
+  bridge_oligo_col: "oligo_name"
+  bridge_count_col: null
+  bridge_table_revcomp: false
+
+# --- Barcode tracks ----------------------------------------------------------
+# core/locus_config.py renders this block as the FLAT key/value sidecar TRACE's
+# load_locus_config() can actually parse (it splits on the first ":" and ignores
+# nesting entirely, so nested YAML must never be handed to it directly).
+locus:
+  # Genome track — verified against the v11 reference with `samtools faidx`:
+  # exactly 20 N's, flanked as below. TrackConfig.validate_against_reference()
+  # asserts precisely this, so a drifted reference fails loudly rather than
+  # calling barcodes out of the wrong window.
+  barcode_locus: "chrII:638845-638864"
+  barcode_left_sequence: "ACCCTGTTAT"
+  barcode_right_sequence: "GAGCATGACC"
+  # Plasmid track — VERIFIED by reading the reference, 2026-09-13. The contig
+  # (10,790 bp) carries FOUR N-runs; only one of them is the bc1 cassette, so a
+  # "find the N-run" heuristic would have picked the wrong window:
+  #   1-based 1768-1787  20 N, right flank GTTTAAGAGC  -> the sgRNA SPACER
+  #   1-based 6194-6213  20 N                          -> the bc1 CASSETTE (this one)
+  #   1-based 6314-6439 126 N                          -> the donor variable region
+  #   1-based 6464-6473  10 N                          -> a short degenerate run
+  # The bc1 cassette is identified positively, not by length: its flanks are the
+  # exact reverse complement of the genome track's, which is the inversion TRACE's
+  # TrackConfig docstring asserts ("plasmid left flank == revcomp(genome right
+  # flank)") and the reason tracks_from_config sets genome revcomp=True and
+  # plasmid revcomp=False.
+  #   revcomp("GAGCATGACC") == "GGTCATGCTC"  == plasmid_bc_left_sequence
+  #   revcomp("ACCCTGTTAT") == "ATAACAGGGT"  == plasmid_bc_right_sequence
+  plasmid_bc_locus: "blank_guide_donor_plasmid_pF746_SpCas9:6194-6213"
+  plasmid_bc_left_sequence: "GGTCATGCTC"
+  plasmid_bc_right_sequence: "ATAACAGGGT"
+
+# --- Stage 2: donor pre-calling (TRACE donor_outcome) — 🔴 GATED -------------
+# Gated three ways (spec §8.1–§8.3): no per-oligo step-2 donor exists for the
+# 2021 pool, so the SYNTHETIC_ERROR axis ships DISABLED and the output is stamped
+# `synthetic_error_axis=disabled` (a zero in `synthetic_errors` on an unstamped
+# file is a wrong answer waiting to be quoted); no gVCF exists anywhere, so
+# `designed_variant_unedited` cannot be separated from `unknown`; and
+# precall_sample crashes on the `integrated_plasmid_<oligo>` contigs the
+# composite-reference standard puts in every reference.
+donor_precall:
+  synthetic_donor_source: "design_donor"
+  ne_threshold: 1
+  quantification_window_size: 10
+  quantification_window_cov_perc: 1.0
+  # bcftools writes FORMAT GT:PL:DP:AD (AD 4th); TRACE's positional gVCF parser
+  # reads AD from slot 2. core/vcf_adapter.py re-represents, it does not derive.
+  ad_format_slot_in: 4
+  ad_format_slot_out: 2
+  # The per-plate 96-sample merged VCFs to split per sample. Empty on a cohort
+  # that has none — which is the case for every cohort inventoried so far.
+  plate_vcfs: []
+
+# --- Stage 3: SV / plasmid integration (TRACE sv_plasmid) --------------------
+# `samtools` must be on PATH — sv_plasmid shells out to it three times. That is
+# not expressible as a Python dependency, so step 3 preflights the binary.
+sv_plasmid:
+  blacklist: "/path/to/common/annotation_files/REDI_reads_mapped_regions.txt"
+  samtools: "samtools"
+  flexible_bases: 6
+  dup_mode: "standard"        # "parity" reproduces the legacy Perl duplicate-flag bug
+  bp_to_extend: 1000
+  # null = derive per contig via integrated_plasmid_junction(). TRACE's 1129 is
+  # the parity literal and its own docstring says production must derive it.
+  junction_distance: null
+
+# --- Stage 4: reconciliation (TRACE reconcile) -------------------------------
+# Only the input tables live here. classify_site's tau_full / tau_wt / min_cov
+# and window_edit_vaf's min_base_qual are deliberately ABSENT: they are TRACE
+# thresholds, and a threshold in this file would be the orchestration layer
+# quietly owning an algorithm decision.
+reconcile:
+  oligo_windows:     "/path/to/common/annotation_files/<oligo_windows>.tsv"
+  oligo_assignments: "/path/to/keyfiles/<per_sample_oligo_assignment>.tsv"
+
+# --- Cluster resources -------------------------------------------------------
+# Scheduling only — never an analysis parameter, and never rendered into a rule's
+# command string. One key per stage; an unrecognized key is a validation error in
+# both readers. `time` is "HH:MM:SS" (config.py's vocabulary); the workflow
+# converts it to the `runtime` MINUTES the slurm executor plugin actually reads
+# (the CAVEAT recorded at the bottom of workflow/profiles/sherlock/config.yaml).
+#
+# Per-sample steps are chunked into cluster jobs with `--group-components`
+# (workflow/profiles/sherlock_wgs/config.yaml), so `time` here is the budget for
+# ONE sample and the group size sets the job's total.
+resources:
+  step_1_bc1:           { mem_mb: 8000,  time: "01:00:00", cpus: 1 }
+  step_2_donor_precall: { mem_mb: 16000, time: "02:00:00", cpus: 1 }
+  step_3_sv_plasmid:    { mem_mb: 16000, time: "02:00:00", cpus: 2 }
+  step_4_reconcile:     { mem_mb: 8000,  time: "01:00:00", cpus: 1 }
+  step_5_join:          { mem_mb: 8000,  time: "00:30:00", cpus: 1 }
+
+# python: "/path/to/anaconda3/bin/python"   # optional interpreter override
