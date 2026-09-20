@@ -51,6 +51,8 @@ logging.basicConfig(
 )
 from magestic.utils.bc1_extraction import (
     extract_bc1 as _canonical_extract_bc1, ANCHOR_TIERS, EMITTING_TIERS)
+from magestic.utils.collapsed_fastq import (
+    iter_collapsed_fastq, COLLAPSED_HEADER_FORMATS)
 
 logger = logging.getLogger(__name__)
 
@@ -66,40 +68,18 @@ def sample_reads_from_collapsed_fastq(
     """
     Sample first N reads from a collapsed FASTQ file.
 
-    Collapsed FASTQs have read counts encoded in the read name.
+    Collapsed FASTQs have read counts encoded in the read name. Both producer
+    formats are handled by magestic.utils.collapsed_fastq -- see there, and
+    planning/210_bc1_recall_code_gate.md, for why this is not inlined.
 
     Returns:
         List of (sequence, count) tuples
     """
-    reads = []
-    open_fn = gzip.open if str(fastq_path).endswith(".gz") else open
-
-    with open_fn(fastq_path, "rt") as f:
-        while len(reads) < n_sample:
-            header = f.readline().strip()
-            if not header:
-                break
-
-            sequence = f.readline().strip()
-            f.readline()  # plus line
-            f.readline()  # quality line
-
-            # Parse count from header
-            count = 1
-            if "count=" in header:
-                try:
-                    count = int(header.split("count=")[1].split()[0])
-                except (ValueError, IndexError):
-                    pass
-            elif "-" in header:
-                try:
-                    count = int(header.split("-")[-1])
-                except ValueError:
-                    pass
-
-            reads.append((sequence, count))
-
-    return reads
+    return [
+        (sequence, count)
+        for sequence, count, _qual, _fmt in iter_collapsed_fastq(
+            fastq_path, limit=n_sample)
+    ]
 
 
 def build_position_conservation(
@@ -829,62 +809,51 @@ def parse_collapsed_fastq(
     Parse collapsed FASTQ and extract BC1 counts.
 
     Returns:
-        Tuple of (bc1_counts, total_reads, matched_reads, length_stats, tier_stats)
-        where length_stats is a Counter of BC1 lengths
+        Tuple of (bc1_counts, total_reads, matched_reads, length_stats,
+                  tier_stats, n_records, header_formats)
+        where length_stats is a Counter of BC1 lengths, n_records is the number
+        of collapsed RECORDS read (total_reads is the number of READS they
+        represent -- the two differ by the collapse factor and conflating them
+        is the defect fixed on 2026-09-19) and header_formats is the per-record
+        tally of read-name formats, for the provenance sidecar.
     """
     bc1_counts = defaultdict(int)
     total_reads = 0
     matched_reads = 0
     length_stats = Counter()
     tier_stats = Counter()
+    header_formats = Counter()
+    n_records = 0
 
     min_bc1_len = bc1_length - length_tolerance
     max_bc1_len = bc1_length + length_tolerance
 
-    open_fn = gzip.open if str(fastq_path).endswith(".gz") else open
+    # Read counts come from magestic.utils.collapsed_fastq, which resolves BOTH
+    # producer formats per record and RAISES on an unrecognized read name. The
+    # previous inline block recognized only ``count=`` and silently weighted
+    # every legacy ``@12`` record as one read -- see
+    # planning/210_bc1_recall_code_gate.md for the measurement.
+    for sequence, count, _quality, _fmt in iter_collapsed_fastq(
+            fastq_path, format_counter=header_formats):
+        n_records += 1
+        total_reads += count
 
-    with open_fn(fastq_path, "rt") as f:
-        while True:
-            # Read 4 lines (FASTQ format)
-            header = f.readline().strip()
-            if not header:
-                break
+        # Extract BC1 (now returns 4 values)
+        bc1, orientation, anchor_tier, actual_length = extract_bc1_from_sequence(
+            sequence, bc1_prefix, bc1_suffix, bc1_length, length_tolerance,
+            established_offset=established_offset
+        )
+        tier_stats[anchor_tier] += count
 
-            sequence = f.readline().strip()
-            plus = f.readline().strip()
-            quality = f.readline().strip()
+        if bc1 and "N" not in bc1:
+            # Validate length is within tolerance
+            if min_bc1_len <= actual_length <= max_bc1_len:
+                bc1_counts[bc1] += count
+                matched_reads += count
+                length_stats[actual_length] += count
 
-            # Extract count from collapsed FASTQ header (format: @seq_123_count=456)
-            count = 1
-            if "count=" in header:
-                try:
-                    count = int(header.split("count=")[1].split()[0])
-                except (ValueError, IndexError):
-                    pass
-            elif "-" in header:
-                # Alternative format: @seq-456 where 456 is count
-                try:
-                    count = int(header.split("-")[-1])
-                except ValueError:
-                    pass
-
-            total_reads += count
-
-            # Extract BC1 (now returns 4 values)
-            bc1, orientation, anchor_tier, actual_length = extract_bc1_from_sequence(
-                sequence, bc1_prefix, bc1_suffix, bc1_length, length_tolerance,
-                established_offset=established_offset
-            )
-            tier_stats[anchor_tier] += count
-
-            if bc1 and "N" not in bc1:
-                # Validate length is within tolerance
-                if min_bc1_len <= actual_length <= max_bc1_len:
-                    bc1_counts[bc1] += count
-                    matched_reads += count
-                    length_stats[actual_length] += count
-
-    return bc1_counts, total_reads, matched_reads, length_stats, tier_stats
+    return (bc1_counts, total_reads, matched_reads, length_stats, tier_stats,
+            n_records, header_formats)
 
 
 def main():
@@ -985,7 +954,8 @@ def main():
                            f"MIXED. The layout call is least trustworthy here.")
 
     # PASS 2 -- extract with that offset established.
-    bc1_counts, total_reads, matched_reads, length_stats, tier_stats = parse_collapsed_fastq(
+    (bc1_counts, total_reads, matched_reads, length_stats, tier_stats,
+     n_records, header_formats) = parse_collapsed_fastq(
         args.input,
         bc1_prefix,
         bc1_suffix,
@@ -994,7 +964,15 @@ def main():
     )
 
     match_rate = 100 * matched_reads / total_reads if total_reads > 0 else 0
-    logger.info(f"  Total reads: {total_reads:,}")
+    # READS and RECORDS are different quantities. Log both, always: a run whose
+    # collapse factor is 1.00 on a legacy tree is the signature of the count
+    # defect fixed 2026-09-19 (planning/210_bc1_recall_code_gate.md).
+    collapse_factor = total_reads / n_records if n_records else 0
+    logger.info(f"  Collapsed records: {n_records:,}")
+    logger.info(f"  Total reads: {total_reads:,} "
+                f"(collapse factor {collapse_factor:.2f} reads/record)")
+    logger.info(f"  Read-name formats: "
+                f"{dict(header_formats.most_common())}")
     logger.info(f"  Matched reads: {matched_reads:,} ({match_rate:.1f}%)")
     logger.info(f"  Unique BC1s: {len(bc1_counts):,}")
 
