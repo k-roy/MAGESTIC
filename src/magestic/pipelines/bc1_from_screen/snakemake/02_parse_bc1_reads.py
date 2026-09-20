@@ -1095,6 +1095,14 @@ def main():
 
     bc1_tiers = stats["bc1_tiers"]
     bc1_orientations = stats["bc1_orientations"]
+    # The schema is declared, not inferred from the rows. A sample that yields
+    # ZERO barcodes is a real result -- an empty or failed well -- and it must
+    # still produce a valid table with the right header, so downstream joins and
+    # the counts==sum(n_<tier>) check see a schema rather than a KeyError.
+    # pd.DataFrame([]) has no columns at all, which crashed sort_values("counts")
+    # on 4 genuinely empty 2021 samples during the first Phase A run.
+    OUT_COLUMNS = (["bc1", "sample_name", "counts"]
+                   + [f"n_{t}" for t in EMITTING_TIERS] + ["n_fwd", "n_rev"])
     rows = []
     for bc1, count in bc1_counts.items():
         tiers = bc1_tiers[bc1]
@@ -1108,7 +1116,13 @@ def main():
         row["n_fwd"] = orients.get("fwd", 0)
         row["n_rev"] = orients.get("rev", 0)
         rows.append(row)
-    output_df = pd.DataFrame(rows)
+    output_df = pd.DataFrame(rows, columns=OUT_COLUMNS)
+    if not len(output_df):
+        logger.warning(
+            "  ZERO barcodes passed extraction for this sample. Writing an EMPTY "
+            "table with the full header plus its provenance sidecar -- an empty "
+            "well is a result, not an error, and the sidecar records why "
+            "(total_reads=%d, matched_reads=%d).", total_reads, matched_reads)
 
     # Sort by counts descending
     output_df = output_df.sort_values("counts", ascending=False)
