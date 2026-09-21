@@ -210,3 +210,28 @@ def test_ambiguous_gdb_candidate_evidence_survives_aggregation(add_neighbor_dono
     assert pd.isna(row['guide']) and row['guide_evidence_conflict']
     assert set(json.loads(row['guide_candidates'])) == expected
     assert {item['guide'] for item in json.loads(row['gdb_candidates'])} == expected
+
+
+@pytest.mark.parametrize('collapse', [False, True])
+def test_complete_native_annotation_batches_retain_all_candidate_records(collapse):
+    # Complete, disjoint PCR observations annotated against separate GDB tables.
+    # This is an accepted input composition, not the runner's single-table route.
+    outputs = []
+    for barcode, count, pcr, guide, library, scaffold, support in [
+        ('G'*20, 20, 'p1', None, 'L1', 'S1', 1000),
+        ('G'*19+'A' if collapse else 'G'*20, 10, 'p2', 'G'*20, 'L2', 'S2', 10),
+    ]:
+        observations = pd.DataFrame(dict(bc1=[barcode], donor=['A'*129], bc0=['A'*10],
+                                         counts=[count], pcr_replicate_id=[pcr]))
+        annotations = pd.DataFrame(dict(donor=['A'*129], bc0=['A'*10], guide=[guide],
+                                        library_ID=[library], scaffold=[scaffold], counts=[support]))
+        outputs.append(merge_data_sources(df_2x300=observations, df_gdb=annotations))
+    complete = pd.concat(outputs, ignore_index=True)
+    expected = {json.dumps(item, sort_keys=True) for value in complete['gdb_candidates']
+                for item in json.loads(value)}
+    result = aggregate(complete, collapse_sequences=collapse)
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row['counts'] == 30 and row['num_PCR_replicates'] == 2
+    assert row['guide'] == 'G'*20 and row['library_id'] == 'L2' and row['scaffold'] == 'S2'
+    assert {json.dumps(item, sort_keys=True) for item in json.loads(row['gdb_candidates'])} == expected

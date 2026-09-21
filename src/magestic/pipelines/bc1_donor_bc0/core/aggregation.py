@@ -75,7 +75,9 @@ def _combine(group, count_columns, representative=None):
                         and _text(item.get('donor')) == _text(row.get('donor'))]
             if carriers:
                 carrier = max(carriers, key=lambda item: item['_representative_reads'])
-                for column in ('guide', 'donor_from_gdb', 'library_id', 'scaffold', 'gdb_candidates', 'counts_gdb'):
+                # Structured evidence belongs to the whole group. Only scalar
+                # display metadata comes from this coherent carrier record.
+                for column in ('guide', 'donor_from_gdb', 'library_id', 'scaffold', 'counts_gdb'):
                     if column in carrier:
                         row[column] = carrier[column]
     return row
