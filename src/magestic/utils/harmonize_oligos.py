@@ -40,7 +40,6 @@ PROJECT_DIR = BASE_DIR / "projects/QTL/20260116_variant_annotation_harmonization
 SCRIPTS_DIR = PROJECT_DIR / "scripts"
 KEYFILES_DIR = PROJECT_DIR / "keyfiles"
 OUTPUT_DIR = BASE_DIR / "common/annotation_files"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -1283,8 +1282,14 @@ def main(args=None):
     combined = flag_incomplete_frameshifts(combined)
 
     # Write outputs
-    # Write outputs
     print("\nWriting output files...")
+    for output_path in (
+        PATHS.output_file,
+        PATHS.sample_output_file,
+        PATHS.stratified_sample_file,
+        PATHS.debug_output_file,
+    ):
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(PATHS.output_file, sep="\t", index=False)
     combined.sample(n=min(100, len(combined)), random_state=42).to_csv(
         PATHS.sample_output_file, sep="\t", index=False
