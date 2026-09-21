@@ -1,0 +1,188 @@
+"""Aggregate observed links while retaining scoped denominator and PCR evidence."""
+from collections import defaultdict
+import json
+
+import numpy as np
+import pandas as pd
+from rapidfuzz.distance.Levenshtein import distance
+
+from .merge import SCOPE_COLUMNS, _count, _ids, _text
+
+
+def _scope(row, columns):
+    return tuple(_text(row.get(column)) for column in columns)
+
+
+def _union(values):
+    result = set()
+    for value in values:
+        result.update(value)
+    return result
+
+
+def _combine(group, count_columns, representative=None):
+    """Retain a real representative and combine only declared evidence fields."""
+    records = group.to_dict('records')
+    row = dict(representative if representative is not None else
+               max(records, key=lambda item: item['_representative_reads']))
+    for column in count_columns:
+        row[column] = sum(item[column] for item in records)
+    for column in ('_pcr_ids', '_original_bc1s'):
+        row[column] = _union(item[column] for item in records)
+    row['_pcr_lower_bound'] = max(item['_pcr_lower_bound'] for item in records)
+    row['pcr_support_exact'] = all(item['pcr_support_exact'] for item in records if item['counts'] > 0)
+    for column in ('has_2x150', 'has_2x300', 'has_gdb', 'has_donor_conflict', 'gdb_ambiguous'):
+        if column in group:
+            row[column] = any(bool(item[column]) for item in records if pd.notna(item[column]))
+    if 'guide' in group:
+        guides = {_text(item.get('guide')) for item in records} - {None}
+        row['guide_candidates'] = json.dumps(sorted(guides))
+        if len(guides) > 1:
+            row['guide'] = None
+            row['guide_evidence_conflict'] = True
+        elif len(guides) == 1 and _text(row.get('guide')) is None:
+            # Carry a whole annotation bundle only for the same observed donor.
+            carriers = [item for item in records if _text(item.get('guide'))
+                        and _text(item.get('donor')) == _text(row.get('donor'))]
+            if carriers:
+                carrier = max(carriers, key=lambda item: item['_representative_reads'])
+                for column in ('guide', 'donor_from_gdb', 'library_id', 'scaffold', 'gdb_candidates', 'counts_gdb'):
+                    if column in carrier:
+                        row[column] = carrier[column]
+    return row
+
+
+def _collapse(frame, group_columns, sequence_column, count_columns, threshold):
+    """Greedy existing-distance policy, preserving each row's evidence bundle."""
+    rows = []
+    for _, group in frame.groupby(group_columns, dropna=False, sort=False):
+        group = group.reset_index(drop=True)
+        while len(group):
+            top_index = group['counts'].idxmax()
+            representative = group.loc[top_index].to_dict()
+            sequence = _text(representative[sequence_column])
+            if sequence is None:
+                # Unknown sequences cannot be error-collapsed; still consume the row.
+                mask = group.index == top_index
+            else:
+                mask = group[sequence_column].map(
+                    lambda value: _text(value) is not None and distance(str(value), sequence) <= threshold)
+            rows.append(_combine(group.loc[mask], count_columns, representative))
+            group = group.loc[~mask].reset_index(drop=True)
+    return pd.DataFrame(rows, columns=frame.columns.union(pd.Index(['guide_candidates', 'guide_evidence_conflict']), sort=False))
+
+
+def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequences=True,
+                            show_progress=True):
+    """Keep all count evidence until scoped barcode denominators are calculated.
+
+    A raw barcode sent to multiple representatives by separate link collapses has
+    ambiguous identity: its affected purity is undefined rather than invented.
+    Min-PCR support is a label. Only the explicit final min-read rule drops rows.
+    """
+    frame = df.copy()
+    for column in ('bc1', 'donor', 'bc0'):
+        if column not in frame:
+            if len(frame):
+                raise ValueError(f'Missing link identity column: {column}')
+            frame[column] = pd.Series(dtype=object)
+    if 'counts' not in frame:
+        if 'total_counts' in frame:
+            frame['counts'] = frame['total_counts']
+        else:
+            source_columns = [column for column in ('counts_2x150', 'counts_2x300') if column in frame]
+            if not source_columns and len(frame):
+                raise ValueError('Missing BDB read count column')
+            frame['counts'] = frame[source_columns].sum(axis=1) if source_columns else pd.Series(dtype='int64')
+    count_columns = [column for column in ('counts', 'total_counts', 'counts_2x150', 'counts_2x300') if column in frame]
+    for column in count_columns:
+        frame[column] = frame[column].map(_count)
+    for column in ('bc1', 'donor', 'bc0'):
+        frame[column] = frame[column].map(_text)
+    scopes = [column for column in (*SCOPE_COLUMNS, 'input_library_scope') if column in frame]
+    # SPS identifies construct evidence, not an independently transformed pool.
+    # It can constrain link collapsing but cannot split a barcode denominator.
+    link_scopes = scopes + (['SPS'] if 'SPS' in frame else [])
+    if frame.empty:
+        for column, dtype in [('total_bc1_counts', float), ('bc1_purity', float),
+                              ('unresolved_bc1_counts', float), ('num_distinct_donors', int),
+                              ('num_PCR_replicates', int), ('support_tier', object),
+                              ('pcr_replicate_ids', object), ('barcode_identity_ambiguous', bool)]:
+            frame[column] = pd.Series(dtype=dtype)
+        return frame
+
+    original_totals = defaultdict(int)
+    original_unresolved = defaultdict(int)
+    ids, lower, exact, origins = [], [], [], []
+    for row in frame.to_dict('records'):
+        key = (_scope(row, scopes), row['bc1'])
+        original_totals[key] += row['counts']
+        if row['donor'] is None or row['bc0'] is None:
+            original_unresolved[key] += row['counts']
+        identities = set()
+        if row['counts']:
+            for column in ('pcr_replicate_ids', 'pcr_replicate_id', 'sample_number'):
+                if column in row:
+                    identities = _ids(row[column], serialized=column == 'pcr_replicate_ids')
+                    if identities:
+                        break
+        if any(';' in identity or identity.lstrip().startswith('[') for identity in identities):
+            raise ValueError('PCR identity contains reserved semicolon or JSON-list prefix')
+        scalar = max([_count(row[column], 'PCR support count') for column in
+                      ('num_PCR_replicates', 'total_pcr_replicates')
+                      if column in row and _text(row[column]) is not None] or [0]) if row['counts'] else 0
+        ids.append(identities)
+        lower.append(scalar)
+        exact.append(bool((identities and scalar <= len(identities) and row.get('pcr_support_exact', True))
+                          or row['counts'] == 0))
+        origins.append({row['bc1']} if row['bc1'] is not None else set())
+    frame['_pcr_ids'], frame['_pcr_lower_bound'] = ids, lower
+    frame['pcr_support_exact'], frame['_original_bc1s'] = exact, origins
+    frame['_representative_reads'] = frame['counts']
+    frame['_unresolved_fragment'] = [row.get('donor_bc0_fragment') if row['donor'] is None else None
+                                      for row in frame.to_dict('records')]
+    groups = link_scopes + ['bc1', 'donor', 'bc0', '_unresolved_fragment']
+    result = pd.DataFrame([_combine(group, count_columns) for _, group in frame.groupby(groups, dropna=False, sort=False)])
+    if collapse_sequences:
+        # Unknown link components cannot establish that two observations belong
+        # to the same construct. Keep their exact rows and read mass intact.
+        complete = result[['bc1', 'donor', 'bc0']].notna().all(axis=1)
+        resolved = result.loc[complete]
+        unresolved_links = result.loc[~complete]
+        resolved = _collapse(resolved, link_scopes + ['bc1', 'bc0'], 'donor', count_columns, 5)
+        resolved = _collapse(resolved, link_scopes + ['bc0', 'donor'], 'bc1', count_columns, 1)
+        result = pd.concat([resolved, unresolved_links], ignore_index=True)
+
+    # Map original identity to final identity before applying the read filter.
+    destinations = defaultdict(set)
+    destination_origins = defaultdict(set)
+    for row in result.to_dict('records'):
+        scope = _scope(row, scopes)
+        for original in row['_original_bc1s']:
+            destinations[(scope, original)].add(row['bc1'])
+            destination_origins[(scope, row['bc1'])].add(original)
+    totals, unresolved, ambiguities = [], [], []
+    for row in result.to_dict('records'):
+        scope = _scope(row, scopes)
+        originals = destination_origins[(scope, row['bc1'])]
+        ambiguous = row['bc1'] is None or any(len(destinations[(scope, original)]) != 1 for original in originals)
+        ambiguities.append(ambiguous)
+        totals.append(np.nan if ambiguous else sum(original_totals[(scope, original)] for original in originals))
+        unresolved.append(np.nan if ambiguous else sum(original_unresolved[(scope, original)] for original in originals))
+    result['total_bc1_counts'] = totals
+    result['unresolved_bc1_counts'] = unresolved
+    result['barcode_identity_ambiguous'] = ambiguities
+    result['bc1_purity'] = result['counts'] / result['total_bc1_counts'].replace(0, np.nan)
+    result['num_distinct_donors'] = result.groupby(scopes + ['bc1'], dropna=False)['donor'].transform('nunique')
+    result['num_PCR_replicates'] = [max(len(value), bound) for value, bound in zip(result['_pcr_ids'], result['_pcr_lower_bound'])]
+    result['pcr_replicate_ids'] = [';'.join(sorted(value)) for value in result['_pcr_ids']]
+    result['original_bc1s'] = [json.dumps(sorted(value)) for value in result['_original_bc1s']]
+    result['support_tier'] = np.where(result['num_PCR_replicates'] >= max(min_pcr_replicates, 1), 'confident', 'provisional')
+    if sum(result['counts']) != sum(frame['counts']):
+        raise ValueError('BDB aggregation did not conserve input read counts')
+    removed = result[result['counts'] < min_reads]
+    kept = result[result['counts'] >= min_reads].copy()
+    kept.attrs['count_accounting'] = dict(reads_in=int(sum(frame['counts'])),
+        reads_out=int(sum(kept['counts'])), rows_below_min_reads=len(removed),
+        reads_below_min_reads=int(sum(removed['counts'])), rows_missing_bc1=int(frame['bc1'].isna().sum()))
+    return kept.drop(columns=[column for column in kept if column.startswith('_')])
