@@ -40,6 +40,13 @@ from pydeseq2.dds import DeseqDataSet
 from pydeseq2.default_inference import DefaultInference
 from pydeseq2.ds import DeseqStats
 
+# Shared with step 10 (sibling module free of magestic imports, like config.py).
+try:
+    from magestic.pipelines.bc1_from_screen.transformation_scope import is_design_pool_column
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from transformation_scope import is_design_pool_column
+
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -76,7 +83,80 @@ def parse_args():
         "--min-basemean", type=float, default=0,
         help="Minimum baseMean filter (default: 0, no filtering)"
     )
+    parser.add_argument(
+        "--sample-metadata", type=Path, default=None,
+        help="Sample key giving each count column's transformation (checked before fitting)"
+    )
+    parser.add_argument(
+        "--feature-metadata", type=Path, default=None,
+        help="bc1 table giving each feature's transformation (checked before fitting)"
+    )
+    parser.add_argument(
+        "--transformation-column", type=str, default=None,
+        help="Construction-derived transformation column in the metadata, e.g. trafo_ID (no default)"
+    )
+    parser.add_argument(
+        "--sample-name-column", type=str, default="sample_name",
+        help="Sample-name column in --sample-metadata (default: sample_name)"
+    )
+    parser.add_argument(
+        "--feature-id-column", type=str, default="bc1",
+        help="Feature column in --feature-metadata (default: bc1)"
+    )
+    parser.add_argument(
+        "--pool-transformations", action="store_true", default=False,
+        help="Fit columns or features from several transformations together (explicit pooling)"
+    )
     return parser.parse_args()
+
+
+def validate_transformation_scope(counts_df: pd.DataFrame, args) -> None:
+    """Refuse a matrix whose columns or features span transformations, unless pooling is explicit.
+
+    Without --sample-metadata/--feature-metadata the behaviour is unchanged (step 10 is
+    the gate). The transformation column has no default, and a design-pool column
+    (oligo_name, SPS, V library IDs...) is refused. Every count column (or fitted
+    feature) must have exactly one transformation value; duplicate rows must agree.
+    """
+    axes = [
+        (getattr(args, "sample_metadata", None), getattr(args, "sample_name_column", "sample_name"),
+         [str(c) for c in counts_df.columns], "count column"),
+        (getattr(args, "feature_metadata", None), getattr(args, "feature_id_column", "bc1"),
+         [str(i) for i in counts_df.index], "feature"),
+    ]
+    if not any(path for path, *_ in axes):
+        return
+    column = getattr(args, "transformation_column", None)
+    if not column:
+        raise ValueError("--transformation-column is required with --sample-metadata or --feature-metadata; "
+                         "name a construction-derived column such as trafo_ID.")
+    if is_design_pool_column(column):
+        raise ValueError(f"--transformation-column '{column}' identifies a design pool, not a transformation; "
+                         f"name a construction-derived column such as trafo_ID.")
+    for path, key, ids, label in axes:
+        if not path:
+            continue
+        table = pd.read_csv(path, sep="\t")
+        for needed in (key, column):
+            if needed not in table.columns:
+                raise ValueError(f"{path} lacks column '{needed}'; available: {list(table.columns)}")
+        values = {}
+        for ident, value in zip(table[key].astype(str), table[column]):
+            if pd.isna(value) or str(value).strip() == "":
+                continue
+            values.setdefault(ident, set()).add(str(value).strip())
+        conflicting = sorted(i for i in ids if len(values.get(i, ())) > 1)
+        if conflicting:
+            raise ValueError(f"{len(conflicting)} {label}(s) have conflicting '{column}' values in {path}: "
+                             f"{conflicting[:10]}")
+        uncovered = sorted(i for i in ids if i not in values)
+        if uncovered:
+            raise ValueError(f"{len(uncovered)} {label}(s) have no '{column}' value in {path}: {uncovered[:10]}")
+        present = sorted({next(iter(values[i])) for i in ids})
+        if len(present) > 1 and not getattr(args, "pool_transformations", False):
+            raise ValueError(
+                f"The {label}s span {len(present)} transformations in '{column}': {present}. Fit each "
+                f"transformation separately, or pass --pool-transformations to fit them together explicitly.")
 
 
 def load_and_combine_counts(reference_file: Path, treatment_file: Path) -> tuple:
@@ -159,6 +239,13 @@ def main():
     logger.info(f"  Loaded {len(counts_df):,} BC1s")
     logger.info(f"  Reference samples: {(metadata_df['condition'] == 'reference').sum()}")
     logger.info(f"  Treatment samples: {(metadata_df['condition'] == 'treatment').sum()}")
+
+    # Refuse a matrix spanning transformations before any model is built.
+    try:
+        validate_transformation_scope(counts_df, args)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return 1
 
     # Run DESeq2
     logger.info("Running DESeq2...")

@@ -161,6 +161,8 @@ def _skip_if_optional_dependency_missing(result: subprocess.CompletedProcess, wh
 
 DEFAULT_WILDCARDS = dict(screen="scr", library="yL1", comparison="cmpA", sample="s1", condition="Caffeine")
 DEFAULT_COMPARISONS = ("cmpA", "cmpB")
+# Rule 10 requires a declared transformation scope (config["comparisons"], no default).
+DEFAULT_CONFIG = {"comparisons": {"transformation_scope": "pooled"}}
 _RULE_HEAD = re.compile(r"^rule\s+(\w+)\s*:\s*$", re.M)
 _SECTION_HEAD = re.compile(r"^ {4}(\w+):[ \t]*(.*)$")
 _SHELL_OPERATORS = {"|", "||", "&&", ";", ">", ">>", "2>", "&>", "2>&1"}
@@ -226,7 +228,7 @@ class RenderedRule:
     """One job of one rule of the shipped Snakefile.rules, evaluated from the rule text."""
 
     def __init__(self, name: str, root: Path, wildcards: dict | None = None, comparisons=DEFAULT_COMPARISONS,
-                 samples=("s1", "s2")):
+                 samples=("s1", "s2"), config: dict | None = None):
         blocks = _rule_blocks()
         if name not in blocks:
             raise KeyError(f"rule {name!r} not found in {RULES_FILE}")
@@ -235,7 +237,7 @@ class RenderedRule:
         self.comparisons = list(comparisons)
         project = Path(root) / "project"
         self.env = dict(
-            Path=Path, config={}, COMMON_SCRIPTS_DIR=SNAKEMAKE_DIR, PYTHON=PYTHON,
+            Path=Path, config=DEFAULT_CONFIG if config is None else config, COMMON_SCRIPTS_DIR=SNAKEMAKE_DIR, PYTHON=PYTHON,
             SAMPLES=list(samples), LIBRARIES=[self.wildcards.library], expand=_expand,
             directory=_passthrough, temp=_passthrough, protected=_passthrough,
             ancient=_passthrough, touch=_passthrough,
@@ -1050,3 +1052,20 @@ def test_packaged_screen_runner_rejects_unknown_steps(tmp_path):
     text = result.stdout + result.stderr
     assert result.returncode != 0, _explain(result, argv)
     assert "no_such_step" in text and "COMPLETED SUCCESSFULLY" not in text
+
+
+def test_rule10_split_scope_renders_flags_step10_accepts(tmp_path):
+    """Rule 10 in split mode passes the reference table and a named transformation column, and
+    step 10's own argparse accepts the rendered command; a missing scope fails the rule loudly."""
+    config = {"comparisons": {"transformation_scope": "split", "transformation_column": "trafo_ID",
+                              "bc1_reference_table": str(tmp_path / "bc1_reference_table.tsv"),
+                              "pooled_dates": True}}
+    rule = RenderedRule("split_10_comparisons", tmp_path, config=config)
+    argv = rule.argv()
+    options = _options(argv)
+    assert options.get("--yeast-sublibrary-column") == "trafo_ID" and "--split-by-yeast-sublibrary" in argv
+    assert "--no-consolidate" in argv and str(tmp_path / "bc1_reference_table.tsv") in [str(p) for p in rule.inputs()]
+    result = _run([PYTHON, "-c", _PARSE_ONLY_DRIVER, *argv[1:]], tmp_path, timeout=180)
+    assert result.returncode == 0, _explain(result, argv)
+    with pytest.raises(KeyError):
+        RenderedRule("split_10_comparisons", tmp_path, config={})

@@ -45,6 +45,7 @@ REQUIRED CONFIG KEYS:
     config["deseq2"]: DESeq2 parameters
     config["hit_calling"]: Hit calling parameters
     config["resources"]: Resource specifications for each step
+    config["comparisons"]: Step 10 transformation scope ("pooled" or "split"; no default)
 
 Author: Kevin R. Roy
 """
@@ -230,18 +231,32 @@ rule matrix_08_create:
 # =============================================================================
 # Step 10: Split Count Tables by Comparison
 # =============================================================================
+# The transformation scope has no default (step 10 refuses without one). Set
+# config["comparisons"]["transformation_scope"] to "pooled", or to "split" together with
+# "bc1_reference_table" and a construction-derived "transformation_column" (e.g. trafo_ID).
+# "pooled_dates": true passes --no-consolidate for keys without a screen_date column;
+# "exclude_samples_file" lists count columns to drop. A missing key fails the rule loudly.
 rule split_10_comparisons:
-    """Split count matrix into per-comparison tables"""
+    """Split count matrix into per-comparison tables within one declared transformation scope"""
     input:
         count_matrix = BC1_COUNTS_DIR / "{screen}_bc1_counts_wide_{library}_combined_tiers.tsv",
-        sample_key = KEYFILE_DIR / "sample_key.tsv"
+        sample_key = KEYFILE_DIR / "sample_key.tsv",
+        bc1_reference = lambda w: config["comparisons"].get("bc1_reference_table", [])
     output:
         manifest = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "comparison_manifest.tsv",
         reference_dir = directory(BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "reference"),
         treatment_dir = directory(BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "treatment")
     params:
         script = COMMON_SCRIPTS_DIR / "10_split_comparisons.py",
-        output_dir = lambda w: str(BC1_COUNTS_DIR / "counts_for_deseq" / w.library)
+        output_dir = lambda w: str(BC1_COUNTS_DIR / "counts_for_deseq" / w.library),
+        scope_args = lambda w: {
+            "pooled": lambda: "--pool-transformations",
+            "split": lambda: "--split-by-yeast-sublibrary --bc1-reference-table {} --yeast-sublibrary-column {}".format(
+                config["comparisons"]["bc1_reference_table"], config["comparisons"]["transformation_column"]),
+        }[config["comparisons"]["transformation_scope"]](),
+        date_args = lambda w: "--no-consolidate" if config["comparisons"].get("pooled_dates", False) else "",
+        exclude_args = lambda w: ("--exclude-samples-file {}".format(config["comparisons"]["exclude_samples_file"])
+                                  if config["comparisons"].get("exclude_samples_file") else "")
     log:
         LOGS_DIR / "10_split_{library}.log"
     threads: 1
@@ -252,6 +267,7 @@ rule split_10_comparisons:
             --sample-key {input.sample_key} \\
             --library {wildcards.library} \\
             --output-dir {params.output_dir} \\
+            {params.scope_args} {params.date_args} {params.exclude_args} \\
             2>&1 | tee {log}
         """
 
