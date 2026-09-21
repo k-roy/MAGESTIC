@@ -182,7 +182,10 @@ def main():
             prov.add_input(args.error_mappings, role='error_parent_mappings')
             prov.set_parameters(count_unit=['bc1', 'sample_name'],
                                 duplicate_count_rows='sum_before_absorption',
-                                mapping_scope='global barcode mappings from input file')
+                                mapping_scope='global barcode mappings from input file',
+                                rows_in_scope='combined_counts_input',
+                                rows_out_scope='this_output_artifact',
+                                read_accounting_scope='combined_counts_to_cleaned_counts')
             provenances[path] = prov
 
     # Load counts
@@ -198,8 +201,10 @@ def main():
     # Absorb error counts
     print("\nAbsorbing error counts...")
     cleaned_counts, absorption_log = absorb_error_counts(counts_df, error_mappings)
-    for prov in provenances.values():
-        prov.set_counts(rows_in=len(counts_df), rows_out=len(cleaned_counts),
+    for path, prov in provenances.items():
+        output_rows = len(cleaned_counts) if path == args.output else len(absorption_log)
+        prov.set_counts(rows_in=len(counts_df), rows_out=output_rows,
+                        cleaned_count_rows=len(cleaned_counts),
                         reads_in=int(counts_df['counts'].sum()), reads_out=int(cleaned_counts['counts'].sum()),
                         mapping_rows=len(error_mappings), absorption_log_rows=len(absorption_log),
                         absorbed_reads=int(absorption_log['total_absorbed_counts'].sum()))

@@ -55,6 +55,20 @@ def test_actual_absorber_writes_clean_counts_and_even_empty_log(tmp_path, monkey
         assert receipt["counts"]["reads_in"] == receipt["counts"]["reads_out"] == expected
         assert receipt["counts"]["absorbed_reads"] == 3 * with_errors
         assert len(receipt["inputs"]) == 2
+        assert receipt["counts"]["rows_out"] == len(pd.read_csv(path, sep="\t"))
+
+
+def test_absorption_keeps_samples_separate():
+    parent, child = "A" * 20, "A" * 19 + "C"
+    counts = pd.DataFrame([
+        (parent, "S1", 10), (parent, "S1", 20), (child, "S1", 3),
+        (parent, "S2", 7), (child, "S2", 2)], columns=["bc1", "sample_name", "counts"])
+    mapping = pd.DataFrame([dict(error_bc1=child, parent_bc1=parent)])
+    result, log = load_absorber().absorb_error_counts(counts, mapping)
+    assert result.set_index("sample_name")["counts"].to_dict() == {"S1": 33, "S2": 9}
+    assert result["bc1"].tolist() == [parent, parent]
+    assert log.iloc[0]["total_absorbed_counts"] == 5
+    assert log.iloc[0]["n_sample_contributions"] == 2
 
 
 def test_absent_error_child_returns_normalized_counts_and_empty_log():
