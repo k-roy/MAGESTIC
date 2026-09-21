@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pysam
 
+from magestic.utils.collapsed_fastq import parse_collapsed_header_count
 from magestic.utils.sequence_anchors import (
     extract_donor_bc0_fragment,
     find_anchor_from_end,
@@ -295,7 +296,8 @@ def process_collapsed_fastq(
     Parameters
     ----------
     fastq_path : Path
-        Collapsed FASTQ where the read name is the integer count of identical reads.
+        Collapsed FASTQ carrying either supported count-header format. Format is
+        resolved per record by the canonical parser; unknown/zero counts raise.
     inner_primers : str
         Primer pair identifier (e.g. ``"KR1884-KR1953"``).  Determines
         whether the read should be reverse-complemented before parsing.
@@ -333,7 +335,7 @@ def process_collapsed_fastq(
     with pysam.FastxFile(str(fastq_path)) as fin:
         for entry in fin:
             total_unique_seqs += 1
-            count = int(entry.name)
+            count, _ = parse_collapsed_header_count(entry.name)
             total_counts += count
             seq = entry.sequence
             qual = entry.quality or ""

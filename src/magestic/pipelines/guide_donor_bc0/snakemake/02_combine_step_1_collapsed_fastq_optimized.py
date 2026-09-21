@@ -29,6 +29,7 @@ import pandas as pd
 import numpy as np
 import pysam
 
+from magestic.utils.collapsed_fastq import parse_collapsed_header_count
 # Import anchor-based extraction utilities
 from magestic.utils.sequence_anchors import (
     find_anchor_from_end,
@@ -195,7 +196,7 @@ def process_single_fastq(args: Tuple) -> pd.DataFrame:
 
     with pysam.FastxFile(str(fastq_path)) as fin:
         for entry in fin:
-            counts = int(entry.name)
+            counts, _ = parse_collapsed_header_count(entry.name)
             seq = entry.sequence
 
             # Reverse complement reads from reverse primer pairs

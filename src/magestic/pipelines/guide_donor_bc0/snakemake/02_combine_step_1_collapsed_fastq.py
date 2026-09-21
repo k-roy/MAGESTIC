@@ -47,6 +47,7 @@ from typing import Dict, List, Tuple, Optional, Set
 import pysam
 from tqdm import tqdm
 
+from magestic.utils.collapsed_fastq import parse_collapsed_header_count
 # Import anchor-based extraction utilities
 from magestic.utils.sequence_anchors import (
     find_anchor_from_end,
@@ -362,7 +363,7 @@ def process_collapsed_fastq(
     with pysam.FastxFile(str(fastq_path)) as fin:
         for entry in fin:
             total_unique_seqs += 1
-            counts = int(entry.name)
+            counts, _ = parse_collapsed_header_count(entry.name)
             total_counts += counts
             seq = entry.sequence
             qual = entry.quality
