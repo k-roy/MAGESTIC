@@ -967,7 +967,10 @@ def load_donor_bc0_lookup(
         )
 
         if filepath and filepath.exists():
-            identity = filepath.resolve()
+            # One physical file however it is named: a symlink or a hardlink under a
+            # second keyfile row shares the device and inode and is read once.
+            status = filepath.stat()
+            identity = (status.st_dev, status.st_ino)
             metadata = tuple(_text(row.get(column)) for column in ('sample_number', *SCOPE_COLUMNS, 'SPS'))
             if identity in registrations:
                 if registrations[identity] != metadata:
