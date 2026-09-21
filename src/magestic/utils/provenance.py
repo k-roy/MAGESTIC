@@ -82,14 +82,14 @@ def file_record(path: str | os.PathLike, *, role: Optional[str] = None, md5: Opt
     return rec
 
 
-def _run(cmd: List[str], cwd: Optional[str] = None) -> Optional[str]:
+def _run(cmd: List[str], cwd: Optional[str] = None, *, strip_output: bool = True) -> Optional[str]:
     try:
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
     except Exception:
         return None
     if r.returncode != 0:
         return None
-    return r.stdout.strip()
+    return r.stdout.strip() if strip_output else r.stdout
 
 
 def git_state(repo_hint: Optional[str | os.PathLike] = None) -> Dict[str, Any]:
@@ -103,7 +103,10 @@ def git_state(repo_hint: Optional[str | os.PathLike] = None) -> Dict[str, Any]:
     top = _run(["git", "rev-parse", "--show-toplevel"], cwd=str(repo_hint))
     if not top:
         return {"repo": None, "commit": None, "dirty": None, "note": "not a git checkout"}
-    dirty_files = _run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=top) or ""
+    # Porcelain's leading status space is structural, not padding. Removing it
+    # shifts the fixed-width path boundary on the first unstaged modification.
+    dirty_files = _run(["git", "status", "--porcelain", "--untracked-files=no"],
+                       cwd=top, strip_output=False) or ""
     return {
         "repo": top,
         "branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=top),
