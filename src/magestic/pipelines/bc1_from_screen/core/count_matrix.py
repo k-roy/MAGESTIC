@@ -67,8 +67,9 @@ def consolidate_t0_samples(
         Tuple of (consolidated matrix, updated metadata)
     """
     # Identify t0 samples for this library
-    # Handle generations as numeric for robust comparison
-    generations_numeric = pd.to_numeric(keyfile[generation_col], errors="coerce").fillna(-1).astype(int)
+    # Compare generations numerically without truncation: 0.5 is not a baseline, and a
+    # non-numeric value (NaN after coercion) never equals 0.
+    generations_numeric = pd.to_numeric(keyfile[generation_col], errors="coerce")
     t0_mask = (
         (keyfile[condition_col] == "YPD") &
         (generations_numeric == 0) &
