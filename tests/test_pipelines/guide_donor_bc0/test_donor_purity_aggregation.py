@@ -89,6 +89,38 @@ def test_missing_donor_stays_in_denominator(purity_route, tmp_path):
     assert sidecar['counts']['eligible_group_reads'] == 10
 
 
+def test_unknown_donors_cannot_outvote_observed_sequence(purity_route, tmp_path):
+    result, _, output = run_purity(purity_route, tmp_path, [
+        ('G'*20, 'A'*10, None, 'guide_only', 'unknown1', 6),
+        ('G'*20, 'A'*10, None, 'guide_only', 'unknown2', 6),
+        ('G'*20, 'A'*10, 'C'*129, 'known', 'observed', 10)])
+    row = result.iloc[0]
+    assert row.donor == 'C'*129
+    assert row.oligo_name == 'known'
+    assert row.dominant_donor_counts == 10
+    assert row.grouped_guide_bc0_counts == 22
+    assert row.guide_bc0_purity == pytest.approx(10/22)
+    sidecar = json.loads(Path(str(output)+'.provenance.json').read_text())
+    assert sidecar['counts']['missing_donor_reads'] == 12
+
+
+def test_all_unknown_donors_are_unassessable(purity_route, tmp_path):
+    result, stats, output = run_purity(purity_route, tmp_path, [
+        ('G'*20, 'A'*10, None, 'guide_only', 'unknown1', 6),
+        ('G'*20, 'A'*10, None, 'guide_only', 'unknown2', 6)])
+    assert len(result) == 1  # Preserve the group and its read denominator.
+    row = result.iloc[0]
+    assert pd.isna(row.donor) and pd.isna(row.guide_bc0_purity)
+    assert row.dominant_donor_counts == 0
+    assert row.grouped_guide_bc0_counts == 12
+    assert not row.donor_observed
+    assert stats['unassessable_groups'] == 1
+    assert stats['high_purity_count'] == stats['low_purity_count'] == 0
+    assert stats['mean_purity'] is None and stats['median_purity'] is None
+    sidecar = json.loads(Path(str(output)+'.provenance.json').read_text())
+    assert sidecar['counts']['eligible_group_reads'] == 12
+
+
 def test_equal_donor_tie_and_sequence_row_threshold(purity_route, tmp_path):
     result, _, output = run_purity(purity_route, tmp_path, [
         ('G'*20, 'A'*10, 'C'*129, 'A', 'first', 4),

@@ -68,13 +68,16 @@ def calculate_bc0_purity(
     For each (guide, bc0) group:
 
     1. Sum counts across all donor variants.
-    2. Sum counts for identical donors, then select the dominant donor.
+    2. Sum counts for identical observed donors, then select the dominant donor.
     3. ``purity = dominant_donor_counts / total_count``.
 
     ``counts`` and other sequence-row fields come from the highest-count row
     supporting the selected donor. ``dominant_donor_counts`` includes all of
     that donor's rows, including different leaders. Equal-support donor ties
     retain first appearance, as before; purity alone does not assert uniqueness.
+    Missing donor reads remain in the denominator but cannot establish a donor
+    sequence. Groups without an observed donor retain their representative row
+    and denominator, with ``donor_observed=False`` and undefined purity.
 
     Parameters
     ----------
@@ -102,6 +105,7 @@ def calculate_bc0_purity(
                         low_purity_threshold=0.5, donor_key=["guide", "bc0", "donor"],
                         representative_row="highest count within dominant donor; first appearance on ties",
                         missing_group_keys="rows with missing guide or bc0 excluded and counted",
+                        missing_donors="denominator only; groups without observed donor have undefined purity",
                         min_counts_scope="individual sequence rows before donor aggregation")
     df = pd.read_csv(input_file, sep="\t")
     required = {"guide", "bc0", "donor", "counts"}
@@ -117,6 +121,7 @@ def calculate_bc0_purity(
     missing_key_rows = int(missing_keys.sum())
     missing_key_reads = int(df.loc[missing_keys, "counts"].sum())
     eligible = df.loc[~missing_keys]
+    missing_donors = eligible["donor"].isna()
 
     # Total counts per guide-bc0 pair
     summed = (
@@ -127,28 +132,39 @@ def calculate_bc0_purity(
     )
 
     # Select a donor using all its supporting rows, while retaining a real
-    # representative row for leader/assignment flags. Missing donors remain a
-    # counted category, as in the previous numerator/denominator convention.
+    # representative row for leader/assignment flags. Missing identities cannot
+    # be combined into evidence for one identical donor sequence.
     if eligible.empty:
         top = eligible.copy()
         top["dominant_donor_counts"] = pd.Series(dtype="int64")
+        top["donor_observed"] = pd.Series(dtype="bool")
     else:
-        donors = eligible.groupby(["guide", "bc0", "donor"], sort=False, dropna=False)["counts"].agg(
+        donors = eligible.loc[~missing_donors].groupby(["guide", "bc0", "donor"], sort=False)["counts"].agg(
             dominant_donor_counts="sum", representative_index="idxmax").reset_index()
         winners = donors.loc[donors.groupby(["guide", "bc0"], sort=False)["dominant_donor_counts"].idxmax()]
         top = df.loc[winners["representative_index"]].copy()
         top["dominant_donor_counts"] = winners["dominant_donor_counts"].to_numpy()
+        top["donor_observed"] = True
+        has_observed = eligible.groupby(["guide", "bc0"])["donor"].transform("count") > 0
+        unknown = eligible.loc[~has_observed]
+        if not unknown.empty:
+            unassessable = unknown.loc[unknown.groupby(["guide", "bc0"], sort=False)["counts"].idxmax()].copy()
+            unassessable["dominant_donor_counts"] = 0
+            unassessable["donor_observed"] = False
+            top = pd.concat([top, unassessable], ignore_index=True)
 
     merged = top.merge(summed, on=["guide", "bc0"])
     merged["guide_bc0_purity"] = merged["dominant_donor_counts"] / merged["grouped_guide_bc0_counts"]
+    merged.loc[~merged["donor_observed"], "guide_bc0_purity"] = float("nan")
 
     merged.to_csv(output_file, sep="\t", index=False)
 
     stats = {
         "total_rows": len(df),
         "unique_guide_bc0": len(merged),
-        "mean_purity": float(merged["guide_bc0_purity"].mean()) if len(merged) else None,
-        "median_purity": float(merged["guide_bc0_purity"].median()) if len(merged) else None,
+        "mean_purity": float(merged["guide_bc0_purity"].mean()) if merged["guide_bc0_purity"].notna().any() else None,
+        "median_purity": float(merged["guide_bc0_purity"].median()) if merged["guide_bc0_purity"].notna().any() else None,
+        "unassessable_groups": int((~merged["donor_observed"]).sum()),
         "high_purity_count": int((merged["guide_bc0_purity"] >= 0.9).sum()),
         "low_purity_count": int((merged["guide_bc0_purity"] < 0.5).sum()),
     }
@@ -156,6 +172,8 @@ def calculate_bc0_purity(
                     eligible_group_reads=int(merged["grouped_guide_bc0_counts"].sum()),
                     filtered_rows=filtered_rows, filtered_reads=filtered_reads,
                     missing_key_rows=missing_key_rows, missing_key_reads=missing_key_reads,
+                    missing_donor_rows=int(missing_donors.sum()),
+                    missing_donor_reads=int(eligible.loc[missing_donors, "counts"].sum()),
                     **stats)
     prov.note("This is plasmid donor-sequence purity, not genomic editing efficiency. Representative sequence counts and aggregate dominant-donor counts are distinct.")
     prov.add_output(output_file, rows=len(merged))
