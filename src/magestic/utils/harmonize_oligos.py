@@ -20,6 +20,7 @@ Changes from the original project script:
 
 
 from pathlib import Path
+import re
 import subprocess
 import pandas as pd
 import numpy as np
@@ -507,15 +508,82 @@ def compute_aa_change_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_SYSTEMATIC_ORF = re.compile(r"^Y([A-P])[LR]\d{3}[WC]")
+_ROMAN = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII",
+          "IX", "X", "XI", "XII", "XIII", "XIV", "XV", "XVI")
+
+
+def chromosome_from_systematic_name(name) -> Optional[str]:
+    """Nuclear chromosome of a standard yeast systematic ORF name (YOR125C -> chrXV)."""
+    match = _SYSTEMATIC_ORF.match(str(name)) if pd.notna(name) else None
+    return f"chr{_ROMAN[ord(match.group(1)) - ord('A')]}" if match else None
+
+
+def add_variant_chromosome(variants_df: pd.DataFrame) -> pd.DataFrame:
+    """Give each variant annotation the chromosome of its ORF.
+
+    Allele strings such as ``559546_G_A_SNP`` carry a position but no chromosome, and
+    one string can annotate different genes on different chromosomes (TOR1 R45K on
+    chrX and CAT5 G62G on chrXV in the Bloom codon-change table). The chromosome is
+    taken from ``systematic_ORF_name``, falling back to ``ORF_locus``. A table that
+    already has ``chrom``, or has neither ORF column, is returned unchanged.
+    """
+    if "chrom" in variants_df.columns:
+        return variants_df
+    sources = [c for c in ("systematic_ORF_name", "ORF_locus") if c in variants_df.columns]
+    if not sources:
+        return variants_df
+    df = variants_df.copy()
+    chrom = pd.Series([None] * len(df), index=df.index, dtype=object)
+    for column in sources:
+        chrom = chrom.where(chrom.notna(), df[column].map(chromosome_from_systematic_name))
+    unplaced = chrom.isna() & df["individual_variants"].notna()
+    if unplaced.any():
+        raise ValueError(
+            f"{int(unplaced.sum())} variant annotation(s) have no chromosome derivable from "
+            f"{sources} (e.g. {df.loc[unplaced, sources].head(3).values.tolist()}); "
+            f"supply a chrom column")
+    df["chrom"] = chrom
+    return df
+
+
 def merge_variants_info(
     oligo_df: pd.DataFrame, variants_df: pd.DataFrame
 ) -> pd.DataFrame:
-    """Merge variant annotations into oligo table, avoiding duplicate columns."""
-    common_cols = set(oligo_df.columns) & set(variants_df.columns)
-    cols_to_drop = [c for c in common_cols if c != "individual_variants"]
-    variants_trimmed = variants_df.drop(columns=cols_to_drop)
+    """Merge variant annotations into oligo table, avoiding duplicate columns.
 
-    return pd.merge(oligo_df, variants_trimmed, how="left", on="individual_variants")
+    The join uses chromosome and allele string whenever the variant table can be
+    placed on chromosomes (see add_variant_chromosome), so an annotation cannot land
+    on a design at the same position of another chromosome. Each design row matches
+    at most one annotation: duplicate annotation keys raise instead of multiplying
+    design rows. Without chromosome information the join falls back to the allele
+    string alone, and refuses when a matching string occurs on more than one of the
+    design table's chromosomes.
+    """
+    if "chrom" in oligo_df.columns:
+        variants_df = add_variant_chromosome(variants_df)
+    keys = (["chrom", "individual_variants"]
+            if "chrom" in oligo_df.columns and "chrom" in variants_df.columns
+            else ["individual_variants"])
+    if keys == ["individual_variants"] and "chrom" in oligo_df.columns:
+        placed = oligo_df.dropna(subset=["individual_variants"])
+        spread = placed.groupby("individual_variants")["chrom"].nunique()
+        ambiguous = sorted(set(spread[spread > 1].index) & set(variants_df["individual_variants"]))
+        if ambiguous:
+            raise ValueError(
+                f"{len(ambiguous)} allele string(s) occur on more than one chromosome and the "
+                f"variant table has no chromosome information (e.g. {ambiguous[:3]})")
+    common_cols = set(oligo_df.columns) & set(variants_df.columns)
+    cols_to_drop = [c for c in common_cols if c not in keys]
+    variants_trimmed = variants_df.drop(columns=cols_to_drop)
+    try:
+        return pd.merge(oligo_df, variants_trimmed, how="left", on=keys, validate="many_to_one")
+    except pd.errors.MergeError as error:
+        duplicated = variants_trimmed.loc[variants_trimmed.duplicated(keys, keep=False), keys]
+        raise ValueError(
+            f"variant annotations are not unique by {keys} "
+            f"(e.g. {duplicated.drop_duplicates().head(3).values.tolist()}); "
+            f"deduplicate them before merging") from error
 
 
 def harmonize_oligo_table(
@@ -871,8 +939,15 @@ def main(args=None):
     variants_to_aa_info_df = variants_to_aa_info_df.merge(
         orf_coords, on="systematic_ORF_name", how="left"
     )
+    # An allele string names a position, not a chromosome: deduplicate per chromosome
+    # so one gene's annotation is never kept for another chromosome's design.
+    variants_to_aa_info_df = add_variant_chromosome(variants_to_aa_info_df)
+    repeated = variants_to_aa_info_df.duplicated(subset=["chrom", "individual_variants"])
+    if repeated.any():
+        print(f"WARNING: {int(repeated.sum())} variant annotation row(s) repeat an allele string "
+              f"on the same chromosome (e.g. overlapping ORFs); the first row is kept for each.")
     variants_to_aa_info_df = variants_to_aa_info_df.drop_duplicates(
-        subset=["individual_variants"]
+        subset=["chrom", "individual_variants"]
     )
 
     # Load the cAMP/Ras/PKA saturation oligo info (20240514 SpG design; V574-V597).
