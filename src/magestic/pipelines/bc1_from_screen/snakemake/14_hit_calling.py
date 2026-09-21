@@ -161,6 +161,22 @@ def estimate_null_distribution(df: pd.DataFrame, use_synonymous: bool, tier_name
     return null_mean, corrected_std
 
 
+CONCORDANCE_COLUMN = "concordance_fraction"
+
+
+def _concordance_pass(frame, threshold: float):
+    """The advertised concordance gate, applied only where the fraction exists.
+
+    Step 14's input (per-BC1 DESeq2 results) carries no replicate concordance unless an
+    upstream step adds one, so the thresholds were parsed and never used. Where the
+    column is absent every row passes this gate and the run says so; where it exists a
+    missing value does not pass.
+    """
+    if CONCORDANCE_COLUMN not in frame.columns:
+        return pd.Series(True, index=frame.index)
+    return frame[CONCORDANCE_COLUMN].fillna(-np.inf) >= threshold
+
+
 def main():
     args = parse_args()
 
@@ -184,6 +200,10 @@ def main():
     if missing_cols:
         logger.error(f"Missing required columns: {missing_cols}")
         return 1
+
+    if CONCORDANCE_COLUMN not in df.columns:
+        logger.warning(f"  No '{CONCORDANCE_COLUMN}' column in the input: the advertised concordance "
+                       f"gate cannot be applied and every BC1 passes it.")
 
     # Configure hit calling
     config = HitCallingConfig(
@@ -237,11 +257,20 @@ def main():
             if n_tier == 0:
                 continue
 
+            concordance_threshold = (config.tier_1_concordance_threshold if tier_label == "abundance_high"
+                                     else config.tier_2_concordance_threshold)
             tier_df = df[tier_mask]
             null_mean, null_std = estimate_null_distribution(tier_df, use_synonymous, tier_label)
 
             if np.isnan(null_mean) or np.isnan(null_std):
                 logger.warning(f"  [{tier_label}] Could not estimate null, skipping")
+                continue
+
+            # A null with no spread makes every z infinite, so any nonzero effect would
+            # pass any threshold. Treat it as an unusable null and call no hits here.
+            if not np.isfinite(null_std) or null_std <= 0:
+                logger.warning(f"  [{tier_label}] Null spread is {null_std}; every z-score would be "
+                               f"infinite. Calling no hits for this tier (z stays undefined).")
                 continue
 
             # Calculate z-scores for this tier
@@ -259,9 +288,11 @@ def main():
             # NaN padj compares False, so an untested BC1 is never a hit.
             z_pass = df.loc[tier_mask, "z_score"].abs() >= z_threshold
             q_pass = df.loc[tier_mask, padj_col] < args.alpha
+            c_pass = _concordance_pass(df.loc[tier_mask], concordance_threshold)
             df.loc[tier_mask, "z_pass"] = z_pass
             df.loc[tier_mask, "padj_pass"] = q_pass
-            df.loc[tier_mask, "is_significant"] = z_pass & q_pass
+            df.loc[tier_mask, "concordance_pass"] = c_pass
+            df.loc[tier_mask, "is_significant"] = z_pass & q_pass & c_pass
 
             n_sig = df.loc[tier_mask, "is_significant"].sum()
             logger.info(f"  [{tier_label}] {n_sig:,} significant / {n_tier:,} BC1s "
@@ -279,6 +310,10 @@ def main():
         # No tier info, use abundance_high thresholds for all
         logger.warning("  No tier column found, using abundance_high thresholds for all BC1s")
         null_mean, null_std = estimate_null_distribution(df, use_synonymous, "all")
+        if np.isnan(null_std) or not np.isfinite(null_std) or null_std <= 0:
+            logger.error(f"Null spread is {null_std}; every z-score would be infinite or undefined. "
+                         f"Refusing to call hits from a degenerate null.")
+            return 1
         null_mean_overall = null_mean
         null_std_overall = null_std
         df["z_score"] = (df["log2FoldChange"] - null_mean) / null_std
@@ -286,7 +321,9 @@ def main():
         df["null_std"] = null_std
         df["z_pass"] = df["z_score"].abs() >= config.tier_1_z_threshold
         df["padj_pass"] = df[padj_col] < args.alpha
-        df["is_significant"] = df["z_pass"] & df["padj_pass"]      # D-2: z AND padj
+        df["concordance_pass"] = _concordance_pass(df, config.tier_1_concordance_threshold)
+        # D-2: z AND padj, now also the advertised concordance gate where the data exists
+        df["is_significant"] = df["z_pass"] & df["padj_pass"] & df["concordance_pass"]
         df["tier"] = "abundance_high"
 
     # Collect statistics (support both naming conventions)

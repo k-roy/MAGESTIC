@@ -856,9 +856,10 @@ def extract_variants_from_alignment(
                 ref_pos += length
                 query_pos += length
             elif op == 1:  # insertion
-                internal = (any(o in _ALIGNED_OPS for o, _ in ops[:index])
-                            and any(o in _ALIGNED_OPS for o, _ in ops[index + 1:]))
-                if internal and ref_pos > 0:
+                # Anchored on the preceding aligned base, so a leading insertion (no
+                # anchor) is skipped while a trailing one is still reported.
+                anchored = any(o in _ALIGNED_OPS for o, _ in ops[:index])
+                if anchored and ref_pos > 0:
                     anchor = ref_fasta.fetch(chrom, ref_pos - 1, ref_pos).upper()
                     inserted = query[query_pos:query_pos + length].upper()
                     variants.append((chrom, ref_pos, anchor, anchor + inserted))

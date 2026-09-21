@@ -178,9 +178,22 @@ def aggregate_across_nuclease_libraries(
         pattern, "", regex=True
     )
 
+    # Per-row helpers so the group can count DESIGNS (nuclease libraries), not rows: a
+    # design appearing in two tiers counted twice and drove concordance above 1.
+    is_ngnh = hits_df[variant_col].astype(str).str.contains("NGNH", na=False)
+    significant = hits_df[sig_col].fillna(False).astype(bool)
+    hits_df["_significant_design"] = hits_df[variant_col].where(significant)
+    hits_df["_non_ngnh_design"] = hits_df[variant_col].where(~is_ngnh)
+    hits_df["_significant_non_ngnh_design"] = hits_df[variant_col].where(significant & ~is_ngnh)
+    hits_df["_significant_ngnh_design"] = hits_df[variant_col].where(significant & is_ngnh)
+
     # Aggregate by comparison and variant_identity
     agg_dict = {
         variant_col: ["nunique", lambda x: sorted(x.unique())],
+        "_significant_design": "nunique",
+        "_non_ngnh_design": "nunique",
+        "_significant_non_ngnh_design": "nunique",
+        "_significant_ngnh_design": "nunique",
         n_bc1_col: "sum",
         lfc_col: ["mean", "median", "std"],
         concordance_col: "mean",
@@ -224,33 +237,30 @@ def aggregate_across_nuclease_libraries(
     }
     agg_df.rename(columns=rename_map, inplace=True)
 
-    # Library concordance (protect against division by zero)
+    # Library concordance: the fraction of this variant's nuclease-library DESIGNS that
+    # are significant, so it cannot exceed 1 when a design appears in several rows.
+    agg_df["n_significant_libraries"] = agg_df["_significant_design_nunique"]
     agg_df["library_concordance"] = np.where(
         agg_df["n_nuclease_libraries"] > 0,
-        agg_df["n_significant"] / agg_df["n_nuclease_libraries"],
+        agg_df["n_significant_libraries"] / agg_df["n_nuclease_libraries"],
         0.0
     )
 
-    # NGNH efficiency exception - vectorized for performance
-    # Build the logic using vectorized operations where possible
-    # For rows with >1 library, check if NGNH is failing while others pass
-
-    # First, identify which rows have NGNH in their libraries (need to iterate for list checking)
-    has_ngnh = agg_df["nuclease_libraries"].apply(
-        lambda libs: any("NGNH" in lib for lib in libs) if isinstance(libs, (list, set)) else False
-    )
-
-    # Count non-NGNH libraries for each row
-    n_non_ngnh = agg_df["nuclease_libraries"].apply(
-        lambda libs: len([lib for lib in libs if "NGNH" not in lib]) if isinstance(libs, (list, set)) else 0
-    )
-
-    # NGNH exception: more than 1 library, has NGNH, and significant count equals non-NGNH count
+    # NGNH efficiency exception: NGNH is the library expected to edit poorly, so the
+    # exception is for a variant whose non-NGNH libraries all call it while NGNH does
+    # not. It must not fire when NGNH is the only library that calls it.
+    n_non_ngnh = agg_df["_non_ngnh_design_nunique"]
+    n_significant_non_ngnh = agg_df["_significant_non_ngnh_design_nunique"]
+    has_ngnh = (agg_df["n_nuclease_libraries"] - n_non_ngnh) > 0
+    ngnh_significant = agg_df["_significant_ngnh_design_nunique"] > 0
     agg_df["ngnh_low_efficiency_exception"] = (
-        (agg_df["n_nuclease_libraries"] > 1) &
-        has_ngnh &
-        (agg_df["n_significant"] == n_non_ngnh)
+        (agg_df["n_nuclease_libraries"] > 1)
+        & has_ngnh
+        & (n_non_ngnh > 0)
+        & (n_significant_non_ngnh == n_non_ngnh)
+        & ~ngnh_significant
     )
+    agg_df = agg_df.drop(columns=[c for c in agg_df.columns if c.startswith("_")])
 
     # Aggregated significance
     agg_df["is_significant_aggregated"] = (

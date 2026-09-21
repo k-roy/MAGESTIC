@@ -10,6 +10,7 @@ All loaders return DataFrames with standardized columns for downstream processin
 """
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import json
@@ -195,11 +196,18 @@ _PLAIN_NUMBER = re.compile(r'^-?\d+(\.\d+)?$')
 
 
 def _same_declaration(a: str, b: str) -> bool:
-    """Equal declarations; plain decimal numerals compare by value (1 and 1.0 agree)."""
+    """Equal declarations; plain decimal numerals compare by value (1 and 1.0 agree).
+
+    Compared as decimals, not floats: two integers past float precision (for example
+    9007199254740992 and 9007199254740993) are different declarations.
+    """
     if a == b:
         return True
     if _PLAIN_NUMBER.match(a) and _PLAIN_NUMBER.match(b):
-        return float(a) == float(b)
+        try:
+            return Decimal(a) == Decimal(b)
+        except InvalidOperation:
+            return False
     return False
 
 
