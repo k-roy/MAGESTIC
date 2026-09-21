@@ -14,21 +14,25 @@ Author: Kevin R. Roy
 """
 
 import argparse
-import os
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from magestic.utils.provenance import StepProvenance
+
+EXPECTED_COLUMNS = ['bc1', 'sample_name', 'counts']
 
 
 def read_count_file(filepath: Path) -> pd.DataFrame:
     """Read a single BC1 count file."""
     try:
         df = pd.read_csv(filepath, sep='\t')
-        return df
     except Exception as e:
-        print(f"Warning: Could not read {filepath}: {e}")
-        return pd.DataFrame()
+        raise ValueError(f"Could not read required count file {filepath}: {e}") from e
+    # Validate each input, including empty wells, before concatenation can hide
+    # a missing column behind another sample's valid schema.
+    if not all(col in df.columns for col in EXPECTED_COLUMNS):
+        raise ValueError(f"Expected columns {EXPECTED_COLUMNS} in {filepath}, got {list(df.columns)}")
+    return df
 
 
 def combine_count_files(
@@ -52,30 +56,35 @@ def combine_count_files(
 
     print(f"Found {len(count_files)} BC1 count files to combine")
 
+    prov = StepProvenance('bc1_from_screen', '04_combine_counts', output_file)
+    for path in count_files:
+        prov.add_input(path, role='parsed_sample_counts')
+    prov.set_parameters(n_workers=n_workers, discovery_pattern='*_bc1_counts.tsv',
+                        output_columns=EXPECTED_COLUMNS, partial_inputs_allowed=False)
+
     # Read files in parallel
     print(f"Reading files with {n_workers} workers...")
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         dfs = list(executor.map(read_count_file, count_files))
 
-    # Filter out empty dataframes
+    empty_files = sum(df.empty for df in dfs)
+    rows_in = sum(len(df) for df in dfs)
+    reads_in = sum(df['counts'].sum() for df in dfs)
+    # Empty, correctly formed sample tables are accounted for in provenance.
     dfs = [df for df in dfs if len(df) > 0]
 
     if not dfs:
-        raise ValueError("All count files were empty or could not be read")
+        raise ValueError("All count files were empty; no nonempty analysis to combine")
 
-    print(f"Successfully read {len(dfs)} files")
+    print(f"Successfully read {len(count_files)} files ({empty_files} empty)")
 
     # Combine all dataframes
     print("Concatenating dataframes...")
     combined = pd.concat(dfs, ignore_index=True)
 
     # Ensure expected columns
-    expected_cols = ['bc1', 'sample_name', 'counts']
-    if not all(col in combined.columns for col in expected_cols):
-        raise ValueError(f"Expected columns {expected_cols}, got {list(combined.columns)}")
-
     # Select and order columns
-    combined = combined[expected_cols]
+    combined = combined[EXPECTED_COLUMNS]
 
     # Print summary stats
     n_unique_bc1 = combined['bc1'].nunique()
@@ -92,6 +101,12 @@ def combine_count_files(
     print(f"\nSaving to {output_file}...")
     output_file.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(output_file, sep='\t', index=False)
+    prov.set_counts(input_files=len(count_files), empty_input_files=empty_files,
+                    rows_in=rows_in, rows_out=len(combined),
+                    reads_in=int(reads_in), reads_out=int(total_counts),
+                    unique_bc1s=int(n_unique_bc1), nonempty_samples=int(n_unique_samples))
+    prov.add_output(output_file, rows=len(combined))
+    prov.write()
 
     print("Done!")
 
