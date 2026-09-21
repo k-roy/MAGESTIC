@@ -716,7 +716,7 @@ def run_minimap2(donors_fasta: Path, reference_fasta: Path, output_sam: Path, th
     try:
         with open(output_sam, "w") as outf:
             subprocess.run(
-                ["minimap2", "-a", "-x", "sr", "-t", str(threads), str(reference_fasta), str(donors_fasta)],
+                ["minimap2", "-a", "--MD", "-x", "sr", "-t", str(threads), str(reference_fasta), str(donors_fasta)],
                 stdout=outf, stderr=subprocess.DEVNULL, check=True,
             )
         return True
@@ -820,72 +820,60 @@ def run_triple_aligners(
 # Variant Extraction
 # =============================================================================
 
+_ALIGNED_OPS = (0, 7, 8)  # CIGAR M, =, X
+
+
 def extract_variants_from_alignment(
     read,
     reference_fasta_path: Path
 ) -> List[Tuple[str, int, str, str]]:
-    """Extract variants from alignment as (chrom, pos, ref, alt) tuples."""
-    if not HAS_PYSAM:
-        return []
+    """Extract variants from alignment as (chrom, pos, ref, alt) tuples (1-based pos).
 
-    if read.is_unmapped:
+    Walks the CIGAR and reads reference bases from the FASTA, so no MD tag is needed:
+    minimap2 writes none unless asked, and the previous MD-based extraction returned
+    no variants at all for such reads. Soft and hard clips are unaligned sequence and
+    are not insertions; an insertion is reported only between two aligned blocks.
+    Insertions and deletions are VCF-style, anchored on the preceding reference base.
+    """
+    if not HAS_PYSAM or read.is_unmapped:
+        return []
+    ops = read.cigartuples
+    query = read.query_sequence
+    if not ops or query is None:
         return []
 
     variants = []
-    ref_fasta = pysam.FastaFile(str(reference_fasta_path))
     chrom = read.reference_name
-
-    try:
-        pairs = read.get_aligned_pairs(with_seq=True)
-    except Exception:
-        return []
-
-    i = 0
-    while i < len(pairs):
-        query_pos, ref_pos, ref_base = pairs[i]
-
-        if ref_pos is None:
-            # Insertion
-            ins_bases = ""
-            while i < len(pairs) and pairs[i][1] is None:
-                if pairs[i][0] is not None:
-                    ins_bases += read.query_sequence[pairs[i][0]]
-                i += 1
-            if ins_bases:
-                if ref_pos is None and i > 0:
-                    prev_ref_pos = None
-                    for j in range(i - 1, -1, -1):
-                        if pairs[j][1] is not None:
-                            prev_ref_pos = pairs[j][1]
-                            break
-                    if prev_ref_pos is not None:
-                        ref_base = ref_fasta.fetch(chrom, prev_ref_pos, prev_ref_pos + 1)
-                        variants.append((chrom, prev_ref_pos + 1, ref_base, ref_base + ins_bases))
-            continue
-
-        if query_pos is None:
-            # Deletion
-            del_start = ref_pos
-            del_bases = ""
-            while i < len(pairs) and pairs[i][0] is None:
-                if pairs[i][2] is not None:
-                    del_bases += pairs[i][2]
-                i += 1
-            if del_bases:
-                if del_start > 0:
-                    anchor = ref_fasta.fetch(chrom, del_start - 1, del_start)
-                    variants.append((chrom, del_start, anchor + del_bases, anchor))
-            continue
-
-        # Mismatch
-        if ref_base is not None and query_pos is not None:
-            query_base = read.query_sequence[query_pos]
-            if ref_base.upper() != query_base.upper():
-                variants.append((chrom, ref_pos + 1, ref_base.upper(), query_base.upper()))
-
-        i += 1
-
-    ref_fasta.close()
+    ref_pos, query_pos = read.reference_start, 0
+    with pysam.FastaFile(str(reference_fasta_path)) as ref_fasta:
+        for index, (op, length) in enumerate(ops):
+            if op in _ALIGNED_OPS:
+                reference = ref_fasta.fetch(chrom, ref_pos, ref_pos + length).upper()
+                for offset in range(length):
+                    base = query[query_pos + offset].upper()
+                    if base != reference[offset]:
+                        variants.append((chrom, ref_pos + offset + 1, reference[offset], base))
+                ref_pos += length
+                query_pos += length
+            elif op == 1:  # insertion
+                internal = (any(o in _ALIGNED_OPS for o, _ in ops[:index])
+                            and any(o in _ALIGNED_OPS for o, _ in ops[index + 1:]))
+                if internal and ref_pos > 0:
+                    anchor = ref_fasta.fetch(chrom, ref_pos - 1, ref_pos).upper()
+                    inserted = query[query_pos:query_pos + length].upper()
+                    variants.append((chrom, ref_pos, anchor, anchor + inserted))
+                query_pos += length
+            elif op == 2:  # deletion
+                if ref_pos > 0:
+                    anchor = ref_fasta.fetch(chrom, ref_pos - 1, ref_pos).upper()
+                    deleted = ref_fasta.fetch(chrom, ref_pos, ref_pos + length).upper()
+                    variants.append((chrom, ref_pos, anchor + deleted, anchor))
+                ref_pos += length
+            elif op == 3:  # reference skip
+                ref_pos += length
+            elif op == 4:  # soft clip: unaligned query sequence, not a variant
+                query_pos += length
+            # 5 (hard clip) and 6 (padding) consume neither sequence
     return variants
 
 
