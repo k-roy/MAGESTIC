@@ -193,6 +193,17 @@ def combine_technical_replicates(count_matrix: pd.DataFrame,
     if 'tier' in count_matrix.columns:
         combined['tier'] = count_matrix['tier']
 
+    # A group ID shares the output namespace with metadata and any samples
+    # retained as-is. Refuse ambiguity instead of silently replacing a column.
+    output_names = set(meta_cols)
+
+    def add_counts(name, values):
+        text_name = str(name)  # TSV headers stringify non-string group IDs.
+        if text_name in output_names:
+            raise ValueError(f"Output column collision for {name!r}; use distinct technical group and sample names")
+        output_names.add(text_name)
+        combined[name] = values
+
     correlation_results = []
     outliers = []
     processed_samples = set()
@@ -207,7 +218,7 @@ def combine_technical_replicates(count_matrix: pd.DataFrame,
             continue
         elif len(available_samples) == 1:
             # Only one replicate available, use as-is
-            combined[group_id] = count_matrix[available_samples[0]]
+            add_counts(group_id, count_matrix[available_samples[0]])
             processed_samples.add(available_samples[0])
             continue
 
@@ -239,7 +250,7 @@ def combine_technical_replicates(count_matrix: pd.DataFrame,
                     })
 
         # Sum counts across all replicates
-        combined[group_id] = count_matrix[available_samples].sum(axis=1)
+        add_counts(group_id, count_matrix[available_samples].sum(axis=1))
 
         for s in available_samples:
             processed_samples.add(s)
@@ -248,15 +259,16 @@ def combine_technical_replicates(count_matrix: pd.DataFrame,
     for group_id, samples in singleton_groups.items():
         sample = samples[0]
         if sample in sample_to_col:
-            combined[group_id] = count_matrix[sample]
+            add_counts(group_id, count_matrix[sample])
             processed_samples.add(sample)
 
     # Check for any unprocessed samples
     unprocessed = set(sample_cols) - processed_samples
     if unprocessed:
         logger.warning(f"  {len(unprocessed)} samples not in sample key, kept as-is")
-        for sample in unprocessed:
-            combined[sample] = count_matrix[sample]
+        for sample in sample_cols:
+            if sample in unprocessed:
+                add_counts(sample, count_matrix[sample])
 
     return combined, pd.DataFrame(correlation_results), pd.DataFrame(outliers)
 
