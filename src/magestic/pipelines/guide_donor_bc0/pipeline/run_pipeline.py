@@ -66,7 +66,7 @@ def run_combine_fastq(config: GuideDonorBC0Config) -> bool:
     """Run Step 02: Parse collapsed FASTQ files into guide-donor-BC0 count tables."""
     logger.info("Step 02: Combining collapsed FASTQ files...")
 
-    from ..core.fastq_processing import load_sample_keyfile, process_library
+    from ..core.fastq_processing import load_sample_keyfile, process_library, validate_collapsed_fastq_inputs
 
     # Resolve sample keyfile
     sample_keyfile = config.sample_keyfile
@@ -101,6 +101,17 @@ def run_combine_fastq(config: GuideDonorBC0Config) -> bool:
             return False
         libraries = [lib for lib in libraries if lib in config.libraries]
     logger.info(f"  Libraries to process: {', '.join(libraries)}")
+
+    # A missing sample must not produce partial tables or relabel an old output
+    # with new empty-run provenance. Check all selected libraries first.
+    try:
+        validate_collapsed_fastq_inputs(
+            [sample for library in libraries for sample in library_to_samples[library]],
+            config.collapsed_fastq_dir,
+        )
+    except FileNotFoundError as exc:
+        logger.error("  %s", exc)
+        return False
 
     from ..core.fastq_processing import parse_parameters
 

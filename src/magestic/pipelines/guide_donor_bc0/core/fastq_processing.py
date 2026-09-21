@@ -394,6 +394,7 @@ def write_counts_file(
     output_path: Path,
     library_ID: str,
     bc0_counts: Dict[tuple, Dict[str, int]],
+    run_columns: Optional[List[str]] = None,
 ) -> None:
     """
     Write the accumulated counts dictionary to a tab-separated file.
@@ -407,13 +408,13 @@ def write_counts_file(
     bc0_counts : dict
         Maps ``(leader, guide, donor, SPS, bc0, msd, donor_bc0_fragment, seq)``
         tuples to per-column count dicts.
+    run_columns : list[str], optional
+        Per-run columns to preserve when there are no retained sequences.
     """
-    if not bc0_counts:
-        return
-
-    sample_counts = next(iter(bc0_counts.values()))
+    sample_counts = next(iter(bc0_counts.values()), {})
     total_cols = ["total_counts", "total_fwd_counts", "total_rev_counts"]
-    per_run_cols = sorted(k for k in sample_counts if k not in total_cols)
+    per_run_cols = sorted(k for k in (sample_counts if bc0_counts else (run_columns or []))
+                          if k not in total_cols)
     seq_cols = ["leader", "guide", "donor", "SPS", "bc0", "msd", "donor_bc0_fragment", "seq"]
 
     header = ["library_ID"] + total_cols + per_run_cols + seq_cols
@@ -431,6 +432,22 @@ def write_counts_file(
 # ============================================================================
 # Per-Library Orchestration
 # ============================================================================
+
+def validate_collapsed_fastq_inputs(samples: List[SampleInfo], collapsed_fastq_dir: Path) -> None:
+    """Refuse missing expected FASTQs before any result is published.
+
+    An existing zero-record FASTQ is valid. A missing file is not an empty sample.
+    Callers can preflight all selected libraries together before processing any.
+    """
+    missing = []
+    for sample in samples:
+        for seq_date in sample.sequencing_dates:
+            path = collapsed_fastq_dir / f"{seq_date}_{sample.outer_primers}_{sample.sample_number}_collapsed.fastq"
+            if not path.is_file():
+                missing.append(str(path))
+    if missing:
+        raise FileNotFoundError("Missing expected collapsed FASTQ files: " + ", ".join(missing))
+
 
 def process_library(
     library_ID: str,
@@ -465,6 +482,7 @@ def process_library(
         Processing statistics: files processed, unique sequences, total counts,
         missing files, elapsed seconds, output file path, filtered counts.
     """
+    validate_collapsed_fastq_inputs(samples, collapsed_fastq_dir)
     start_time = timeit.default_timer()
     bc0_counts: Dict[tuple, Dict[str, int]] = {}
     quality_stats: Dict[str, int] = {"filtered_low_quality": 0, "filtered_counts": 0}
@@ -480,10 +498,6 @@ def process_library(
         for seq_date in sample.sequencing_dates:
             sample_name = f"{seq_date}_{sample.outer_primers}_{sample.sample_number}"
             fastq_path = collapsed_fastq_dir / f"{sample_name}_collapsed.fastq"
-
-            if not fastq_path.exists():
-                missing_files.append(str(fastq_path))
-                continue
 
             total_files += 1
             n_seqs, n_counts = process_collapsed_fastq(
@@ -506,7 +520,8 @@ def process_library(
     calculate_totals(bc0_counts)
 
     output_path = counts_dir / f"{library_ID}_guide_donor_bc0_counts.tsv"
-    write_counts_file(output_path, library_ID, bc0_counts)
+    run_columns = [f"{direction}_{date[-4:]}" for date in all_dates for direction in ("fwd", "rev")]
+    write_counts_file(output_path, library_ID, bc0_counts, run_columns=run_columns)
 
     return {
         "library_ID": library_ID,
