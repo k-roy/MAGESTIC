@@ -55,7 +55,12 @@ def _guide_key_series(frag: pd.Series) -> pd.Series:
 
 
 def load_guide_table(guide_dir: Path, pattern: str, fallback_pattern: str, output: str):
-    """Load, reduce per file (best-supported guide per linking key), fail loudly."""
+    """Select guides by summed sequence-row support within each source library.
+
+    Keep a real highest-count representative row for SPS/source metadata. Named
+    source libraries remain separate support candidates; selection across them
+    retains the existing strongest-source policy rather than silently pooling.
+    """
     primary, fallback = sorted(guide_dir.glob(pattern)), sorted(guide_dir.glob(fallback_pattern))
     files = primary or fallback
     if primary and fallback:
@@ -84,8 +89,14 @@ def load_guide_table(guide_dir: Path, pattern: str, fallback_pattern: str, outpu
             lib_to_file[lib] = f.name
         df["linking_key"] = _guide_key_series(df["donor_bc0_fragment"])
         df = df[df["linking_key"].notna() & (df["guide"] != "") & (df["guide"] != "NA")]
-        # best-supported guide per key within this file; remember how many distinct guides
+        # Repeated full-sequence rows can carry the same guide/linking key.
+        # Sum their support within the source library before choosing a guide.
         n_guides = df.groupby("linking_key")["guide"].nunique()
+        support_keys = ["linking_key", "guide"] + (["library_ID"] if "library_ID" in df.columns else [])
+        support = df.groupby(support_keys, sort=False, dropna=False)["_n"].agg(
+            guide_support="sum", representative_index="idxmax").reset_index()
+        df = df.loc[support["representative_index"]].copy()
+        df["_n"] = support["guide_support"].to_numpy()
         df = df.sort_values("_n", ascending=False, kind="mergesort").drop_duplicates("linking_key")
         df["_n_guides"] = df["linking_key"].map(n_guides).astype("int64")
         keep = ["linking_key", "guide", "_n", "_n_guides"] + [c for c in ("library_ID", "SPS") if c in df.columns]
@@ -241,6 +252,8 @@ def main():
                        library_IDs=s["library_IDs"], keys_kept=int(s["keys_kept"]))
     prov.set_parameters(guide_dir=str(args.guide_dir), guide_pattern=args.guide_pattern,
                         guide_fallback_pattern=args.guide_fallback_pattern, guide_usecols=GUIDE_USECOLS,
+                        guide_support_scope="sum sequence rows per linking_key/guide/library_ID within each file; source libraries not pooled",
+                        guide_metadata_row="highest-count row within selected source-guide group; first appearance on ties",
                         linking_key="donor[-30:] + bc0[:10]  <->  donor_bc0_fragment[:30] + donor_bc0_fragment[-10:]")
     prov.set_counts(links_in=int(len(bc1_df)), links_out=int(len(merged)), unique_bc1=int(bc1_df["bc1"].nunique()),
                     links_with_valid_key=int(bc1_df["linking_key"].notna().sum()), links_guide_linked=int(matched),
