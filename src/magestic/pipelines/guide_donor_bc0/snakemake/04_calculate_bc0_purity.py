@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import List
 import sys
 
-import pandas as pd
 from tqdm import tqdm
 
 # ============================================================================
@@ -83,8 +82,8 @@ def calculate_bc0_purity(
 
     For each guide-bc0 combination:
     1. Sum all counts across different donors
-    2. Find the top (highest count) donor
-    3. Calculate purity = top_count / total_count
+    2. Sum all rows carrying each identical donor, then find the top donor
+    3. Calculate purity = dominant_donor_counts / total_count
 
     Args:
         input_file: Path to matched guide-donor-bc0 counts file
@@ -94,53 +93,10 @@ def calculate_bc0_purity(
     Returns:
         Dict with processing statistics
     """
-    df = pd.read_csv(input_file, sep="\t")
+    # One implementation for the numbered workflow and packaged runner.
+    from magestic.pipelines.guide_donor_bc0.core.bc0_purity import calculate_bc0_purity as core_purity
+    return core_purity(input_file, output_file, config)
 
-    # Filter out low count entries if needed
-    if config.min_counts > 1:
-        df = df[df["counts"] >= config.min_counts]
-
-    if df.empty:
-        return {
-            "total_rows": 0,
-            "unique_guide_bc0": 0,
-            "mean_purity": None,
-        }
-
-    # Sum counts for each unique guide-bc0 combination
-    summed_guide_bc0 = (
-        df.groupby(["guide", "bc0"])["counts"]
-        .sum()
-        .reset_index()
-        .rename(columns={"counts": "grouped_guide_bc0_counts"})
-    )
-
-    # Retain only the top guide-bc0 combination (highest count per group)
-    idx = df.groupby(["guide", "bc0"])["counts"].idxmax()
-    top_guide_bc0 = df.loc[idx].copy()
-
-    # Merge summed counts with top combinations
-    merged = top_guide_bc0.merge(
-        summed_guide_bc0,
-        on=["guide", "bc0"]
-    )
-
-    # Calculate purity: ratio of top count to total count for guide-bc0
-    merged["guide_bc0_purity"] = (
-        merged["counts"] / merged["grouped_guide_bc0_counts"]
-    )
-
-    # Save results
-    merged.to_csv(output_file, sep="\t", index=False)
-
-    return {
-        "total_rows": len(df),
-        "unique_guide_bc0": len(merged),
-        "mean_purity": merged["guide_bc0_purity"].mean(),
-        "median_purity": merged["guide_bc0_purity"].median(),
-        "high_purity_count": (merged["guide_bc0_purity"] >= 0.9).sum(),
-        "low_purity_count": (merged["guide_bc0_purity"] < 0.5).sum(),
-    }
 
 
 def find_input_files(input_dir: Path, suffix: str, prefix: str = "") -> List[Path]:
@@ -213,9 +169,9 @@ def main():
 
     # Write summary statistics
     if all_stats:
-        summary_df = pd.DataFrame(all_stats)
         summary_file = purity_dir / "purity_summary.tsv"
-        summary_df.to_csv(summary_file, sep="\t", index=False)
+        from magestic.pipelines.guide_donor_bc0.core.bc0_purity import write_purity_summary
+        write_purity_summary(all_stats, input_files, summary_file, config)
         print(f"\nSummary written to: {summary_file}")
 
     # Final summary

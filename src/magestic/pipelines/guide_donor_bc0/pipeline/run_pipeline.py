@@ -309,21 +309,11 @@ def run_bc0_purity(config: GuideDonorBC0Config) -> bool:
     for input_file in input_files:
         library_id = input_file.stem.replace(INPUT_SUFFIX.replace(".tsv", ""), "")
         output_file = purity_dir / f"{library_id}{OUTPUT_SUFFIX}"
-        prov = StepProvenance(pipeline="guide_donor_bc0", step="04_purity", output=str(output_file),
-                              description="per (guide, bc0): counts summed over donors, dominant donor kept, "
-                                          "purity = dominant / total")
-        prov.add_input(input_file, role="matched_guide_donor_bc0_counts")
-        prov.set_parameters(min_counts=purity_config.min_counts)
         stats = calculate_bc0_purity(input_file, output_file, purity_config)
         stats["library_id"] = library_id
         all_stats.append(stats)
-        prov.set_counts(rows_in=int(stats.get("total_rows", 0)), rows_out=int(stats.get("unique_guide_bc0", 0)),
-                        mean_purity=stats.get("mean_purity"), median_purity=stats.get("median_purity"),
-                        high_purity_ge_0p9=int(stats.get("high_purity_count", 0) or 0),
-                        low_purity_lt_0p5=int(stats.get("low_purity_count", 0) or 0))
-        if output_file.exists():
-            prov.add_output(output_file, rows=int(stats.get("unique_guide_bc0", 0)))
-        logger.info(f"    sidecar: {prov.write()}")
+        # calculate_bc0_purity owns the sidecar for every caller, including
+        # its donor aggregation and filtering parameters. Do not overwrite it.
         if stats["mean_purity"] is not None:
             logger.info(
                 f"  {library_id}: {stats['unique_guide_bc0']:,} guide-BC0 pairs, "
@@ -332,12 +322,12 @@ def run_bc0_purity(config: GuideDonorBC0Config) -> bool:
 
     # Write summary
     if all_stats:
-        import pandas as pd
         summary_name = "purity_summary.tsv"
         if config.libraries:
             # one library per task: a shared summary file would race between array tasks
             summary_name = f"purity_summary.{'_'.join(config.libraries)}.tsv"
-        pd.DataFrame(all_stats).to_csv(purity_dir / summary_name, sep="\t", index=False)
+        from ..core.bc0_purity import write_purity_summary
+        write_purity_summary(all_stats, input_files, purity_dir / summary_name, purity_config)
 
     logger.info("Step 04: Complete")
     return True
