@@ -48,10 +48,12 @@ import pandas as pd
 try:
     from magestic.pipelines.bc1_from_screen.config import TierConfig
     from magestic.pipelines.bc1_from_screen.library_scope import resolve_library_samples
+    from magestic.pipelines.bc1_from_screen.reference_projection import project_bc1_reference
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from config import TierConfig
     from library_scope import resolve_library_samples
+    from reference_projection import project_bc1_reference
 
 logging.basicConfig(
     level=logging.INFO,
@@ -424,15 +426,19 @@ def main():
     logger.info("Classifying BC1s into tiers...")
     tier_mapping = classify_bc1_tiers(t0_counts, tier_config)
 
-    # Add oligo information from reference table
+    # Add oligo information from the reference table, one row per BC1. A BC1 with
+    # several reference oligos abstains (oligo_name empty, candidates kept) instead of
+    # multiplying its tier row, which double-counted its reads in the tier summary.
     if "bc1" in ref_table.columns and "oligo_name" in ref_table.columns:
+        projection = project_bc1_reference(ref_table)
         tier_mapping = tier_mapping.merge(
-            ref_table[["bc1", "oligo_name"]].drop_duplicates(),
-            on="bc1",
-            how="left"
-        )
+            projection[["bc1", "oligo_name", "bc1_reference_n_oligos", "bc1_reference_oligo_candidates"]],
+            on="bc1", how="left", validate="many_to_one")
+        tier_mapping["bc1_reference_n_oligos"] = tier_mapping["bc1_reference_n_oligos"].fillna(0).astype(int)
         n_with_oligo = tier_mapping["oligo_name"].notna().sum()
-        logger.info(f"  {n_with_oligo:,} BC1s mapped to oligos")
+        n_ambiguous = int((tier_mapping["bc1_reference_n_oligos"] > 1).sum())
+        logger.info(f"  {n_with_oligo:,} BC1s mapped to one oligo; {n_ambiguous:,} have several "
+                    f"reference oligos and are left unassigned")
 
     # Create summary statistics
     tier_stats = create_tier_summary(tier_mapping, args.library)
