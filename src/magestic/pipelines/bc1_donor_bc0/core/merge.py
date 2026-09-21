@@ -1,604 +1,366 @@
+"""Merge plasmid-assay evidence at the observed, scoped bc1/donor/bc0 link.
+
+Read support is summed; PCR identities are unioned. Competing links and
+unresolved fragments remain separate observations. GDB reads are annotation
+evidence only and never enter BDB read or PCR totals.
 """
-Early merge module for combining 2x150 and 2x300 bc1-donor-bc0 data.
-
-This module implements the early merge strategy that:
-1. Combines data from both sequencing depths at the bc1-donor-bc0 level
-2. Deduplicates records to avoid redundant processing
-3. Tracks data source(s) for each record
-4. Handles conflicts when donors differ between sources
-5. Counts PCR replicates across all sources for increased confidence
-
-Key insight: The 30bp donor portion + 10bp bc0 = 40bp unique identifier
-that can link 2x150 fragments to 2x300 complete sequences.
-"""
-
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+import json
+import logging
+from typing import Dict, List, Optional, Tuple, Set
+
 import numpy as np
 import pandas as pd
-import logging
-
 from ..config import COMMON_SEQUENCE_START, BC0_LENGTH
 
 logger = logging.getLogger(__name__)
+# These namespaces stay separate. In particular, SPS is not transformation ID.
+SCOPE_COLUMNS = ('yeast_library', 'yeast_sublibrary', 'trafo_ID', 'library_ID', 'V_library')
+
+
+def _text(value):
+    return str(value) if value is not None and not pd.isna(value) and str(value) else None
+
+
+def _count(value, label='read count'):
+    try:
+        parsed = Decimal(str(value))
+        if not parsed.is_finite() or parsed < 0 or parsed != parsed.to_integral_value():
+            raise ValueError
+        return int(parsed)
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError(f'Invalid {label}: {value!r}; expected a finite nonnegative integer') from None
+
+
+def _ids(value):
+    if isinstance(value, (set, frozenset, tuple, list)):
+        return {str(v) for v in value if _text(v) is not None}
+    if _text(value) is None:
+        return set()
+    if isinstance(value, str) and value.startswith('['):
+        decoded = json.loads(value)
+        if not isinstance(decoded, list):
+            raise ValueError('PCR identities must be a JSON list')
+        return _ids(decoded)
+    return {str(value)}
+
+
+def _fragment_suffix(fragment, sps, bc0):
+    """Decode only an explicitly supplied SPS/bc0 boundary; never first-CGAT."""
+    if not all(isinstance(v, str) and v for v in (fragment, sps, bc0)):
+        return None
+    tail = sps + bc0
+    if not fragment.endswith(tail) or len(fragment) <= len(tail):
+        return None
+    return fragment[:-len(tail)]
 
 
 @dataclass
 class BC1Record:
-    """
-    Unified record for a bc1-donor-bc0 combination.
-
-    This dataclass represents the merged view of data from multiple sources.
-    A single bc1 may have data from 2x150, 2x300, and/or gdb sources.
-    """
-    bc1: str
-    bc0: str
-
-    # Donor information - may come from different sources
-    donor_full: Optional[str] = None           # Full donor from 2x300
-    donor_bc0_fragment: Optional[str] = None   # 60bp fragment from 2x150
-    donor_from_gdb: Optional[str] = None       # Donor from guide-donor-bc0
-
-    # Guide information (from gdb)
+    """One observed link, possibly with a uniquely attached short observation."""
+    bc1: Optional[str]
+    bc0: Optional[str]
+    donor_full: Optional[str] = None
+    donor_bc0_fragment: Optional[str] = None
+    donor_from_gdb: Optional[str] = None
     guide: Optional[str] = None
-
-    # Data source tracking
     has_2x150: bool = False
     has_2x300: bool = False
     has_gdb: bool = False
-
-    # Read counts from each source
     counts_2x150: int = 0
     counts_2x300: int = 0
     counts_gdb: int = 0
-
-    # PCR replicate counts from each source
     pcr_replicates_2x150: int = 0
     pcr_replicates_2x300: int = 0
-
-    # Conflict tracking
     has_donor_conflict: bool = False
     conflict_details: Optional[str] = None
-
-    # Additional metadata
     library_id: Optional[str] = None
     scaffold: Optional[str] = None
+    donor_recovered: Optional[str] = None
+    SPS: Optional[str] = None
+    scope: Tuple = field(default_factory=lambda: (None,) * len(SCOPE_COLUMNS))
+    pcr_ids_2x150: Set[str] = field(default_factory=set)
+    pcr_ids_2x300: Set[str] = field(default_factory=set)
+    anonymous_pcr_2x150: int = 0
+    anonymous_pcr_2x300: int = 0
+    support_unknown: bool = False
+    fragments: Set[str] = field(default_factory=set)
+    short_link_candidates: int = 0
+    gdb_candidates: List[Dict] = field(default_factory=list)
 
     @property
-    def total_counts(self) -> int:
-        """Total read counts across all sources."""
+    def total_counts(self):
         return self.counts_2x150 + self.counts_2x300
 
     @property
-    def total_pcr_replicates(self) -> int:
-        """Total PCR replicates across all sources."""
-        return self.pcr_replicates_2x150 + self.pcr_replicates_2x300
+    def total_pcr_replicates(self):
+        # Without identities the largest supplied scalar is only a lower bound.
+        return max(len(self.pcr_ids_2x150 | self.pcr_ids_2x300),
+                   self.anonymous_pcr_2x150, self.anonymous_pcr_2x300,
+                   self.pcr_replicates_2x150, self.pcr_replicates_2x300)
 
     @property
-    def best_donor(self) -> Optional[str]:
-        """
-        Get the best available donor sequence.
-
-        Priority:
-        1. Full donor from 2x300 (most complete)
-        2. Donor from gdb (if available and consistent)
-        3. None if only fragment available (need to infer from matching)
-        """
-        if isinstance(self.donor_full, str) and self.donor_full:
-            return self.donor_full
-        if isinstance(self.donor_from_gdb, str) and self.donor_from_gdb:
-            return self.donor_from_gdb
-        return None
+    def best_donor(self):
+        return self.donor_full or self.donor_recovered or self.donor_from_gdb
 
     @property
-    def donor_bc0_key(self) -> Optional[str]:
-        """
-        Get the donor_bc0 key for linking records.
-
-        This is the 30bp donor portion + 10bp bc0 that uniquely identifies
-        a donor-bc0 combination and can link 2x150 fragments to 2x300 data.
-        """
-        if not isinstance(self.bc0, str):
+    def donor_bc0_key(self):
+        if not self.bc0:
             return None
-        if isinstance(self.donor_bc0_fragment, str) and self.donor_bc0_fragment:
-            # Extract donor portion (before common sequence)
-            if COMMON_SEQUENCE_START in self.donor_bc0_fragment:
-                donor_portion = self.donor_bc0_fragment[:self.donor_bc0_fragment.index(COMMON_SEQUENCE_START)]
-            else:
-                # Fallback: assume last 10bp is bc0, rest is donor portion
-                donor_portion = self.donor_bc0_fragment[:-BC0_LENGTH]
-            return donor_portion + self.bc0
+        if self.best_donor:
+            return build_donor_bc0_key(self.best_donor, self.bc0)
+        suffix = _fragment_suffix(self.donor_bc0_fragment, self.SPS, self.bc0)
+        return suffix[-30:] + self.bc0 if suffix else None
 
-        if isinstance(self.donor_full, str) and self.donor_full:
-            # Extract last 30bp of donor + bc0
-            donor_portion = self.donor_full[-30:] if len(self.donor_full) >= 30 else self.donor_full
-            return donor_portion + self.bc0
-
-        return None
-
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for DataFrame creation."""
-        return {
-            'bc1': self.bc1,
-            'bc0': self.bc0,
-            'donor': self.best_donor,
-            'donor_full': self.donor_full,
-            'donor_bc0_fragment': self.donor_bc0_fragment,
-            'donor_from_gdb': self.donor_from_gdb,
-            'guide': self.guide,
-            'has_2x150': self.has_2x150,
-            'has_2x300': self.has_2x300,
-            'has_gdb': self.has_gdb,
-            'counts_2x150': self.counts_2x150,
-            'counts_2x300': self.counts_2x300,
-            'counts_gdb': self.counts_gdb,
-            'total_counts': self.total_counts,
-            'pcr_replicates_2x150': self.pcr_replicates_2x150,
-            'pcr_replicates_2x300': self.pcr_replicates_2x300,
-            'total_pcr_replicates': self.total_pcr_replicates,
-            'has_donor_conflict': self.has_donor_conflict,
-            'conflict_details': self.conflict_details,
-            'library_id': self.library_id,
-            'scaffold': self.scaffold,
-        }
+    def to_dict(self):
+        ids = self.pcr_ids_2x150 | self.pcr_ids_2x300
+        result = dict(bc1=self.bc1, bc0=self.bc0, donor=self.best_donor,
+            donor_full=self.donor_full, donor_recovered=self.donor_recovered,
+            donor_bc0_fragment=self.donor_bc0_fragment, donor_from_gdb=self.donor_from_gdb,
+            guide=self.guide, has_2x150=self.has_2x150, has_2x300=self.has_2x300, has_gdb=self.has_gdb,
+            counts_2x150=self.counts_2x150, counts_2x300=self.counts_2x300, counts_gdb=self.counts_gdb,
+            total_counts=self.total_counts, pcr_replicates_2x150=self.pcr_replicates_2x150,
+            pcr_replicates_2x300=self.pcr_replicates_2x300, total_pcr_replicates=self.total_pcr_replicates,
+            pcr_replicate_ids=json.dumps(sorted(ids)),
+            pcr_ids_2x150=json.dumps(sorted(self.pcr_ids_2x150)),
+            pcr_ids_2x300=json.dumps(sorted(self.pcr_ids_2x300)),
+            pcr_support_exact=not self.support_unknown,
+            has_donor_conflict=self.has_donor_conflict, conflict_details=self.conflict_details,
+            library_id=self.library_id, scaffold=self.scaffold, SPS=self.SPS,
+            input_library_scope=json.dumps(dict(zip(SCOPE_COLUMNS, self.scope)), sort_keys=True),
+            observed_fragments=json.dumps(sorted(self.fragments)),
+            short_link_candidates=self.short_link_candidates,
+            gdb_candidates=json.dumps(self.gdb_candidates, sort_keys=True),
+            gdb_ambiguous=len(self.gdb_candidates) > 1,
+            link_resolved=bool(self.bc1 and self.bc0 and self.best_donor))
+        result.update(dict(zip(SCOPE_COLUMNS, self.scope)))
+        return result
 
 
 def extract_donor_portion_from_fragment(fragment: str) -> str:
-    """
-    Extract the donor portion from a donor_bc0_fragment.
-
-    The fragment structure is: ~30bp donor + ~20bp common + 10bp bc0
-    Common sequence starts with 'CGAT'.
-
-    Args:
-        fragment: The 60bp donor_bc0_fragment
-
-    Returns:
-        The donor portion (before common sequence)
-    """
+    """Legacy convenience heuristic; not used to establish a merge assignment."""
     if COMMON_SEQUENCE_START in fragment:
         return fragment[:fragment.index(COMMON_SEQUENCE_START)]
-    # Fallback: assume structure is 30bp donor + 20bp common + 10bp bc0
     return fragment[:30]
 
 
 def build_donor_bc0_key(donor: str, bc0: str, use_last_n_bp: int = 30) -> str:
-    """
-    Build a donor_bc0 key for linking records.
-
-    Args:
-        donor: Full or partial donor sequence
-        bc0: The bc0 barcode
-        use_last_n_bp: How many bp from end of donor to use
-
-    Returns:
-        Concatenated key: donor_portion + bc0
-    """
-    # Guard against non-string donor/bc0 (NaN floats from NA-donor gdb rows)
+    """Candidate lookup key only: a suffix match is not a unique donor call."""
     if not isinstance(donor, str) or not isinstance(bc0, str):
-        return ""
-    if len(donor) >= use_last_n_bp:
-        donor_portion = donor[-use_last_n_bp:]
-    else:
-        donor_portion = donor
-    return donor_portion + bc0
+        return ''
+    return donor[-use_last_n_bp:] + bc0
 
 
-def merge_2x150_data(df_2x150: pd.DataFrame, show_progress: bool = True) -> Dict[str, BC1Record]:
-    """
-    Process 2x150 data into BC1Record objects.
+def _key(record):
+    known = record.donor_full or record.donor_recovered
+    return (record.scope, record.bc1, record.bc0, known,
+            None if known else record.donor_bc0_fragment, record.SPS)
 
-    PERFORMANCE: Uses itertuples instead of iterrows for ~10x faster iteration.
 
-    Expected columns:
-    - bc1: The bc1 barcode
-    - donor_bc0_fragment: The 60bp fragment (or 'donor' if that's the column name)
-    - bc0: The bc0 barcode
-    - total_counts or counts: Read counts
-    - num_PCR_replicates: PCR replicate count
+def _refresh_support(record):
+    for source in ('2x150', '2x300'):
+        setattr(record, 'pcr_replicates_' + source,
+                max(len(getattr(record, 'pcr_ids_' + source)),
+                    getattr(record, 'anonymous_pcr_' + source)))
 
-    Args:
-        df_2x150: DataFrame with 2x150 bc1-donor_bc0_fragment data
-        show_progress: Whether to show a progress bar
 
-    Returns:
-        Dictionary mapping bc1 -> BC1Record
-    """
-    from tqdm import tqdm
+def _combine(target, other):
+    """Transfer one observation exactly once, with SUM reads / UNION IDs."""
+    for source in ('2x150', '2x300'):
+        setattr(target, 'counts_' + source, getattr(target, 'counts_' + source) + getattr(other, 'counts_' + source))
+        setattr(target, 'has_' + source, getattr(target, 'has_' + source) or getattr(other, 'has_' + source))
+        getattr(target, 'pcr_ids_' + source).update(getattr(other, 'pcr_ids_' + source))
+        setattr(target, 'anonymous_pcr_' + source,
+                max(getattr(target, 'anonymous_pcr_' + source), getattr(other, 'anonymous_pcr_' + source)))
+    target.support_unknown |= other.support_unknown
+    target.donor_full = target.donor_full or other.donor_full
+    target.donor_recovered = target.donor_recovered or other.donor_recovered
+    target.SPS = target.SPS or other.SPS
+    target.fragments.update(other.fragments)
+    target.donor_bc0_fragment = min(target.fragments) if target.fragments else None
+    _refresh_support(target)
 
-    records: Dict[str, BC1Record] = {}
 
-    # Handle column name variations
-    fragment_col = 'donor_bc0_fragment' if 'donor_bc0_fragment' in df_2x150.columns else 'donor'
-    counts_col = 'total_bc1_donor_bc0_counts' if 'total_bc1_donor_bc0_counts' in df_2x150.columns else 'counts'
-    pcr_col = 'num_PCR_replicates' if 'num_PCR_replicates' in df_2x150.columns else None
-    # 2026-05-31 fix: when the parsed TSV does not carry a pre-aggregated
-    # num_PCR_replicates column (the current parser does not), derive the
-    # replicate count from the per-sample replicate identity.
-    # 2026-06-11 R2 fix: prefer the composite pcr_replicate_id (full
-    # PCR_plate_name identity: gDNA_plate_name + inner_primers + outer_primers +
-    # sample_number) carried by data_loader, so a sample split across distinct
-    # primer plates — or independently re-prepped (new gDNA plate, even if the
-    # outer primers coincide) — counts as multiple independent PCR replicates.
-    # Re-sequencing the same library is intentionally NOT a new replicate
-    # (sequencing_date is excluded from the id). Fall back to bare sample_number
-    # for backward compat.
-    if pcr_col is not None:
-        replicate_col = None
-    elif 'pcr_replicate_id' in df_2x150.columns:
-        replicate_col = 'pcr_replicate_id'
-    elif 'sample_number' in df_2x150.columns:
-        replicate_col = 'sample_number'
-    else:
-        replicate_col = None
-    has_library_id = 'library_ID' in df_2x150.columns
-
-    # Prepare subset of columns for efficient iteration
-    cols_needed = ['bc1', 'bc0', fragment_col, counts_col]
-    if pcr_col:
-        cols_needed.append(pcr_col)
-    elif replicate_col:
-        cols_needed.append(replicate_col)
-    if has_library_id:
-        cols_needed.append('library_ID')
-
-    df_subset = df_2x150[cols_needed]
-
-    # replicates-per-bc1 accumulator: drives pcr_replicates_2x150 when the input
-    # lacks a pre-aggregated num_PCR_replicates column.
-    replicates_per_bc1: Dict[str, set] = defaultdict(set) if replicate_col else {}
-
-    # Use itertuples for faster iteration
-    iterator = df_subset.itertuples(index=False)
+def _merge_source(df, source, existing=None, show_progress=True):
+    """Return a composite-key dictionary; never key evidence by bc1 alone."""
+    records = {_key(record): record for record in (existing or {}).values()}
+    count_cols = [c for c in ('total_bc1_donor_bc0_counts', 'counts', 'total_counts') if c in df]
+    if not count_cols:
+        raise ValueError('Missing BDB read count column')
+    for required in ('bc1', 'bc0'):
+        if required not in df:
+            raise ValueError(f'Missing BDB column: {required}')
+    iterator = df.itertuples(index=False, name=None)
     if show_progress:
-        iterator = tqdm(iterator, total=len(df_subset), desc="Processing 2x150")
-
-    for row in iterator:
-        bc1 = row.bc1
-        bc0 = row.bc0
-        # HANDOFF_20260528 fix (Agent B, yL437/yL442): removed dead getattr line that threw
-        # AttributeError when pandas-mangled `donor_bc0_fragment` → `donorbc0fragment` did
-        # not match the actual itertuples attribute name. Position-based access below is the
-        # correct path; the getattr was always overridden by line 231.
-        fragment = row[2]  # Third column is fragment_col
-        counts = row[3] if pd.notna(row[3]) else 0
-
-        if bc1 not in records:
-            records[bc1] = BC1Record(bc1=bc1, bc0=bc0)
-
-        record = records[bc1]
-        record.has_2x150 = True
+        from tqdm import tqdm
+        iterator = tqdm(iterator, total=len(df), desc='Merging observed ' + source + ' links')
+    columns = list(df.columns)
+    for values in iterator:
+        row = dict(zip(columns, values))
+        counts = [_count(row[c]) for c in count_cols]
+        if len(set(counts)) != 1:
+            raise ValueError(f'Conflicting read count columns: {count_cols}')
+        count = counts[0]
+        bc1, bc0 = _text(row['bc1']), _text(row['bc0'])
+        scope = tuple(_text(row.get(c)) for c in SCOPE_COLUMNS)
+        fragment = _text(row.get('donor_bc0_fragment'))
+        if source == '2x150' and 'donor_bc0_fragment' not in df:
+            fragment = _text(row.get('donor'))
+        donor = _text(row.get('donor', row.get('bdb_donor')))
+        record = BC1Record(bc1, bc0, scope=scope, SPS=_text(row.get('SPS')))
+        if source == '2x300':
+            record.donor_full = donor
+        elif 'donor_bc0_fragment' in df:
+            record.donor_recovered = donor
         record.donor_bc0_fragment = fragment
-        # 2026-05-31 fix: SUM counts across all rows seen for this bc1 (one
-        # row per (bc1, sample) in the concatenated parsed TSVs). Prior code
-        # overwrote on each iteration, so final value was just the last row's.
-        record.counts_2x150 += int(counts)
-
-        if pcr_col:
-            pcr_val = row[4]
-            # 2026-05-31 fix: SUM pre-aggregated PCR replicate counts across rows.
-            record.pcr_replicates_2x150 += int(pcr_val) if pd.notna(pcr_val) else 0
-        elif replicate_col:
-            replicates_per_bc1[bc1].add(row[4])
-
-        if has_library_id:
-            lib_idx = 5 if (pcr_col or replicate_col) else 4
-            lib_id = row[lib_idx] if len(row) > lib_idx else None
-            if pd.notna(lib_id):
-                record.library_id = lib_id
-
-    # 2026-05-31 fix: when num_PCR_replicates was absent, derive
-    # pcr_replicates_2x150 from the distinct replicate-identity count per bc1.
-    if replicate_col:
-        for bc1, replicates in replicates_per_bc1.items():
-            records[bc1].pcr_replicates_2x150 = len(replicates)
-
-    logger.info(f"Processed {len(records)} bc1 records from 2x150 data")
-    return records
-
-
-def merge_2x300_data(df_2x300: pd.DataFrame,
-                     existing_records: Optional[Dict[str, BC1Record]] = None,
-                     show_progress: bool = True) -> Dict[str, BC1Record]:
-    """
-    Process 2x300 data into BC1Record objects, optionally merging with existing records.
-
-    PERFORMANCE: Uses vectorized operations where possible and itertuples for iteration.
-
-    Expected columns:
-    - bc1: The bc1 barcode
-    - donor: The full donor sequence
-    - bc0: The bc0 barcode
-    - total_bc1_donor_bc0_counts or counts: Read counts
-    - num_PCR_replicates: PCR replicate count
-
-    Args:
-        df_2x300: DataFrame with 2x300 bc1-donor-bc0 data
-        existing_records: Optional dict of existing records to merge into
-        show_progress: Whether to show a progress bar
-
-    Returns:
-        Dictionary mapping bc1 -> BC1Record
-    """
-    from tqdm import tqdm
-
-    records = existing_records if existing_records is not None else {}
-
-    # Handle column name variations
-    donor_col = 'donor' if 'donor' in df_2x300.columns else 'bdb_donor'
-    counts_col = 'total_bc1_donor_bc0_counts' if 'total_bc1_donor_bc0_counts' in df_2x300.columns else 'counts'
-    pcr_col = 'num_PCR_replicates' if 'num_PCR_replicates' in df_2x300.columns else None
-    # 2026-05-31 fix: derive pcr_replicates_2x300 from the per-sample replicate
-    # identity when the parsed TSV lacks a pre-aggregated num_PCR_replicates
-    # column (the current 2x300 parser does not produce one).
-    # 2026-06-11 R2 fix: prefer the composite pcr_replicate_id (full
-    # PCR_plate_name identity: gDNA_plate_name + inner_primers + outer_primers +
-    # sample_number) tagged by data_loader.load_2x300_data; count distinct
-    # sample_number only as a backward-compat fallback (it under-counts a sample
-    # split across primer plates or independently re-prepped). Re-sequencing the
-    # same library is NOT a new PCR replicate (sequencing_date excluded).
-    if pcr_col is not None:
-        replicate_col = None
-    elif 'pcr_replicate_id' in df_2x300.columns:
-        replicate_col = 'pcr_replicate_id'
-    elif 'sample_number' in df_2x300.columns:
-        replicate_col = 'sample_number'
-    else:
-        replicate_col = None
-    has_library_id = 'library_ID' in df_2x300.columns
-
-    new_records = 0
-    merged_records = 0
-
-    # Get numpy arrays for faster access
-    bc1_vals = df_2x300['bc1'].values
-    bc0_vals = df_2x300['bc0'].values
-    donor_vals = df_2x300[donor_col].values
-    counts_vals = df_2x300[counts_col].values
-    pcr_vals = df_2x300[pcr_col].values if pcr_col else None
-    replicate_vals = df_2x300[replicate_col].values if replicate_col else None
-    lib_vals = df_2x300['library_ID'].values if has_library_id else None
-
-    # replicates-per-bc1 accumulator for the no-num_PCR_replicates path.
-    replicates_per_bc1: Dict[str, set] = defaultdict(set) if replicate_col else {}
-
-    iterator = range(len(df_2x300))
-    if show_progress:
-        iterator = tqdm(iterator, desc="Processing 2x300")
-
-    for i in iterator:
-        bc1 = bc1_vals[i]
-        bc0 = bc0_vals[i]
-        donor = donor_vals[i]
-
-        if bc1 not in records:
-            records[bc1] = BC1Record(bc1=bc1, bc0=bc0)
-            new_records += 1
+        if fragment:
+            record.fragments.add(fragment)
+        setattr(record, 'counts_' + source, count)
+        setattr(record, 'has_' + source, True)
+        if count:
+            identities = set()
+            for field_name in ('pcr_replicate_ids', 'pcr_replicate_id', 'sample_number'):
+                if field_name in row:
+                    identities = _ids(row[field_name])
+                    if identities:
+                        break
+            getattr(record, 'pcr_ids_' + source).update(identities)
+            scalar = row.get('num_PCR_replicates')
+            if not identities:
+                record.support_unknown = True
+                if _text(scalar) is not None:
+                    setattr(record, 'anonymous_pcr_' + source, _count(scalar, 'PCR support count'))
+            elif _text(scalar) is not None and _count(scalar, 'PCR support count') > len(identities):
+                record.support_unknown = True
+                setattr(record, 'anonymous_pcr_' + source, _count(scalar, 'PCR support count'))
+        _refresh_support(record)
+        key = _key(record)
+        if key in records:
+            _combine(records[key], record)
         else:
-            merged_records += 1
-
-        record = records[bc1]
-        record.has_2x300 = True
-        record.donor_full = donor
-        # 2026-05-31 fix: SUM counts across all rows for this bc1 (one row per
-        # (bc1, sample) in the concatenated parsed TSVs). Prior code overwrote
-        # so final value was just the last row's count.
-        record.counts_2x300 += int(counts_vals[i]) if pd.notna(counts_vals[i]) else 0
-
-        if pcr_vals is not None:
-            # 2026-05-31 fix: SUM pre-aggregated PCR replicate counts across rows.
-            record.pcr_replicates_2x300 += int(pcr_vals[i]) if pd.notna(pcr_vals[i]) else 0
-        elif replicate_vals is not None:
-            replicates_per_bc1[bc1].add(replicate_vals[i])
-
-        # Check for bc0 consistency
-        if record.bc0 != bc0:
-            logger.warning(f"bc0 mismatch for bc1 {bc1}: 2x150={record.bc0}, 2x300={bc0}")
-
-        # Extract library_id if available
-        if lib_vals is not None and pd.notna(lib_vals[i]):
-            record.library_id = lib_vals[i]
-
-    # 2026-05-31 fix: when num_PCR_replicates was absent, derive
-    # pcr_replicates_2x300 from the distinct replicate-identity count per bc1.
-    if replicate_vals is not None:
-        for bc1, replicates in replicates_per_bc1.items():
-            records[bc1].pcr_replicates_2x300 = len(replicates)
-
-    logger.info(f"Processed 2x300 data: {new_records} new records, {merged_records} merged with existing")
+            records[key] = record
     return records
 
 
-def merge_gdb_data(df_gdb: pd.DataFrame,
-                   existing_records: Dict[str, BC1Record]) -> Dict[str, BC1Record]:
-    """
-    Merge guide-donor-bc0 data into existing records.
-
-    The merge is done via the donor_bc0 key (30bp donor portion + 10bp bc0).
-
-    Expected columns:
-    - guide: The guide sequence
-    - donor: The donor sequence
-    - bc0: The bc0 barcode
-    - donor_bc0_fragment: The 60bp fragment
-    - oligo_name: The matched oligo (if available)
-    - counts or grouped_guide_bc0_counts: Read counts
-
-    Args:
-        df_gdb: DataFrame with guide-donor-bc0 data
-        existing_records: Dict of existing bc1 records to merge into
-
-    Returns:
-        Updated dictionary of BC1Records
-    """
-    # Build lookup from donor_bc0_key -> gdb rows
-    gdb_lookup: Dict[str, List[pd.Series]] = defaultdict(list)
-
-    for _, row in df_gdb.iterrows():
-        donor = row['donor']
-        bc0 = row['bc0']
-        # NA-donor gdb rows (unmatched reads in the matched table) cannot bridge
-        if not isinstance(donor, str) or not isinstance(bc0, str):
+def _attach_unique_short_links(records):
+    candidates = defaultdict(list)
+    for record in records.values():
+        if record.best_donor and record.bc1 and record.bc0:
+            candidates[(record.scope, record.bc1, record.bc0)].append(record)
+    remove = []
+    for key, record in records.items():
+        if record.best_donor or not record.bc1 or not record.bc0:
             continue
-        key = build_donor_bc0_key(donor, bc0)
-        gdb_lookup[key].append(row)
+        suffix = _fragment_suffix(record.donor_bc0_fragment, record.SPS, record.bc0)
+        if not suffix:
+            continue
+        matches = [parent for parent in candidates[(record.scope, record.bc1, record.bc0)]
+                   if parent.best_donor.endswith(suffix)
+                   and parent.SPS == record.SPS]
+        record.short_link_candidates = len(matches)
+        if len(matches) == 1:
+            _combine(matches[0], record)
+            remove.append(key)
+    for key in remove:
+        del records[key]
+    return {_key(record): record for record in records.values()}
 
-    # Also build lookup from fragment -> gdb rows
-    fragment_lookup: Dict[str, List[pd.Series]] = defaultdict(list)
-    if 'donor_bc0_fragment' in df_gdb.columns:
-        for _, row in df_gdb.iterrows():
-            fragment = row['donor_bc0_fragment']
-            if pd.notna(fragment):
-                fragment_lookup[fragment].append(row)
 
-    # Merge gdb data into existing records
-    matched_count = 0
-    for bc1, record in existing_records.items():
-        # Try to match via donor_bc0_key
-        key = record.donor_bc0_key
-        gdb_matches = []
+def merge_2x150_data(df_2x150, show_progress=True):
+    """Merge exact observed short links; dictionary keys are scoped link tuples."""
+    return _merge_source(df_2x150, '2x150', show_progress=show_progress)
 
-        if key and key in gdb_lookup:
-            gdb_matches = gdb_lookup[key]
-        elif record.donor_bc0_fragment and record.donor_bc0_fragment in fragment_lookup:
-            gdb_matches = fragment_lookup[record.donor_bc0_fragment]
 
-        if gdb_matches:
-            # Take the best match (highest counts)
-            counts_col = 'grouped_guide_bc0_counts' if 'grouped_guide_bc0_counts' in gdb_matches[0].index else 'counts'
-            best_match = max(gdb_matches, key=lambda x: x.get(counts_col, 0))
+def merge_2x300_data(df_2x300, existing_records=None, show_progress=True):
+    """Merge exact full links, then attach only uniquely compatible short links."""
+    records = _merge_source(df_2x300, '2x300', existing_records, show_progress)
+    return _attach_unique_short_links(records)
 
-            record.has_gdb = True
-            record.guide = best_match.get('guide')
-            record.donor_from_gdb = best_match.get('donor')
-            record.counts_gdb = int(best_match.get(counts_col, 0))
 
-            if 'library_ID' in best_match.index and pd.notna(best_match.get('library_ID')):
-                record.library_id = best_match['library_ID']
-            if 'scaffold' in best_match.index and pd.notna(best_match.get('scaffold')):
-                record.scaffold = best_match['scaffold']
-
-            matched_count += 1
-
-    logger.info(f"Merged gdb data: {matched_count}/{len(existing_records)} records matched")
+def merge_gdb_data(df_gdb, existing_records):
+    """Annotate compatible links without multiplying or adding BDB evidence."""
+    lookup = defaultdict(list)
+    fragments = defaultdict(list)
+    for values in df_gdb.itertuples(index=False, name=None):
+        row = dict(zip(df_gdb.columns, values))
+        donor, bc0 = _text(row.get('donor')), _text(row.get('bc0'))
+        if not donor or not bc0:
+            continue
+        count_col = 'grouped_guide_bc0_counts' if 'grouped_guide_bc0_counts' in row else 'counts'
+        candidate = {c: _text(row.get(c)) for c in ('donor', 'bc0', 'guide', 'library_ID', 'scaffold', 'SPS', *SCOPE_COLUMNS)}
+        candidate['counts'] = _count(row.get(count_col, 0), 'GDB annotation count')
+        lookup[build_donor_bc0_key(donor, bc0)].append(candidate)
+        fragment = _text(row.get('donor_bc0_fragment'))
+        if fragment:
+            fragments[fragment].append(candidate)
+    for record in existing_records.values():
+        possible = lookup.get(record.donor_bc0_key, [])
+        if not possible and record.donor_bc0_fragment:
+            possible = fragments.get(record.donor_bc0_fragment, [])
+        matches = []
+        for candidate in possible:
+            if candidate['bc0'] != record.bc0:
+                continue
+            if record.best_donor and candidate['donor'] != record.best_donor:
+                continue
+            if record.SPS and candidate.get('SPS') and record.SPS != candidate['SPS']:
+                continue
+            if any(value and candidate.get(col) and value != candidate[col]
+                   for col, value in zip(SCOPE_COLUMNS, record.scope)):
+                continue
+            suffix = _fragment_suffix(record.donor_bc0_fragment, record.SPS, record.bc0)
+            if not record.best_donor and suffix and not candidate['donor'].endswith(suffix):
+                continue
+            matches.append(candidate)
+        # Stable candidate evidence; no counts from a short read are duplicated.
+        record.gdb_candidates = sorted(matches, key=lambda row: (-row['counts'], json.dumps(row, sort_keys=True)))
+        if (not matches or len({row['donor'] for row in matches}) != 1
+                or record.short_link_candidates > 1):
+            continue
+        best = record.gdb_candidates[0]
+        record.has_gdb = True
+        record.donor_from_gdb = best['donor']
+        guides = {row['guide'] for row in matches if row['guide']}
+        record.guide = next(iter(guides)) if len(guides) == 1 else None
+        record.counts_gdb = best['counts']
+        record.library_id, record.scaffold = best['library_ID'], best['scaffold']
     return existing_records
 
 
-def resolve_donor_conflicts(records: Dict[str, BC1Record]) -> Dict[str, BC1Record]:
-    """
-    Resolve conflicts when donors differ between data sources.
-
-    Strategy:
-    1. If 2x300 and gdb donors match: high confidence, no conflict
-    2. If 2x300 and gdb donors differ: flag as conflict, keep both
-    3. If only 2x150 fragment available: check if it matches 2x300/gdb donor end
-
-    Args:
-        records: Dictionary of BC1Records to check
-
-    Returns:
-        Updated dictionary with conflict flags set
-    """
-    conflict_count = 0
-
-    for bc1, record in records.items():
-        if not record.has_donor_conflict:
-            # Check for conflicts between sources
-            donors_to_compare = []
-
-            if isinstance(record.donor_full, str) and record.donor_full:
-                donors_to_compare.append(('2x300', record.donor_full))
-            if isinstance(record.donor_from_gdb, str) and record.donor_from_gdb:
-                donors_to_compare.append(('gdb', record.donor_from_gdb))
-
-            if len(donors_to_compare) >= 2:
-                # Compare donors
-                d1_source, d1 = donors_to_compare[0]
-                d2_source, d2 = donors_to_compare[1]
-
-                if d1 != d2:
-                    record.has_donor_conflict = True
-                    record.conflict_details = f"{d1_source} ({len(d1)}bp) != {d2_source} ({len(d2)}bp)"
-                    conflict_count += 1
-
-            # Check fragment consistency if available
-            if (isinstance(record.donor_bc0_fragment, str) and record.donor_bc0_fragment and isinstance(record.donor_full, str) and record.donor_full):
-                donor_portion = extract_donor_portion_from_fragment(record.donor_bc0_fragment)
-                if not record.donor_full.endswith(donor_portion):
-                    if not record.has_donor_conflict:
-                        record.has_donor_conflict = True
-                        record.conflict_details = "Fragment doesn't match 2x300 donor end"
-                        conflict_count += 1
-
-    logger.info(f"Found {conflict_count} records with donor conflicts")
+def resolve_donor_conflicts(records):
+    """Flag conflicts only where both sequence identities/boundaries are known."""
+    for record in records.values():
+        donor = record.donor_full or record.donor_recovered
+        suffix = _fragment_suffix(record.donor_bc0_fragment, record.SPS, record.bc0)
+        if donor and record.donor_from_gdb and donor != record.donor_from_gdb:
+            record.has_donor_conflict = True
+            record.conflict_details = 'Observed/recovered donor differs from GDB donor'
+        if donor and suffix and not donor.endswith(suffix):
+            record.has_donor_conflict = True
+            record.conflict_details = 'Explicit fragment boundary disagrees with donor suffix'
     return records
 
 
-def merge_data_sources(
-    df_2x150: Optional[pd.DataFrame] = None,
-    df_2x300: Optional[pd.DataFrame] = None,
-    df_gdb: Optional[pd.DataFrame] = None,
-    resolve_conflicts: bool = True
-) -> pd.DataFrame:
+def merge_data_sources(df_2x150=None, df_2x300=None, df_gdb=None, resolve_conflicts=True):
+    """Return all observed links, including ambiguous/unresolved count evidence.
+
+    This is an evidence table, not a unique bc1-to-construct assignment table.
+    The caller must retain scope, PCR identities and unresolved denominator mass.
     """
-    Main entry point: merge all available data sources into a unified DataFrame.
-
-    This function:
-    1. Processes 2x150 data (if available)
-    2. Merges 2x300 data (if available)
-    3. Merges gdb data (if available)
-    4. Resolves donor conflicts
-    5. Returns a unified DataFrame
-
-    Args:
-        df_2x150: DataFrame with 2x150 bc1-donor_bc0_fragment data
-        df_2x300: DataFrame with 2x300 bc1-donor-bc0 data
-        df_gdb: DataFrame with guide-donor-bc0 data
-        resolve_conflicts: Whether to check and flag donor conflicts
-
-    Returns:
-        Unified DataFrame with all merged data
-    """
-    records: Dict[str, BC1Record] = {}
-
-    # Process each data source
-    if df_2x150 is not None and len(df_2x150) > 0:
-        logger.info(f"Processing {len(df_2x150)} rows of 2x150 data")
+    records = {}
+    if df_2x150 is not None and len(df_2x150):
         records = merge_2x150_data(df_2x150)
-
-    if df_2x300 is not None and len(df_2x300) > 0:
-        logger.info(f"Processing {len(df_2x300)} rows of 2x300 data")
-        records = merge_2x300_data(df_2x300, existing_records=records)
-
-    if df_gdb is not None and len(df_gdb) > 0:
-        logger.info(f"Processing {len(df_gdb)} rows of gdb data")
-        records = merge_gdb_data(df_gdb, existing_records=records)
-
-    # Resolve conflicts
+    if df_2x300 is not None and len(df_2x300):
+        records = merge_2x300_data(df_2x300, records)
+    if df_gdb is not None and len(df_gdb):
+        records = merge_gdb_data(df_gdb, records)
     if resolve_conflicts:
         records = resolve_donor_conflicts(records)
-
-    # Convert to DataFrame
-    if not records:
-        logger.warning("No records after merging - returning empty DataFrame")
-        return pd.DataFrame()
-
-    df = pd.DataFrame([r.to_dict() for r in records.values()])
-
-    # Sort by total counts descending
-    df = df.sort_values('total_counts', ascending=False).reset_index(drop=True)
-
-    # Log summary statistics
-    logger.info(f"Merged data summary:")
-    logger.info(f"  Total records: {len(df)}")
-    logger.info(f"  With 2x150 data: {df['has_2x150'].sum()}")
-    logger.info(f"  With 2x300 data: {df['has_2x300'].sum()}")
-    logger.info(f"  With gdb data: {df['has_gdb'].sum()}")
-    logger.info(f"  With both 2x150 and 2x300: {((df['has_2x150']) & (df['has_2x300'])).sum()}")
-    logger.info(f"  With donor conflicts: {df['has_donor_conflict'].sum()}")
-
-    return df
+    columns = list(BC1Record(None, None).to_dict())
+    return pd.DataFrame([record.to_dict() for record in records.values()], columns=columns).sort_values(
+        'total_counts', ascending=False, kind='stable').reset_index(drop=True)
 
 
 def filter_by_quality(
