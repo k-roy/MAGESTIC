@@ -39,7 +39,7 @@ def _ids(value, *, serialized=False):
         return {str(v) for v in value if _text(v) is not None}
     if _text(value) is None:
         return set()
-    if serialized and isinstance(value, str) and value.startswith('['):
+    if serialized and isinstance(value, str) and value.lstrip().startswith('['):
         decoded = json.loads(value)
         if not isinstance(decoded, list):
             raise ValueError('PCR identities must be a JSON list')
@@ -228,8 +228,8 @@ def _merge_source(df, source, existing=None, show_progress=True):
                     identities = _ids(row[field_name], serialized=field_name == 'pcr_replicate_ids')
                     if identities:
                         break
-            if any(';' in identity for identity in identities):
-                raise ValueError('PCR identity contains reserved semicolon delimiter')
+            if any(';' in identity or identity.lstrip().startswith('[') for identity in identities):
+                raise ValueError('PCR identity contains reserved semicolon or JSON-list prefix')
             getattr(record, 'pcr_ids_' + source).update(identities)
             scalar = row.get('num_PCR_replicates')
             if not identities:

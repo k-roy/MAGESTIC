@@ -29,3 +29,24 @@ def test_singular_identity_is_not_parsed_as_a_plural_list():
     # Refuse it rather than publishing something Step08 would count as3PCRs.
     with pytest.raises(ValueError, match='PCR identity'):
         merge_data_sources(df_2x300=rows)
+
+
+@pytest.mark.parametrize('encoded', ['["p1", "p2"]', ' ["p1", "p2"]', '\n["p1", "p2"]\t'])
+def test_json_plural_list_accepts_json_whitespace(encoded):
+    rows = pd.DataFrame(dict(bc1=['G'*20], bc0=['A'*10], donor=['A'*129],
+                             counts=[10], pcr_replicate_ids=[encoded]))
+    result = merge_data_sources(df_2x300=rows).iloc[0]
+    assert result['total_pcr_replicates'] == 2
+    assert result['pcr_replicate_ids'] == 'p1;p2'
+
+
+def test_opaque_json_looking_id_cannot_change_identity_on_roundtrip():
+    rows = pd.DataFrame(dict(bc1=['G'*20], bc0=['A'*10], donor=['A'*129],
+                             counts=[10], pcr_replicate_id=['["p1", "p2"]']))
+    try:
+        first = merge_data_sources(df_2x300=rows)
+    except ValueError as error:
+        assert 'PCR identity' in str(error)
+        return  # Explicit refusal is valid; silently changing one identity to2 is not.
+    second = merge_data_sources(df_2x300=first)
+    assert first.iloc[0]['total_pcr_replicates'] == second.iloc[0]['total_pcr_replicates'] == 1
