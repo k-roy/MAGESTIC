@@ -413,8 +413,8 @@ def write_counts_file(
     """
     sample_counts = next(iter(bc0_counts.values()), {})
     total_cols = ["total_counts", "total_fwd_counts", "total_rev_counts"]
-    per_run_cols = sorted(k for k in (sample_counts if bc0_counts else (run_columns or []))
-                          if k not in total_cols)
+    per_run_cols = sorted({k for k in (sample_counts if bc0_counts else (run_columns or []))
+                           if k not in total_cols})
     seq_cols = ["leader", "guide", "donor", "SPS", "bc0", "msd", "donor_bc0_fragment", "seq"]
 
     header = ["library_ID"] + total_cols + per_run_cols + seq_cols

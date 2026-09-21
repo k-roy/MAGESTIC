@@ -92,3 +92,20 @@ def test_runner_preflights_all_selected_libraries_before_publishing(tmp_path):
     assert runner.run_combine_fastq(config) is False
     assert not table_path(config, 'V_first').exists()
     assert not table_path(config, 'V_missing').exists()
+
+
+def test_empty_and_nonempty_schemas_agree_for_repeated_month_day(tmp_path):
+    config, fastqs = setup_case(tmp_path)
+    config.sample_keyfile.write_text(config.sample_keyfile.read_text().replace(DATE, DATE+',20210102'))
+    second = config.collapsed_fastq_dir/'20210102_plate_s1_collapsed.fastq'
+    fastqs['s1'].write_text('')
+    second.write_text('')
+    assert runner.run_combine_fastq(config) is True
+    empty_header = table_path(config).read_text().splitlines()[0].split('\t')
+    assert len(empty_header) == len(set(empty_header))
+    write_fastq(fastqs['s1'])
+    assert runner.run_combine_fastq(config) is True
+    populated_header = table_path(config).read_text().splitlines()[0].split('\t')
+    assert empty_header == populated_header
+    # This only preserves the existing shared MMDD schema. Distinguishing years
+    # requires a separately reviewed migration of all producers and consumers.
