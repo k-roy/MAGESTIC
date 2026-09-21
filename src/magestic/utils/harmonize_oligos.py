@@ -251,7 +251,9 @@ def impute_missing_sv_scores(
 
     # Get guides with missing scores
     missing_mask = variants_df["SV_prediction_score"].isna()
-    missing_guides = variants_df[missing_mask].copy()
+    # Work in positional order within the missing subset: dataframe index labels
+    # need not be unique, and grouping chromosomes must not reorder assignments.
+    missing_guides = variants_df.loc[missing_mask, ["chrom", "PAM_coord"]].reset_index(drop=True)
 
     if len(missing_guides) == 0:
         print("  No missing scores to impute")
@@ -275,7 +277,7 @@ def impute_missing_sv_scores(
 
     score_sv_ref["chr"] = score_sv_ref["chr"].apply(standardize_chrom)
 
-    imputed_scores = []
+    imputed_scores = np.full(len(missing_guides), np.nan)
 
     # Group by chromosome for efficiency
     for chrom in missing_guides["chrom"].unique():
@@ -284,17 +286,15 @@ def impute_missing_sv_scores(
 
         if len(chrom_ref) == 0:
             # No reference guides on this chromosome, use NaN
-            imputed_scores.extend([np.nan] * len(chrom_missing))
             continue
 
         ref_positions = chrom_ref["pos"].values
         ref_scores = chrom_ref["SCORE.SV.minmax"].values
 
-        for _, guide in chrom_missing.iterrows():
+        for position, guide in chrom_missing.iterrows():
             target_pos = guide["PAM_coord"]
 
             if pd.isna(target_pos):
-                imputed_scores.append(np.nan)
                 continue
 
             # Find two nearest positions
@@ -302,14 +302,14 @@ def impute_missing_sv_scores(
 
             if len(distances) == 1:
                 # Only one reference guide on chromosome
-                imputed_scores.append(ref_scores[0])
+                imputed_scores[position] = ref_scores[0]
             else:
                 # Get two nearest
                 nearest_indices = np.argpartition(
                     distances, min(2, len(distances) - 1)
                 )[:2]
                 nearest_scores = ref_scores[nearest_indices]
-                imputed_scores.append(np.mean(nearest_scores))
+                imputed_scores[position] = np.mean(nearest_scores)
 
     # Assign imputed scores
     variants_df.loc[missing_mask, "SV_prediction_score"] = imputed_scores
