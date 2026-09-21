@@ -31,7 +31,6 @@ import argparse
 import os
 import sys
 import time
-import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
@@ -91,28 +90,28 @@ def load_guide_table(guide_dir: Path, pattern: str, fallback_pattern: str, outpu
         df = df[df["linking_key"].notna() & (df["guide"] != "") & (df["guide"] != "NA")]
         # Repeated full-sequence rows can carry the same guide/linking key.
         # Sum their support within the source library before choosing a guide.
-        n_guides = df.groupby("linking_key")["guide"].nunique()
         support_keys = ["linking_key", "guide"] + (["library_ID"] if "library_ID" in df.columns else [])
         support = df.groupby(support_keys, sort=False, dropna=False)["_n"].agg(
             guide_support="sum", representative_index="idxmax").reset_index()
         df = df.loc[support["representative_index"]].copy()
         df["_n"] = support["guide_support"].to_numpy()
-        df = df.sort_values("_n", ascending=False, kind="mergesort").drop_duplicates("linking_key")
-        df["_n_guides"] = df["linking_key"].map(n_guides).astype("int64")
-        keep = ["linking_key", "guide", "_n", "_n_guides"] + [c for c in ("library_ID", "SPS") if c in df.columns]
+        # Keep every source-guide candidate until global ambiguity is counted.
+        # A discarded per-file runner-up may be absent from every other file.
+        keep = ["linking_key", "guide", "_n"] + [c for c in ("library_ID", "SPS") if c in df.columns]
         per_file.append(df[keep])
         srcs.append({"file": str(f), "bytes": st.st_size,
                      "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
-                     "library_IDs": ";".join(libs), "keys_kept": len(df)})
-        print(f"  {f.name}: {st.st_size:,} B, mtime {srcs[-1]['mtime']}, libs {libs}, {len(df):,} keys")
+                     "library_IDs": ";".join(libs), "keys_kept": int(df["linking_key"].nunique()),
+                     "guide_candidates": len(df)})
+        print(f"  {f.name}: {st.st_size:,} B, mtime {srcs[-1]['mtime']}, libs {libs}, "
+              f"{srcs[-1]['keys_kept']:,} keys, {len(df):,} source-guide candidates")
     pd.DataFrame(srcs).to_csv(f"{output}.guide_sources.tsv", sep="\t", index=False)
     g = pd.concat(per_file, ignore_index=True)
     # across files: a key seen in several libraries -> keep best-supported, record ambiguity
     n_guides_x = g.groupby("linking_key")["guide"].nunique()
     g = g.sort_values("_n", ascending=False, kind="mergesort").drop_duplicates("linking_key")
-    g["guide_link_n_guides"] = np.maximum(g["linking_key"].map(n_guides_x).to_numpy(),
-                                          g["_n_guides"].to_numpy())
-    g = g.rename(columns={"_n": "guide_link_counts"}).drop(columns=["_n_guides"])
+    g["guide_link_n_guides"] = g["linking_key"].map(n_guides_x).astype("int64")
+    g = g.rename(columns={"_n": "guide_link_counts"})
     return g, srcs
 
 
@@ -254,6 +253,7 @@ def main():
                         guide_fallback_pattern=args.guide_fallback_pattern, guide_usecols=GUIDE_USECOLS,
                         guide_support_scope="sum sequence rows per linking_key/guide/library_ID within each file; source libraries not pooled",
                         guide_metadata_row="highest-count row within selected source-guide group; first appearance on ties",
+                        guide_ambiguity_scope="distinct guides across all source-guide candidates, before winner selection",
                         linking_key="donor[-30:] + bc0[:10]  <->  donor_bc0_fragment[:30] + donor_bc0_fragment[-10:]")
     prov.set_counts(links_in=int(len(bc1_df)), links_out=int(len(merged)), unique_bc1=int(bc1_df["bc1"].nunique()),
                     links_with_valid_key=int(bc1_df["linking_key"].notna().sum()), links_guide_linked=int(matched),

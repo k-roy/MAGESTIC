@@ -71,3 +71,27 @@ def test_named_source_libraries_are_not_implicitly_pooled(tmp_path):
     assert row.guide_link_counts == 100
     assert row.library_ID == 'V_third'
     assert row.guide_link_n_guides == 2
+
+
+def test_alternative_guides_survive_reduction_across_source_files(tmp_path):
+    pd.DataFrame([guide_row('A'*20, 60, library='V_one', leader='first'),
+                  guide_row('A'*20, 60, library='V_one', leader='second'),
+                  guide_row('T'*20, 100, library='V_one', leader='other')]).to_csv(
+                      tmp_path/'V_one_guide_donor_bc0_counts.tsv', sep='\t', index=False)
+    pd.DataFrame([guide_row('A'*20, 150, library='V_two')]).to_csv(
+        tmp_path/'V_two_guide_donor_bc0_counts.tsv', sep='\t', index=False)
+    result, _ = loader().load_guide_table(tmp_path, '*_guide_donor_bc0_counts.tsv',
+                                         '*_guide_donor_bc0_purity_filtered.tsv', str(tmp_path/'linked.tsv'))
+    row = result.iloc[0]
+    assert row.guide == 'A'*20 and row.guide_link_counts == 150
+    assert row.library_ID == 'V_two'
+    assert row.guide_link_n_guides == 2
+
+
+def test_empty_guide_table_retains_schema(tmp_path):
+    source = tmp_path/'V_empty_guide_donor_bc0_counts.tsv'
+    pd.DataFrame(columns=list(guide_row('A'*20, 1))).to_csv(source, sep='\t', index=False)
+    result, _ = loader().load_guide_table(tmp_path, '*_guide_donor_bc0_counts.tsv',
+                                         '*_guide_donor_bc0_purity_filtered.tsv', str(tmp_path/'linked.tsv'))
+    assert result.empty
+    assert {'linking_key', 'guide', 'guide_link_counts', 'guide_link_n_guides'} <= set(result.columns)
