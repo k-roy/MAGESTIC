@@ -353,7 +353,7 @@ def aggregate_by_amino_acid_change(
 
     # Flatten column names
     agg_df.columns = [
-        f"{a}_{b}" if b not in ["<lambda_0>", "<lambda_1>"] else
+        f"{a}_{b}" if b not in ["<lambda>", "<lambda_0>", "<lambda_1>"] else
         ("variant_designs" if a == variant_col else
          "categories" if a == category_col else
          "genes" if a == gene_col else
@@ -466,16 +466,24 @@ def aggregate_by_tier(
             hits_df.loc[x.index, sig_col]
         ).sum()
 
+    # Named aggregators: pandas labels them by __name__, so the flattening below can
+    # tell the two tiers apart (two lambdas were both labelled "<lambda>").
+    def _n_tier_rows(tier_name):
+        def count(x):
+            return (x == tier_name).sum()
+        count.__name__ = f"n_{tier_name}_rows"
+        return count
+
+    def _n_tier_significant(tier_name):
+        def count(x):
+            return count_tier_significant(x, tier_name)
+        count.__name__ = f"n_{tier_name}_significant"
+        return count
+
     agg_dict = {
         comparison_col: "nunique",
-        tier_col: [
-            lambda x: (x == "abundance_high").sum(),
-            lambda x: (x == "abundance_medium").sum(),
-        ],
-        sig_col: [
-            lambda x: count_tier_significant(x, "abundance_high"),
-            lambda x: count_tier_significant(x, "abundance_medium"),
-        ],
+        tier_col: [_n_tier_rows("abundance_high"), _n_tier_rows("abundance_medium")],
+        sig_col: [_n_tier_significant("abundance_high"), _n_tier_significant("abundance_medium")],
         lfc_col: "mean",
         zscore_col: "mean",
     }

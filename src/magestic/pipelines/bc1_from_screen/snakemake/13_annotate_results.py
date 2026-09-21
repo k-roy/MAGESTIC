@@ -102,31 +102,39 @@ def main():
     tier_mapping = pd.read_csv(args.tier_mapping, sep="\t")
     logger.info(f"  Loaded {len(tier_mapping):,} tier assignments")
 
-    # Load oligo design
-    logger.info("Loading oligo design...")
-    oligo_design = pd.read_csv(args.oligo_design, sep="\t")
-    logger.info(f"  Loaded {len(oligo_design):,} oligo designs")
+    # Create annotation lookup. The core annotates from the harmonized registry; the
+    # design file named by --oligo-design is not read (core/annotation.py).
+    from magestic.utils.oligo_annotations import HARMONIZED_OLIGO_TABLE
+    logger.info(f"Creating annotation lookup from {HARMONIZED_OLIGO_TABLE}")
+    logger.warning(f"  --oligo-design {args.oligo_design} is not read: the core annotates from the "
+                   "harmonized registry")
+    annotation_lookup = create_annotation_lookup()
 
-    # Create annotation lookup
-    logger.info("Creating annotation lookup...")
-    annotation_lookup = create_annotation_lookup(ref_table, oligo_design)
-
-    # Merge tier information
+    # Merge tier information, one tier row per bc1 (a conflicting duplicate would
+    # otherwise multiply result rows).
     logger.info("Merging tier information...")
     if "tier" in tier_mapping.columns:
         tier_cols = ["bc1", "tier"]
         if "t0_counts" in tier_mapping.columns:
             tier_cols.append("t0_counts")
-        deseq2_df = deseq2_df.merge(
-            tier_mapping[tier_cols].drop_duplicates(),
-            on="bc1",
-            how="left"
-        )
+        tier_rows = tier_mapping[tier_cols].drop_duplicates()
+        conflicted = tier_rows.loc[tier_rows["bc1"].duplicated(), "bc1"].unique()
+        if len(conflicted):
+            raise SystemExit(f"Step 13: tier mapping has conflicting rows for {len(conflicted)} bc1(s), "
+                             f"e.g. {list(conflicted[:5])}; refusing to multiply result rows")
+        deseq2_df = deseq2_df.merge(tier_rows, on="bc1", how="left", validate="many_to_one")
         deseq2_df["tier"] = deseq2_df["tier"].fillna("unknown")
 
-    # Annotate results
+    # Annotate results: bc1 -> oligo through a one-row-per-bc1 reference projection,
+    # then oligo -> design annotation; every input row is kept exactly once.
     logger.info("Annotating results...")
-    annotated_df = annotate_deseq2_results(deseq2_df, annotation_lookup)
+    n_results = len(deseq2_df)
+    annotated_df = annotate_deseq2_results(deseq2_df, annotation_lookup, bc1_ref_df=ref_table)
+    if len(annotated_df) != n_results:
+        raise SystemExit(f"Step 13: annotation changed the row count {n_results} -> {len(annotated_df)}")
+    if "annotation_status" in annotated_df.columns:
+        for status, n in annotated_df["annotation_status"].value_counts().items():
+            logger.info(f"    {status}: {n:,} BC1s")
 
     # Add library column
     annotated_df["library"] = args.library

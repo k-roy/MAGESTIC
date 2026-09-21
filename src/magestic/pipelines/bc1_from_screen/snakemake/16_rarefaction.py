@@ -394,6 +394,9 @@ def main():
     # Add metadata
     rarefaction_df["sample_name"] = args.sample_name
     rarefaction_df["data_type"] = args.data_type
+    # Observed and subsampled rows are not predictions. Setting the flag before any
+    # prediction rows are appended keeps the column boolean, so "~" on it is valid.
+    rarefaction_df["is_prediction"] = False
 
     # Fit saturation model
     logger.info("Fitting saturation model...")

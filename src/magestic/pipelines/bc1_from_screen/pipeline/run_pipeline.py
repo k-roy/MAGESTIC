@@ -59,6 +59,12 @@ AVAILABLE_STEPS = [
 ]
 
 
+def _not_implemented(step: str) -> str:
+    """Message for a step this runner does not execute yet (docs/ARCHITECTURE_POLICY.md §7)."""
+    return (f"magestic-screen-analysis step '{step}' is not implemented; run the numbered "
+            f"scripts via snakemake/Snakefile.rules (docs/ARCHITECTURE_POLICY.md §7)")
+
+
 def run_tier_classification(config: BC1FromScreenConfig) -> bool:
     """Run Step 07: Tier classification."""
     logger.info("Step 07: Running tier classification...")
@@ -79,7 +85,7 @@ def run_tier_classification(config: BC1FromScreenConfig) -> bool:
         logger.info(f"    T0 consolidation groups: {lib.t0_consolidation_groups}")
 
     logger.info("Step 07: Tier classification complete")
-    return True
+    raise NotImplementedError(_not_implemented("tier_classification"))
 
 
 def run_count_matrix(config: BC1FromScreenConfig) -> bool:
@@ -98,7 +104,7 @@ def run_count_matrix(config: BC1FromScreenConfig) -> bool:
         logger.info(f"  Creating matrix for library: {lib.name}")
 
     logger.info("Step 08: Count matrix complete")
-    return True
+    raise NotImplementedError(_not_implemented("count_matrix"))
 
 
 def run_split_comparisons(config: BC1FromScreenConfig) -> bool:
@@ -114,7 +120,7 @@ def run_split_comparisons(config: BC1FromScreenConfig) -> bool:
     logger.info(f"  Working directory: {working_dir}")
 
     logger.info("Step 10: Split complete")
-    return True
+    raise NotImplementedError(_not_implemented("split_comparisons"))
 
 
 def run_deseq2(config: BC1FromScreenConfig) -> bool:
@@ -126,7 +132,7 @@ def run_deseq2(config: BC1FromScreenConfig) -> bool:
 
     logger.info("  (DESeq2 requires pydeseq2 - run separately if not available)")
     logger.info("Step 11: DESeq2 complete")
-    return True
+    raise NotImplementedError(_not_implemented("deseq2"))
 
 
 def run_annotation(config: BC1FromScreenConfig) -> bool:
@@ -134,7 +140,7 @@ def run_annotation(config: BC1FromScreenConfig) -> bool:
     logger.info("Step 13: Annotating results...")
 
     logger.info("Step 13: Annotation complete")
-    return True
+    raise NotImplementedError(_not_implemented("annotation"))
 
 
 def run_hit_calling(config: BC1FromScreenConfig) -> bool:
@@ -155,7 +161,7 @@ def run_hit_calling(config: BC1FromScreenConfig) -> bool:
     logger.info(f"  Tier 2 thresholds: z={t2['z_threshold']}, concordance={t2['concordance_threshold']}")
 
     logger.info("Steps 14/15: Hit calling complete")
-    return True
+    raise NotImplementedError(_not_implemented("hit_calling"))
 
 
 def run_plots(config: BC1FromScreenConfig) -> bool:
@@ -163,7 +169,7 @@ def run_plots(config: BC1FromScreenConfig) -> bool:
     logger.info("Step (TBD): Creating plots...")
 
     logger.info("Step (TBD): Plots complete")
-    return True
+    raise NotImplementedError(_not_implemented("plots"))
 
 
 STEP_FUNCTIONS = {
@@ -290,8 +296,9 @@ def run_pipeline(
     success = True
     for step in steps:
         if step not in STEP_FUNCTIONS:
-            logger.warning(f"Unknown step: {step}")
-            continue
+            logger.error(f"Unknown step: {step}; available: {AVAILABLE_STEPS}")
+            success = False
+            break
 
         try:
             step_success = STEP_FUNCTIONS[step](config)
@@ -299,6 +306,10 @@ def run_pipeline(
                 logger.error(f"Step {step} failed")
                 success = False
                 break
+        except NotImplementedError as e:
+            logger.error(str(e))
+            success = False
+            break
         except Exception as e:
             logger.exception(f"Error in step {step}: {e}")
             success = False
@@ -394,6 +405,9 @@ Examples:
     steps = None
     if args.steps:
         steps = [s.strip() for s in args.steps.split(",")]
+        unknown = [s for s in steps if s not in AVAILABLE_STEPS]
+        if unknown:
+            parser.error(f"unknown step(s): {unknown}; available: {AVAILABLE_STEPS}")
 
     # Enable debug logging
     if args.debug:
