@@ -8,7 +8,7 @@ Provides dataclasses for pipeline configuration including:
 - T0 consolidation settings
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -347,45 +347,29 @@ class BC1FromScreenConfig:
             base_dir=Path(data.get("base_dir", "/path/to")),
             min_total_reads_per_sample=data.get("min_total_reads_per_sample", 50000),
             min_replicates_per_condition=data.get("min_replicates_per_condition", 2),
+            use_scratch=data.get("use_scratch", False),
+            scratch_dir=Path(data["scratch_dir"]) if data.get("scratch_dir") is not None else None,
         )
 
     def to_yaml(self, yaml_path: Path) -> None:
         """Save configuration to a YAML file."""
-        data = {
-            "project_name": self.project_name,
-            "screen_name": self.screen_name,
-            "project_dir": str(self.project_dir),
-            "libraries": [
-                {
-                    "name": lib.name,
-                    "screen_dates": lib.screen_dates,
-                    "bottlenecked": lib.bottlenecked,
-                    "timepoints": lib.timepoints,
-                    "t0_consolidation_groups": lib.t0_consolidation_groups,
-                    "description": lib.description,
-                }
-                for lib in self.libraries
-            ],
-            "tier_config": {
-                "tier_1_min_reads": self.tier_config.tier_1_min_reads,
-                "tier_2_min_reads": self.tier_config.tier_2_min_reads,
-                "tier_3_min_reads": self.tier_config.tier_3_min_reads,
-            },
-            "hit_calling_config": {
-                "tier_1_z_threshold": self.hit_calling_config.tier_1_z_threshold,
-                "tier_1_concordance_threshold": self.hit_calling_config.tier_1_concordance_threshold,
-                "tier_2_z_threshold": self.hit_calling_config.tier_2_z_threshold,
-                "tier_2_concordance_threshold": self.hit_calling_config.tier_2_concordance_threshold,
-                "tier_2_min_bc1s_aggregated": self.hit_calling_config.tier_2_min_bc1s_aggregated,
-            },
-            "sequencing_dates": self.sequencing_dates,
-            "base_dir": str(self.base_dir),
-            "min_total_reads_per_sample": self.min_total_reads_per_sample,
-            "min_replicates_per_condition": self.min_replicates_per_condition,
-        }
+        # Include every declared field, including adaptive thresholds. A manual
+        # subset previously reset explicit settings when the YAML was reloaded.
+        data = asdict(self)
+        for name in ("project_dir", "base_dir", "scratch_dir"):
+            if data[name] is not None:
+                data[name] = str(data[name])
+
+        from magestic.utils.provenance import StepProvenance
+        prov = StepProvenance("bc1_from_screen", "save_configuration", yaml_path)
+        prov.add_input(__file__, role="configuration_schema_and_writer")
+        prov.set_parameters(configuration=data)
+        prov.set_counts(configurations=1, libraries=len(self.libraries))
 
         with open(yaml_path, 'w') as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+        prov.add_output(yaml_path)
+        prov.write()
 
     def validate(self) -> List[str]:
         """Validate the configuration."""
