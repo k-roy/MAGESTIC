@@ -20,6 +20,7 @@ opposite directions in the two cases.
 """
 
 from dataclasses import dataclass
+import math
 
 from .genome import rc
 from .spec import DISALLOWED_IN_DONOR, GUIDE_LENGTH
@@ -200,6 +201,9 @@ def load_score_predictions(path: str) -> dict:
             try:
                 ne = float(r["SCORE.NE.minmax"])
             except (KeyError, ValueError, TypeError):
+                continue
+            if not math.isfinite(ne):
+                # Missing/nonfinite model output is not a calibrated prediction.
                 continue
 
             def _f(k):

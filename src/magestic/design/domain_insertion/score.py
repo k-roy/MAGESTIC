@@ -181,8 +181,12 @@ def p_eff(efficacy) -> float:
 
     Returns a STEP function on purpose: we cannot rank on a difference finer than we measured, so
     two guides inside one bin tie and `policy`'s fewest-codons tie-break decides them.
+    Nonfinite predictions are unavailable, not members of a calibration bin.
     """
-    e = min(max(float(efficacy), 0.0), 1.0)
+    e = float(efficacy)
+    if not math.isfinite(e):
+        raise ValueError("Efficacy calibration requires a finite prediction")
+    e = min(max(e, 0.0), 1.0)
     for lo, hi, p in EFFICACY_CAL_BINS:
         if lo <= e < hi:
             return p
@@ -197,14 +201,14 @@ def p_fidelity(wm_in_gap: int) -> float:
 
 def design_score(efficacy, sv, net_recoded, wm_in_gap, *, cut_distance, log=True,
                  which: str = "p"):
-    """The scalar. Returns -inf (or 0.0 with log=False) when efficacy is unavailable, so an
+    """The scalar. Returns -inf (or 0.0 with log=False) when efficacy is None/nonfinite, so an
     unscored guide loses to any scored one without poisoning the arithmetic.
 
     `cut_distance` is KEYWORD-ONLY AND REQUIRED. It has no default on purpose: v2 shipped a scorer
     that was silently blind to distance (`659`), and a default would let a caller that forgets to
     pass it reproduce that bug as a no-op instead of a TypeError.
     """
-    if efficacy is None:
+    if efficacy is None or not math.isfinite(float(efficacy)):
         return float("-inf") if log else 0.0
     eff = p_eff(efficacy)
     sv_ok = min(max(1.0 - float(sv or 0.0), 1e-9), 1.0)
