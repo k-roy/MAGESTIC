@@ -150,7 +150,7 @@ rule link_03_guide_donor_bc0:
             shell("""
                 {PYTHON} {params.script} \\
                     --input {input.collapsed} \\
-                    --guide-donor-bc0-dir {params.guide_donor_bc0_dir} \\
+                    --guide-dir {params.guide_donor_bc0_dir} \\
                     --output {output.linked} \\
                     2>&1 | tee {log}
             """)
