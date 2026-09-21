@@ -12,7 +12,9 @@ All loaders return DataFrames with standardized columns for downstream processin
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import json
 import re
+from urllib.parse import quote
 import pandas as pd
 import logging
 from tqdm import tqdm
@@ -83,8 +85,38 @@ def derive_amplicon_level(trafo_id) -> str:
     return AMPLICON_LEVEL_UNKNOWN
 
 
+# Cell spellings that mean "no value": pandas' default ``na_values``. The loaders read
+# keyfiles with default NA parsing and numbered step 02 reads literal strings
+# (keep_default_na=False); normalizing both through this list makes them agree.
+MISSING_VALUE_SPELLINGS = frozenset((
+    '', '#N/A', '#N/A N/A', '#NA', '-1.#IND', '-1.#QNAN', '-NaN', '-nan', '1.#IND',
+    '1.#QNAN', '<NA>', 'N/A', 'NA', 'NULL', 'NaN', 'None', 'n/a', 'nan', 'null'))
+
+
+def declared_value(value):
+    """Return a metadata cell as stripped text, or None when it holds no value.
+
+    An integer-valued float (``1.0``, which pandas produces for an integer column
+    containing a blank) is rendered as ``1``.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    return None if text in MISSING_VALUE_SPELLINGS else text
+
+
 def build_pcr_replicate_id(row) -> str:
     """PCR-replicate identity = one independent amplification of the gDNA, per well.
+
+    BDB reads the guide-donor plasmid carried in that gDNA prep, so this identifies
+    a PCR event, not a genomic integration.
 
     Identity = :data:`PCR_REPLICATE_ID_FIELDS` — the keyfile's own
     ``PCR_plate_name`` (gDNA_plate + inner + outer) at well resolution, plus the
@@ -109,22 +141,123 @@ def build_pcr_replicate_id(row) -> str:
       artifact reappears in every re-sequencing, so it is not independent
       evidence and must collapse to a single replicate.
 
-    Absent/NaN fields render as ``"NA"`` so the id degrades gracefully (never
-    worse than the prior sample_number-only behaviour). When ``gDNA_plate_name``
-    is unavailable the re-prep guard is inactive; :func:`check_replicate_metadata`
+    Every producer (both loaders and numbered step 02) builds the identity here,
+    and the cells are normalized here so that producers agree. Surrounding
+    whitespace is removed. An absent field, or a cell spelled as in
+    :data:`MISSING_VALUE_SPELLINGS` (including a literal ``"NA"``), is missing and
+    encodes as JSON null. ``sample_number`` drops a ``sample_`` prefix and leading
+    zeros, so ``sample_01`` and ``1`` are the same well. A missing
+    ``amplicon_level`` is derived from ``trafo_ID`` with
+    :func:`derive_amplicon_level` (``unknown`` when no trafo_ID is declared),
+    exactly as the loaders derive it.
+
+    The ordered tuple is serialized as JSON behind a ``pcr:v1:`` prefix and
+    percent-escaped, so field boundaries survive underscores and the ``;`` list
+    delimiter used by merge and aggregation. When ``gDNA_plate_name`` is
+    unavailable the re-prep guard is inactive; :func:`check_replicate_metadata`
     warns so this is never silent.
 
     Args:
         row: A keyfile row (pandas Series or mapping).
 
     Returns:
-        The fields of :data:`PCR_REPLICATE_ID_FIELDS` joined by ``_``.
+        A ``pcr:v1:`` identifier. Rebuild all identities together: a legacy
+        underscore-joined id and a ``pcr:v1:`` id for the same physical PCR are
+        different strings and would be counted as two replicates.
     """
-    def _f(key: str) -> str:
-        val = row.get(key) if hasattr(row, 'get') else (row[key] if key in row else None)
-        return str(val) if pd.notna(val) else 'NA'
+    def _get(key):
+        if hasattr(row, 'get'):
+            return row.get(key)
+        return row[key] if key in row else None
 
-    return "_".join(_f(k) for k in PCR_REPLICATE_ID_FIELDS)
+    values = {key: declared_value(_get(key)) for key in PCR_REPLICATE_ID_FIELDS}
+    well = values['sample_number']
+    if well is not None:
+        well = re.sub(r'^sample_', '', well)
+        values['sample_number'] = str(int(well)) if well.isdigit() else well
+    if values['amplicon_level'] is None:
+        values['amplicon_level'] = derive_amplicon_level(declared_value(_get('trafo_ID')))
+    encoded = json.dumps([values[key] for key in PCR_REPLICATE_ID_FIELDS],
+                         separators=(',', ':'))
+    return 'pcr:v1:' + quote(encoded, safe='')
+
+
+# Declarations that identify the sample, population or PCR event. When both the plate
+# key and the sample key carry one, they must agree for every file that is loaded.
+_KEY_IDENTITY_COLUMNS = frozenset((*PCR_REPLICATE_ID_FIELDS, 'sequencing_date',
+                                   'yeast_library', 'yeast_sublibrary', 'trafo_ID',
+                                   'library_ID', 'V_library', 'SPS'))
+_KEY_CONFLICTS = '_key_conflicts'
+
+
+def _same_declaration(a: str, b: str) -> bool:
+    """Equal declarations, treating numerically equal spellings (1, 1.0) as equal."""
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
+
+
+def _cross_merge_keys(plate_key: pd.DataFrame, sample_key: pd.DataFrame) -> pd.DataFrame:
+    """Cross-merge the plate and sample keys, resolving columns that both declare.
+
+    A plain cross-merge renames a shared column to ``_x``/``_y``, so an equal
+    declaration in both keys vanishes and a contradictory one passes unnoticed.
+    Here each shared column becomes one column holding the value both keys agree
+    on, or one key's value when the other is blank. Disagreements in identity
+    columns (:data:`_KEY_IDENTITY_COLUMNS`) are listed per row in
+    ``_key_conflicts``; the loader refuses such a row when its file is loaded, so
+    cross-product rows that have no file do not fail the run. Other disagreeing
+    columns keep both values as ``<col>__plate_key`` / ``<col>__sample_key`` and
+    leave the shared column empty.
+    """
+    shared = sorted(set(plate_key.columns) & set(sample_key.columns))
+    combined = plate_key.rename(columns={c: f'{c}__plate_key' for c in shared}).merge(
+        sample_key.rename(columns={c: f'{c}__sample_key' for c in shared}), how='cross')
+    conflicts = [[] for _ in range(len(combined))]
+    unresolved = set()
+    for column in shared:
+        resolved = []
+        pairs = zip(combined[f'{column}__plate_key'], combined[f'{column}__sample_key'])
+        for i, (plate_value, sample_value) in enumerate(pairs):
+            a, b = declared_value(plate_value), declared_value(sample_value)
+            if a is None or b is None or _same_declaration(a, b):
+                resolved.append(sample_value if b is not None else plate_value)
+                continue
+            resolved.append(None)
+            if column in _KEY_IDENTITY_COLUMNS:
+                conflicts[i].append(column)
+            else:
+                unresolved.add(column)
+        combined[column] = resolved
+    combined[_KEY_CONFLICTS] = [';'.join(c) for c in conflicts]
+    if shared:
+        logger.info(f"  plate_key and sample_key both declare {shared}; resolved to one column each")
+    if unresolved:
+        logger.warning(
+            f"  plate_key and sample_key disagree on non-identity column(s) {sorted(unresolved)}; "
+            f"both values kept as <column>__plate_key / <column>__sample_key")
+    return combined
+
+
+def _attach_sample_scope(frame, row, source):
+    """Keep sequence evidence; validate physical scope against sample metadata."""
+    from ..core.merge import SCOPE_COLUMNS, _text
+    frame = frame.copy()
+    population = {'yeast_library', 'yeast_sublibrary', 'trafo_ID'}
+    for column in (*SCOPE_COLUMNS, 'SPS'):
+        declared = _text(row.get(column))
+        observed = {_text(value) for value in frame[column]} - {None} if column in frame else set()
+        if declared is None:
+            if column in population and observed:
+                raise ValueError(f'Sample metadata lacks {column} supplied by amplicon table: {source}')
+        else:
+            if observed - {declared}:
+                raise ValueError(f'Sample metadata conflicts with table {column}: {source}')
+            frame[column] = declared
+    return frame
 
 
 def check_replicate_metadata(df: pd.DataFrame, source_label: str = "data") -> None:
@@ -341,6 +474,9 @@ def load_keyfile(keyfile_path: Path, filters: Optional[Dict] = None) -> pd.DataF
     df = pd.read_csv(keyfile_path, sep='\t')
 
     if filters:
+        missing = set(filters) - set(df.columns)
+        if missing:
+            raise ValueError(f'Unknown keyfile filter column(s): {sorted(missing)}')
         for col, val in filters.items():
             if col in df.columns:
                 if isinstance(val, (list, tuple)):
@@ -453,13 +589,7 @@ def load_2x300_data(
             'polymerase': 'sample_listed_polymerase',
             'plate_category': 'plate_category_from_sample_key',
         })
-        overlap = set(plate_key.columns) & set(sample_key.columns)
-        if overlap:
-            logger.warning(
-                f"  plate_key/sample_key still share column(s) {sorted(overlap)}; "
-                f"a cross-merge will suffix them _x/_y and they will not resolve by name."
-            )
-        combined_key = plate_key.merge(sample_key, how='cross')
+        combined_key = _cross_merge_keys(plate_key, sample_key)
     else:
         combined_key = plate_key
 
@@ -549,7 +679,14 @@ def load_2x300_data(
         )
 
         if filepath and filepath.exists():
+            conflicts = row.get(_KEY_CONFLICTS)
+            if conflicts:
+                raise ValueError(
+                    f"plate_key and sample_key declare conflicting {conflicts.split(';')} "
+                    f"for {filepath.name}; correct the keyfiles before loading")
             df = pd.read_csv(filepath, sep='\t')
+
+            df = _attach_sample_scope(df, row, filepath)
 
             # Standardize columns
             df['sample_number'] = row.get('sample_number', 'unknown')
@@ -565,7 +702,7 @@ def load_2x300_data(
             # function of a field already carried, so naming them does not change
             # the distinct-id count -- asserted after the load.
             for col in ('plate_polymerase', 'condition', 'amplicon_level',
-                        'trafo_ID', 'sample_listed_polymerase'):
+                        'sample_listed_polymerase'):
                 df[col] = row.get(col) if pd.notna(row.get(col)) else 'NA'
             df['pcr_replicate_id'] = build_pcr_replicate_id(row)
             df['sequencing_run'] = '2x300'
@@ -587,16 +724,9 @@ def load_2x300_data(
                         axis=1
                     )
 
-            # Select standard columns
-            std_cols = ['counts', 'bc1', 'donor', 'bc0', 'donor_bc0_fragment',
-                       'sample_number', 'outer_primers', 'inner_primers',
-                       'gDNA_plate_name', 'sequencing_date', 'pcr_replicate_id',
-                       # explicit replicate-identity attributes (2026-07-28)
-                       'plate_polymerase', 'condition', 'amplicon_level',
-                       'trafo_ID', 'sample_listed_polymerase',
-                       'sequencing_run', 'data_source']
-            available_cols = [c for c in std_cols if c in df.columns]
-            dfs.append(df[available_cols])
+            # Preserve input sequence/annotation evidence and validated sample
+            # scope; a whitelist previously erased donor/guide/SPS/population.
+            dfs.append(df)
             loaded_files.append(filepath)
 
     # DEFECT 4 FIX (2026-07-28): coverage assertion. Runs BEFORE the empty-result
@@ -688,6 +818,11 @@ def load_2x150_bc1_donor_bc0_data(
 
     combined_key = pd.read_csv(keyfile_path, sep='\t')
 
+    if 'plate_polymerase' not in combined_key and 'polymerase' in combined_key:
+        combined_key = combined_key.rename(columns={'polymerase': 'plate_polymerase'})
+    combined_key['amplicon_level'] = (combined_key['trafo_ID'].map(derive_amplicon_level)
+        if 'trafo_ID' in combined_key else AMPLICON_LEVEL_UNKNOWN)
+
     # Filter to bc1-donor-bc0 amplicons from 2x150 run
     if 'description' in combined_key.columns:
         combined_key = combined_key[combined_key['description'] == 'bc1-donor-bc0']
@@ -721,6 +856,7 @@ def load_2x150_bc1_donor_bc0_data(
         if filepath and filepath.exists():
             df = pd.read_csv(filepath, sep='\t')
 
+            df = _attach_sample_scope(df, row, filepath)
             df['sample_number'] = row.get('sample_number', 'unknown')
             # Carry replicate-identity fields for the full PCR_plate_name
             # replicate id (gDNA_plate_name, inner_primers, outer_primers,
@@ -729,6 +865,8 @@ def load_2x150_bc1_donor_bc0_data(
             df['inner_primers'] = row.get('inner_primers') if pd.notna(row.get('inner_primers')) else 'NA'
             df['gDNA_plate_name'] = row.get('gDNA_plate_name') if pd.notna(row.get('gDNA_plate_name')) else 'NA'
             df['sequencing_date'] = row.get('sequencing_date') if pd.notna(row.get('sequencing_date')) else 'NA'
+            for col in ('plate_polymerase', 'condition', 'amplicon_level'):
+                df[col] = row.get(col) if pd.notna(row.get(col)) else None
             df['pcr_replicate_id'] = build_pcr_replicate_id(row)
             df['sequencing_run'] = '2x150'
             df['data_source'] = '2x150'
@@ -737,12 +875,7 @@ def load_2x150_bc1_donor_bc0_data(
             if 'bc0' not in df.columns and 'donor_bc0_fragment' in df.columns:
                 df['bc0'] = df['donor_bc0_fragment'].str[-10:]
 
-            std_cols = ['counts', 'bc1', 'donor_bc0_fragment', 'bc0',
-                       'sample_number', 'outer_primers', 'inner_primers',
-                       'gDNA_plate_name', 'sequencing_date', 'pcr_replicate_id',
-                       'sequencing_run', 'data_source']
-            available_cols = [c for c in std_cols if c in df.columns]
-            dfs.append(df[available_cols])
+            dfs.append(df)
             loaded_files.append(filepath)
 
     if not dfs:
@@ -916,7 +1049,8 @@ def load_gdb_data(
     logger.info("Loading guide-donor-bc0 data...")
 
     # Find gdb files
-    gdb_files = list(gdb_dir.glob("*guide_donor_bc0*.tsv")) + list(gdb_dir.glob("*gdb*.tsv"))
+    gdb_files = sorted(set(gdb_dir.glob("*guide_donor_bc0*.tsv")) |
+                       set(gdb_dir.glob("*gdb*.tsv")))
 
     if not gdb_files:
         logger.warning(f"No gdb files found in {gdb_dir}")
