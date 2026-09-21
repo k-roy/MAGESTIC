@@ -29,7 +29,7 @@ def test_exact_link_counts_sum_but_pcr_identities_union():
     assert len(merged) == 1
     assert merged.iloc[0]["total_counts"] == 24
     assert merged.iloc[0]["total_pcr_replicates"] == 2
-    assert json.loads(merged.iloc[0]["pcr_replicate_ids"]) == ["p1", "p2"]
+    assert merged.iloc[0]["pcr_replicate_ids"] == "p1;p2"
 
 
 def test_scope_and_sps_are_not_reconstructed_from_barcode():

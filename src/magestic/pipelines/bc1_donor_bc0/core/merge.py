@@ -34,16 +34,18 @@ def _count(value, label='read count'):
         raise ValueError(f'Invalid {label}: {value!r}; expected a finite nonnegative integer') from None
 
 
-def _ids(value):
+def _ids(value, *, serialized=False):
     if isinstance(value, (set, frozenset, tuple, list)):
         return {str(v) for v in value if _text(v) is not None}
     if _text(value) is None:
         return set()
-    if isinstance(value, str) and value.startswith('['):
+    if serialized and isinstance(value, str) and value.startswith('['):
         decoded = json.loads(value)
         if not isinstance(decoded, list):
             raise ValueError('PCR identities must be a JSON list')
         return _ids(decoded)
+    if serialized and isinstance(value, str):
+        return {part for part in value.split(';') if part}
     return {str(value)}
 
 
@@ -123,7 +125,7 @@ class BC1Record:
             counts_2x150=self.counts_2x150, counts_2x300=self.counts_2x300, counts_gdb=self.counts_gdb,
             total_counts=self.total_counts, pcr_replicates_2x150=self.pcr_replicates_2x150,
             pcr_replicates_2x300=self.pcr_replicates_2x300, total_pcr_replicates=self.total_pcr_replicates,
-            pcr_replicate_ids=json.dumps(sorted(ids)),
+            pcr_replicate_ids=';'.join(sorted(ids)),
             pcr_ids_2x150=json.dumps(sorted(self.pcr_ids_2x150)),
             pcr_ids_2x300=json.dumps(sorted(self.pcr_ids_2x300)),
             pcr_support_exact=not self.support_unknown,
@@ -223,9 +225,11 @@ def _merge_source(df, source, existing=None, show_progress=True):
             identities = set()
             for field_name in ('pcr_replicate_ids', 'pcr_replicate_id', 'sample_number'):
                 if field_name in row:
-                    identities = _ids(row[field_name])
+                    identities = _ids(row[field_name], serialized=field_name == 'pcr_replicate_ids')
                     if identities:
                         break
+            if any(';' in identity for identity in identities):
+                raise ValueError('PCR identity contains reserved semicolon delimiter')
             getattr(record, 'pcr_ids_' + source).update(identities)
             scalar = row.get('num_PCR_replicates')
             if not identities:
@@ -323,7 +327,8 @@ def merge_gdb_data(df_gdb, existing_records):
         record.has_gdb = True
         record.donor_from_gdb = best['donor']
         guides = {row['guide'] for row in matches if row['guide']}
-        record.guide = next(iter(guides)) if len(guides) == 1 else None
+        # Metadata is one real observation, not independently coalesced fields.
+        record.guide = best['guide'] if len(guides) == 1 else None
         record.counts_gdb = best['counts']
         record.library_id, record.scaffold = best['library_ID'], best['scaffold']
     return existing_records
