@@ -790,6 +790,8 @@ def load_donor_bc0_lookup(
     Returns:
         DataFrame with columns: donor_bc0_fragment, donor, bc0, counts
     """
+    from ..core.donor_recovery import aggregate_donor_candidates
+    from ..core.merge import SCOPE_COLUMNS, _text
     logger.info("Loading donor-bc0 data for donor recovery...")
 
     keyfile_path = keyfile_dir / combined_key_name
@@ -811,6 +813,7 @@ def load_donor_bc0_lookup(
         combined_key = combined_key.head(debug_n_samples)
 
     dfs = []
+    registrations = {}
 
     for _, row in tqdm(combined_key.iterrows(), total=len(combined_key),
                        desc="Loading donor-bc0", disable=len(combined_key) < 10):
@@ -831,10 +834,24 @@ def load_donor_bc0_lookup(
         )
 
         if filepath and filepath.exists():
+            identity = filepath.resolve()
+            metadata = tuple(_text(row.get(column)) for column in ('sample_number', *SCOPE_COLUMNS, 'SPS'))
+            if identity in registrations:
+                if registrations[identity] != metadata:
+                    raise ValueError(f'Conflicting donor-recovery registration for one physical file: {filepath}')
+                continue
+            registrations[identity] = metadata
             df = pd.read_csv(filepath, sep='\t')
             df['sample_number'] = row.get('sample_number', 'unknown')
-
-            cols = ['counts', 'donor', 'donor_bc0_fragment', 'bc0', 'sample_number']
+            for column in (*SCOPE_COLUMNS, 'SPS'):
+                value = _text(row.get(column))
+                if value is not None:
+                    if column in df and any(_text(item) not in (None, value) for item in df[column]):
+                        raise ValueError(f'Donor-recovery metadata conflicts for {column}: {filepath}')
+                    df[column] = value
+            df['source_file'] = str(filepath.resolve())
+            cols = ['counts', 'donor', 'donor_bc0_fragment', 'bc0', 'sample_number',
+                    *SCOPE_COLUMNS, 'SPS', 'source_file']
             available_cols = [c for c in cols if c in df.columns]
             dfs.append(df[available_cols])
 
@@ -846,15 +863,10 @@ def load_donor_bc0_lookup(
 
     # Aggregate to create lookup table
     logger.info("Aggregating donor-bc0 data into lookup table...")
-    agg_df = combined.groupby('donor_bc0_fragment').agg({
-        'donor': 'first',
-        'bc0': 'first',
-        'counts': 'sum',
-        'sample_number': lambda x: len(set(x))
-    }).reset_index()
-    agg_df.rename(columns={'sample_number': 'num_samples_donor_bc0'}, inplace=True)
+    agg_df = aggregate_donor_candidates(combined)
 
-    logger.info(f"  Created lookup table with {len(agg_df)} unique donor_bc0_fragments")
+    logger.info(f"  Created lookup table with {len(agg_df)} scoped donor candidates; "
+                "num_samples_donor_bc0 counts distinct sample_number labels, not biological replicates")
 
     return agg_df
 
@@ -875,22 +887,11 @@ def recover_full_donors(
     Returns:
         DataFrame with donor column added
     """
-    if donor_lookup.empty or bc1_df.empty:
-        return bc1_df
-
-    logger.info("Recovering full donors for 2x150 data...")
-
-    merged = bc1_df.merge(
-        donor_lookup[['donor_bc0_fragment', 'donor']],
-        on='donor_bc0_fragment',
-        how='left'
-    )
-
-    recovered = merged['donor'].notna().sum()
-    total = len(merged)
-    logger.info(f"  Recovered full donor for {recovered}/{total} ({100*recovered/total:.1f}%) entries")
-
-    return merged
+    from ..core.donor_recovery import recover_unique_donors
+    result = recover_unique_donors(bc1_df, donor_lookup)
+    recovered = int((result['donor_recovery_status'] == 'recovered_unique').sum())
+    logger.info(f"  Uniquely recovered full donor for {recovered}/{len(result)} input BDB rows")
+    return result
 
 
 def load_gdb_data(
