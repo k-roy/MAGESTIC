@@ -26,6 +26,10 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
+from magestic.utils.provenance import StepProvenance
+
+ABSORPTION_LOG_COLUMNS = ['parent_bc1', 'n_error_bc1s', 'total_absorbed_counts',
+                          'n_sample_contributions', 'error_bc1s']
 
 
 def absorb_error_counts(
@@ -42,9 +46,15 @@ def absorb_error_counts(
     Returns:
         (cleaned_counts_df, absorption_log_df)
     """
+    # Step04 concatenates source files: a barcode/sample may occupy several
+    # rows. Combine that physical count unit before attaching an error total,
+    # otherwise the same error contribution is added once per parent row.
+    counts_df = counts_df.groupby(['bc1', 'sample_name'], as_index=False,
+                                  dropna=False)['counts'].sum()
+    empty_log = pd.DataFrame(columns=ABSORPTION_LOG_COLUMNS)
     if len(error_mappings) == 0:
         print("No error mappings provided, returning original counts")
-        return counts_df.copy(), pd.DataFrame()
+        return counts_df.copy(), empty_log
 
     # Create error -> parent mapping dictionary
     error_to_parent = dict(zip(error_mappings['error_bc1'], error_mappings['parent_bc1']))
@@ -62,7 +72,7 @@ def absorb_error_counts(
 
     if len(error_rows) == 0:
         print("No error BC1 rows found in counts, returning original")
-        return counts_df.copy(), pd.DataFrame()
+        return counts_df.copy(), empty_log
 
     # Map error BC1s to their parents
     error_rows['parent_bc1'] = error_rows['bc1'].map(error_to_parent)
@@ -118,6 +128,8 @@ def absorb_error_counts(
     original_total = counts_df['counts'].sum()
     result_total = result['counts'].sum()
     absorbed_total = error_rows['counts'].sum()
+    if result_total != original_total:
+        raise ValueError(f"Absorption did not conserve read counts: {original_total} -> {result_total}")
 
     print(f"\nAbsorption complete:")
     print(f"  Original total counts: {original_total:,}")
@@ -162,6 +174,17 @@ def main():
 
     args = parser.parse_args()
 
+    provenances = {}
+    for path, step in ((args.output, '06_absorbed_counts'), (args.log_output, '06_absorption_log')):
+        if path is not None:
+            prov = StepProvenance('bc1_from_screen', step, path)
+            prov.add_input(args.counts, role='combined_counts')
+            prov.add_input(args.error_mappings, role='error_parent_mappings')
+            prov.set_parameters(count_unit=['bc1', 'sample_name'],
+                                duplicate_count_rows='sum_before_absorption',
+                                mapping_scope='global barcode mappings from input file')
+            provenances[path] = prov
+
     # Load counts
     print(f"Loading counts from {args.counts}...")
     counts_df = pd.read_csv(args.counts, sep='\t')
@@ -175,17 +198,28 @@ def main():
     # Absorb error counts
     print("\nAbsorbing error counts...")
     cleaned_counts, absorption_log = absorb_error_counts(counts_df, error_mappings)
+    for prov in provenances.values():
+        prov.set_counts(rows_in=len(counts_df), rows_out=len(cleaned_counts),
+                        reads_in=int(counts_df['counts'].sum()), reads_out=int(cleaned_counts['counts'].sum()),
+                        mapping_rows=len(error_mappings), absorption_log_rows=len(absorption_log),
+                        absorbed_reads=int(absorption_log['total_absorbed_counts'].sum()))
 
     # Save cleaned counts
     print(f"\nSaving cleaned counts to {args.output}...")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     cleaned_counts.to_csv(args.output, sep='\t', index=False)
+    prov = provenances[args.output]
+    prov.add_output(args.output, rows=len(cleaned_counts))
+    prov.write()
 
     # Save absorption log if requested
-    if args.log_output and len(absorption_log) > 0:
+    if args.log_output:
         print(f"Saving absorption log to {args.log_output}...")
         args.log_output.parent.mkdir(parents=True, exist_ok=True)
         absorption_log.to_csv(args.log_output, sep='\t', index=False)
+        prov = provenances[args.log_output]
+        prov.add_output(args.log_output, rows=len(absorption_log))
+        prov.write()
 
     print("\nDone!")
 
