@@ -34,6 +34,16 @@ def _union(values):
     return result
 
 
+def _gdb_records(value):
+    if not isinstance(value, list):
+        if _text(value) is None:
+            return []
+        value = json.loads(value)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError('GDB candidates must be a JSON list of evidence records')
+    return value
+
+
 def _combine(group, count_columns, representative=None):
     """Retain a real representative and combine only declared evidence fields."""
     records = group.to_dict('records')
@@ -41,7 +51,7 @@ def _combine(group, count_columns, representative=None):
                max(records, key=lambda item: item['_representative_reads']))
     for column in count_columns:
         row[column] = sum(item[column] for item in records)
-    for column in ('_pcr_ids', '_original_bc1s', '_guide_candidates', '_pcr_ids_2x150', '_pcr_ids_2x300'):
+    for column in ('_pcr_ids', '_original_bc1s', '_guide_candidates', '_pcr_ids_2x150', '_pcr_ids_2x300', '_gdb_candidates'):
         row[column] = _union(item[column] for item in records)
     for column in ('_pcr_lower_bound', '_pcr_lower_bound_2x150', '_pcr_lower_bound_2x300'):
         row[column] = max(item[column] for item in records)
@@ -49,6 +59,9 @@ def _combine(group, count_columns, representative=None):
     for column in ('has_2x150', 'has_2x300', 'has_gdb', 'has_donor_conflict', 'gdb_ambiguous'):
         if column in group:
             row[column] = any(_flag(item[column]) for item in records)
+    if 'gdb_candidates' in group:
+        row['gdb_candidates'] = '[' + ', '.join(sorted(row['_gdb_candidates'])) + ']'
+        row['gdb_ambiguous'] = _flag(row.get('gdb_ambiguous')) or len(row['_gdb_candidates']) > 1
     if 'guide' in group:
         guides = row['_guide_candidates']
         row['guide_candidates'] = json.dumps(sorted(guides))
@@ -132,7 +145,7 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
 
     original_totals = defaultdict(int)
     original_unresolved = defaultdict(int)
-    ids, lower, exact, origins, guides = [], [], [], [], []
+    ids, lower, exact, origins, guides, gdb_evidence = [], [], [], [], [], []
     source_ids = {source: [] for source in ('2x150', '2x300')}
     source_lower = {source: [] for source in source_ids}
     source_fields = {source for source in source_ids if
@@ -171,10 +184,14 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
         origins.append({row['bc1']} if row['bc1'] is not None else set())
         guide_values = {_text(row.get('guide'))} - {None}
         guide_values.update(_ids(row.get('guide_candidates'), serialized=True))
+        candidates = _gdb_records(row.get('gdb_candidates'))
+        guide_values.update({_text(item.get('guide')) for item in candidates} - {None})
+        gdb_evidence.append({json.dumps(item, sort_keys=True) for item in candidates})
         guides.append(guide_values)
     frame['_pcr_ids'], frame['_pcr_lower_bound'] = ids, lower
     frame['pcr_support_exact'], frame['_original_bc1s'] = exact, origins
     frame['_guide_candidates'] = guides
+    frame['_gdb_candidates'] = gdb_evidence
     for source in source_ids:
         frame['_pcr_ids_' + source] = source_ids[source]
         frame['_pcr_lower_bound_' + source] = source_lower[source]

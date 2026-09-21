@@ -192,3 +192,21 @@ def test_source_specific_support_unions_do_not_double_count_shared_pcr():
     assert row['pcr_replicates_2x300'] == 2 and row['pcr_replicates_2x150'] == 1
     assert json.loads(row['pcr_ids_2x300']) == ['p1','p2']
     assert json.loads(row['pcr_ids_2x150']) == ['p1']
+
+
+@pytest.mark.parametrize('add_neighbor_donor', [False, True])
+def test_ambiguous_gdb_candidate_evidence_survives_aggregation(add_neighbor_donor):
+    frame = pd.DataFrame(dict(bc1=['G'*20], donor=['A'*129], bc0=['A'*10],
+                              counts=[10], pcr_replicate_id=['p1']))
+    gdb = pd.DataFrame(dict(donor=['A'*129]*2, bc0=['A'*10]*2,
+                            guide=['T'*20,'C'*20], counts=[200,100]))
+    expected = {'T'*20,'C'*20}
+    if add_neighbor_donor:
+        frame.loc[len(frame)] = ['G'*20,'A'*128+'C','A'*10,20,'p2']
+        gdb.loc[len(gdb)] = ['A'*128+'C','A'*10,'G'*20,300]
+        expected.add('G'*20)
+    merged = merge_data_sources(df_2x300=frame, df_gdb=gdb)
+    row = aggregate(merged, collapse_sequences=True).iloc[0]
+    assert pd.isna(row['guide']) and row['guide_evidence_conflict']
+    assert set(json.loads(row['guide_candidates'])) == expected
+    assert {item['guide'] for item in json.loads(row['gdb_candidates'])} == expected
