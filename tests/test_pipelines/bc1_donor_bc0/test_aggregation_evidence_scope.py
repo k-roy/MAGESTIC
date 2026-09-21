@@ -130,3 +130,65 @@ def test_missing_bc0_and_low_read_filter_preserve_unresolved_denominator_mass():
     assert row['unresolved_bc1_counts'] == 1
     assert row['bc1_purity'] == pytest.approx(100/101)
     assert result.attrs['count_accounting']['reads_below_min_reads'] == 1
+
+
+def test_actual_merge_collapse_keeps_every_pcr_support_column_coherent():
+    frame = pd.DataFrame(dict(bc1=['G'*20]*2, donor=['A'*129, 'A'*128+'C'],
+                              bc0=['A'*10]*2, counts=[20, 10], pcr_replicate_id=['p1','p2']))
+    row = aggregate(merge_data_sources(df_2x300=frame), collapse_sequences=True).iloc[0]
+    assert row['counts'] == row['total_counts'] == row['counts_2x300'] == 30
+    assert row['pcr_replicate_ids'] == 'p1;p2'
+    assert row['num_PCR_replicates'] == row['total_pcr_replicates'] == row['pcr_replicates_2x300'] == 2
+    assert json.loads(row['pcr_ids_2x300']) == ['p1','p2']
+
+
+def test_filtered_aggregate_cannot_silently_reset_denominator_when_reused():
+    frame = pd.DataFrame(dict(bc1=['G'*20]*2, donor=['A'*129]*2,
+                              bc0=['A'*10, None], counts=[100, 1], pcr_replicate_id=['p1','p2']))
+    first = aggregate(frame, min_reads=2)
+    assert first.iloc[0]['total_bc1_counts'] == 101
+    try:
+        second = aggregate(first)
+    except ValueError as error:
+        assert 'aggregat' in str(error).lower()
+        return  # Refusing incomplete reaggregation is valid; declaring purity1 is not.
+    assert second.iloc[0]['total_bc1_counts'] == 101
+    assert second.iloc[0]['bc1_purity'] == pytest.approx(100/101)
+
+
+@pytest.mark.parametrize('add_neighbor', [False, True])
+def test_guide_candidates_survive_both_collapse_stages(add_neighbor):
+    frame = pd.DataFrame(dict(bc1=['G'*20]*2, donor=['A'*129, 'A'*128+'C'],
+                              bc0=['A'*10]*2, counts=[20, 10], pcr_replicate_id=['p1','p2']))
+    gdb = pd.DataFrame(dict(donor=['A'*129, 'A'*128+'C'], bc0=['A'*10]*2,
+                            guide=['T'*20, 'C'*20], counts=[200,100]))
+    if add_neighbor:
+        frame.loc[len(frame)] = ['G'*19+'A', 'A'*129, 'A'*10, 5, 'p3']
+    row = aggregate(merge_data_sources(df_2x300=frame, df_gdb=gdb), collapse_sequences=True).iloc[0]
+    assert pd.isna(row['guide']) and row['guide_evidence_conflict']
+    assert set(json.loads(row['guide_candidates'])) == {'T'*20, 'C'*20}
+
+
+def test_plasmid_pool_identity_is_not_a_separate_barcode_population():
+    frame = pd.DataFrame(dict(bc1=['G'*20]*2, donor=['A'*129, 'C'*129],
+                              bc0=['A'*10]*2, counts=[10,90], pcr_replicate_id=['p1','p2'],
+                              yeast_library=['yL_fixture']*2, trafo_ID=['trafo_3']*2,
+                              V_library=['V545','V546'], SPS=['A'*20,'C'*20]))
+    result = aggregate(merge_data_sources(df_2x300=frame))
+    assert len(result) == 2 and set(result['V_library']) == {'V545','V546'}
+    assert result['total_bc1_counts'].tolist() == [100,100]
+    assert sorted(result['bc1_purity']) == pytest.approx([.1,.9])
+
+
+def test_source_specific_support_unions_do_not_double_count_shared_pcr():
+    full = pd.DataFrame(dict(bc1=['G'*20]*2, donor=['A'*129, 'A'*128+'C'],
+                             bc0=['A'*10]*2, counts=[20,10], pcr_replicate_id=['p1','p2']))
+    recovered = pd.DataFrame(dict(bc1=['G'*20], donor=['A'*129], donor_bc0_fragment=['A'*40],
+                                  bc0=['A'*10], counts=[5], pcr_replicate_id=['p1']))
+    row = aggregate(merge_data_sources(df_2x300=full, df_2x150=recovered),
+                    collapse_sequences=True).iloc[0]
+    assert row['counts'] == 35 and row['counts_2x300'] == 30 and row['counts_2x150'] == 5
+    assert row['num_PCR_replicates'] == row['total_pcr_replicates'] == 2
+    assert row['pcr_replicates_2x300'] == 2 and row['pcr_replicates_2x150'] == 1
+    assert json.loads(row['pcr_ids_2x300']) == ['p1','p2']
+    assert json.loads(row['pcr_ids_2x150']) == ['p1']

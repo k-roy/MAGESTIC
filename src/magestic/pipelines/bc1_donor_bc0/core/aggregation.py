@@ -8,6 +8,20 @@ from rapidfuzz.distance.Levenshtein import distance
 
 from .merge import SCOPE_COLUMNS, _count, _ids, _text
 
+# These identify the sampled biological population. V_library/library_ID/SPS
+# are retained as link evidence, never used to partition a purity denominator.
+POPULATION_COLUMNS = ('yeast_library', 'yeast_sublibrary', 'trafo_ID')
+
+
+def _flag(value, default=False):
+    if value is None or pd.isna(value):
+        return default
+    if value in (True, 1, 'True', 'true', '1'):
+        return True
+    if value in (False, 0, 'False', 'false', '0'):
+        return False
+    raise ValueError(f'Invalid evidence flag: {value!r}')
+
 
 def _scope(row, columns):
     return tuple(_text(row.get(column)) for column in columns)
@@ -27,19 +41,21 @@ def _combine(group, count_columns, representative=None):
                max(records, key=lambda item: item['_representative_reads']))
     for column in count_columns:
         row[column] = sum(item[column] for item in records)
-    for column in ('_pcr_ids', '_original_bc1s'):
+    for column in ('_pcr_ids', '_original_bc1s', '_guide_candidates', '_pcr_ids_2x150', '_pcr_ids_2x300'):
         row[column] = _union(item[column] for item in records)
-    row['_pcr_lower_bound'] = max(item['_pcr_lower_bound'] for item in records)
+    for column in ('_pcr_lower_bound', '_pcr_lower_bound_2x150', '_pcr_lower_bound_2x300'):
+        row[column] = max(item[column] for item in records)
     row['pcr_support_exact'] = all(item['pcr_support_exact'] for item in records if item['counts'] > 0)
     for column in ('has_2x150', 'has_2x300', 'has_gdb', 'has_donor_conflict', 'gdb_ambiguous'):
         if column in group:
-            row[column] = any(bool(item[column]) for item in records if pd.notna(item[column]))
+            row[column] = any(_flag(item[column]) for item in records)
     if 'guide' in group:
-        guides = {_text(item.get('guide')) for item in records} - {None}
+        guides = row['_guide_candidates']
         row['guide_candidates'] = json.dumps(sorted(guides))
-        if len(guides) > 1:
+        conflict = len(guides) > 1 or any(_flag(item.get('guide_evidence_conflict')) for item in records)
+        row['guide_evidence_conflict'] = conflict
+        if conflict:
             row['guide'] = None
-            row['guide_evidence_conflict'] = True
         elif len(guides) == 1 and _text(row.get('guide')) is None:
             # Carry a whole annotation bundle only for the same observed donor.
             carriers = [item for item in records if _text(item.get('guide'))
@@ -79,8 +95,11 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     A raw barcode sent to multiple representatives by separate link collapses has
     ambiguous identity: its affected purity is undefined rather than invented.
     Min-PCR support is a label. Only the explicit final min-read rule drops rows.
+    Inputs must be complete observed-link evidence, not a filtered prior output.
     """
     frame = df.copy()
+    if any(column in frame for column in ('original_bc1s', 'total_bc1_counts', 'bc1_purity')):
+        raise ValueError('Cannot reaggregate a prior aggregation output; use complete observed-link evidence')
     for column in ('bc1', 'donor', 'bc0'):
         if column not in frame:
             if len(frame):
@@ -99,10 +118,10 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
         frame[column] = frame[column].map(_count)
     for column in ('bc1', 'donor', 'bc0'):
         frame[column] = frame[column].map(_text)
-    scopes = [column for column in (*SCOPE_COLUMNS, 'input_library_scope') if column in frame]
+    scopes = [column for column in POPULATION_COLUMNS if column in frame]
     # SPS identifies construct evidence, not an independently transformed pool.
     # It can constrain link collapsing but cannot split a barcode denominator.
-    link_scopes = scopes + (['SPS'] if 'SPS' in frame else [])
+    link_scopes = [column for column in (*SCOPE_COLUMNS, 'input_library_scope', 'SPS') if column in frame]
     if frame.empty:
         for column, dtype in [('total_bc1_counts', float), ('bc1_purity', float),
                               ('unresolved_bc1_counts', float), ('num_distinct_donors', int),
@@ -113,7 +132,11 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
 
     original_totals = defaultdict(int)
     original_unresolved = defaultdict(int)
-    ids, lower, exact, origins = [], [], [], []
+    ids, lower, exact, origins, guides = [], [], [], [], []
+    source_ids = {source: [] for source in ('2x150', '2x300')}
+    source_lower = {source: [] for source in source_ids}
+    source_fields = {source for source in source_ids if
+                     any(column in frame for column in ('pcr_ids_' + source, 'pcr_replicates_' + source))}
     for row in frame.to_dict('records'):
         key = (_scope(row, scopes), row['bc1'])
         original_totals[key] += row['counts']
@@ -126,18 +149,35 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
                     identities = _ids(row[column], serialized=column == 'pcr_replicate_ids')
                     if identities:
                         break
+        source_bounds = []
+        for source in source_ids:
+            supported = row['counts'] > 0 and row.get('counts_' + source, row['counts']) > 0
+            values = _ids(row.get('pcr_ids_' + source), serialized=True) if supported else set()
+            source_ids[source].append(values)
+            bound_value = row.get('pcr_replicates_' + source)
+            bound = _count(bound_value, 'source PCR support count') if supported and _text(bound_value) is not None else 0
+            source_lower[source].append(bound)
+            source_bounds.append(bound)
+            identities.update(values)
         if any(';' in identity or identity.lstrip().startswith('[') for identity in identities):
             raise ValueError('PCR identity contains reserved semicolon or JSON-list prefix')
         scalar = max([_count(row[column], 'PCR support count') for column in
                       ('num_PCR_replicates', 'total_pcr_replicates')
-                      if column in row and _text(row[column]) is not None] or [0]) if row['counts'] else 0
+                      if column in row and _text(row[column]) is not None] + source_bounds + [0]) if row['counts'] else 0
         ids.append(identities)
         lower.append(scalar)
-        exact.append(bool((identities and scalar <= len(identities) and row.get('pcr_support_exact', True))
+        exact.append(bool((identities and scalar <= len(identities) and _flag(row.get('pcr_support_exact'), True))
                           or row['counts'] == 0))
         origins.append({row['bc1']} if row['bc1'] is not None else set())
+        guide_values = {_text(row.get('guide'))} - {None}
+        guide_values.update(_ids(row.get('guide_candidates'), serialized=True))
+        guides.append(guide_values)
     frame['_pcr_ids'], frame['_pcr_lower_bound'] = ids, lower
     frame['pcr_support_exact'], frame['_original_bc1s'] = exact, origins
+    frame['_guide_candidates'] = guides
+    for source in source_ids:
+        frame['_pcr_ids_' + source] = source_ids[source]
+        frame['_pcr_lower_bound_' + source] = source_lower[source]
     frame['_representative_reads'] = frame['counts']
     frame['_unresolved_fragment'] = [row.get('donor_bc0_fragment') if row['donor'] is None else None
                                       for row in frame.to_dict('records')]
@@ -175,7 +215,14 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     result['bc1_purity'] = result['counts'] / result['total_bc1_counts'].replace(0, np.nan)
     result['num_distinct_donors'] = result.groupby(scopes + ['bc1'], dropna=False)['donor'].transform('nunique')
     result['num_PCR_replicates'] = [max(len(value), bound) for value, bound in zip(result['_pcr_ids'], result['_pcr_lower_bound'])]
+    result['total_pcr_replicates'] = result['num_PCR_replicates']
     result['pcr_replicate_ids'] = [';'.join(sorted(value)) for value in result['_pcr_ids']]
+    if 'pcr_replicate_id' in result:
+        result['pcr_replicate_id'] = [next(iter(value)) if len(value) == 1 else None for value in result['_pcr_ids']]
+    for source in source_fields:
+        result['pcr_replicates_' + source] = [max(len(value), bound) for value, bound in
+            zip(result['_pcr_ids_' + source], result['_pcr_lower_bound_' + source])]
+        result['pcr_ids_' + source] = [json.dumps(sorted(value)) for value in result['_pcr_ids_' + source]]
     result['original_bc1s'] = [json.dumps(sorted(value)) for value in result['_original_bc1s']]
     result['support_tier'] = np.where(result['num_PCR_replicates'] >= max(min_pcr_replicates, 1), 'confident', 'provisional')
     if sum(result['counts']) != sum(frame['counts']):
