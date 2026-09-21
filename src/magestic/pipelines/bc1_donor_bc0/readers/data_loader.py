@@ -188,34 +188,48 @@ _KEY_IDENTITY_COLUMNS = frozenset((*PCR_REPLICATE_ID_FIELDS, 'sequencing_date',
                                    'yeast_library', 'yeast_sublibrary', 'trafo_ID',
                                    'library_ID', 'V_library', 'SPS'))
 _KEY_CONFLICTS = '_key_conflicts'
+# Columns that name the physical file ({date}_{outer}_sample_{n}_...). When both keys
+# carry one, a plate row and a sample row that disagree on it describe different files.
+_KEY_FILE_COLUMNS = ('sequencing_date', 'outer_primers', 'sample_number')
+_PLAIN_NUMBER = re.compile(r'^-?\d+(\.\d+)?$')
 
 
 def _same_declaration(a: str, b: str) -> bool:
-    """Equal declarations, treating numerically equal spellings (1, 1.0) as equal."""
+    """Equal declarations; plain decimal numerals compare by value (1 and 1.0 agree)."""
     if a == b:
         return True
-    try:
+    if _PLAIN_NUMBER.match(a) and _PLAIN_NUMBER.match(b):
         return float(a) == float(b)
-    except ValueError:
-        return False
+    return False
 
 
 def _cross_merge_keys(plate_key: pd.DataFrame, sample_key: pd.DataFrame) -> pd.DataFrame:
-    """Cross-merge the plate and sample keys, resolving columns that both declare.
+    """Pair plate-key rows with sample-key rows, resolving columns that both declare.
 
     A plain cross-merge renames a shared column to ``_x``/``_y``, so an equal
     declaration in both keys vanishes and a contradictory one passes unnoticed.
-    Here each shared column becomes one column holding the value both keys agree
-    on, or one key's value when the other is blank. Disagreements in identity
-    columns (:data:`_KEY_IDENTITY_COLUMNS`) are listed per row in
-    ``_key_conflicts``; the loader refuses such a row when its file is loaded, so
-    cross-product rows that have no file do not fail the run. Other disagreeing
-    columns keep both values as ``<col>__plate_key`` / ``<col>__sample_key`` and
-    leave the shared column empty.
+
+    * A shared file-naming column (:data:`_KEY_FILE_COLUMNS`) is a join key: a plate
+      row and a sample row that disagree on it describe different files and are not
+      paired. Rows left with no partner are logged; a file on disk that no pair
+      names is then reported by the loader's coverage check.
+    * Every other shared column becomes one column holding the value both keys agree
+      on, or one key's value when the other is blank.
+    * A disagreement in an identity column (:data:`_KEY_IDENTITY_COLUMNS`) is listed
+      in ``_key_conflicts``. The loader combines the lists of all rows that name one
+      file and refuses that file when it loads. Other disagreeing columns keep both
+      values as ``<column>__plate_key`` / ``<column>__sample_key`` and leave the
+      shared column empty.
+
+    Resolved shared values are stripped text (:func:`declared_value`), so a blank
+    never turns an integer date column into floats.
     """
     shared = sorted(set(plate_key.columns) & set(sample_key.columns))
-    combined = plate_key.rename(columns={c: f'{c}__plate_key' for c in shared}).merge(
-        sample_key.rename(columns={c: f'{c}__sample_key' for c in shared}), how='cross')
+    combined = plate_key.rename(columns={c: f'{c}__plate_key' for c in shared}).assign(
+        _plate_row=range(len(plate_key))).merge(
+        sample_key.rename(columns={c: f'{c}__sample_key' for c in shared}).assign(
+            _sample_row=range(len(sample_key))), how='cross')
+    paired = [True] * len(combined)
     conflicts = [[] for _ in range(len(combined))]
     unresolved = set()
     for column in shared:
@@ -224,22 +238,43 @@ def _cross_merge_keys(plate_key: pd.DataFrame, sample_key: pd.DataFrame) -> pd.D
         for i, (plate_value, sample_value) in enumerate(pairs):
             a, b = declared_value(plate_value), declared_value(sample_value)
             if a is None or b is None or _same_declaration(a, b):
-                resolved.append(sample_value if b is not None else plate_value)
+                resolved.append(b if b is not None else a)
                 continue
             resolved.append(None)
-            if column in _KEY_IDENTITY_COLUMNS:
+            if column in _KEY_FILE_COLUMNS:
+                paired[i] = False
+            elif column in _KEY_IDENTITY_COLUMNS:
                 conflicts[i].append(column)
             else:
                 unresolved.add(column)
-        combined[column] = resolved
+        combined[column] = pd.Series(resolved, index=combined.index, dtype=object)
     combined[_KEY_CONFLICTS] = [';'.join(c) for c in conflicts]
+    kept = combined[paired]
+    if len(kept) < len(combined):
+        join_columns = [c for c in shared if c in _KEY_FILE_COLUMNS]
+        logger.info(f"  {len(combined) - len(kept):,} plate/sample row combinations disagree on "
+                    f"{join_columns} and are not paired")
+        for side, other, column in (('sample', 'plate', '_sample_row'), ('plate', 'sample', '_plate_row')):
+            lost = sorted(set(combined[column]) - set(kept[column]))
+            if lost:
+                logger.warning(f"  {len(lost)} {side}_key row(s) pair with no {other}_key row "
+                               f"(0-based rows {lost[:10]})")
     if shared:
         logger.info(f"  plate_key and sample_key both declare {shared}; resolved to one column each")
     if unresolved:
         logger.warning(
             f"  plate_key and sample_key disagree on non-identity column(s) {sorted(unresolved)}; "
             f"both values kept as <column>__plate_key / <column>__sample_key")
-    return combined
+    return kept.drop(columns=['_plate_row', '_sample_row']).reset_index(drop=True)
+
+
+def _declared_or_derived_amplicon_level(key: pd.DataFrame) -> pd.Series:
+    """The key's declared amplicon_level, else the level derived from trafo_ID."""
+    declared = (key['amplicon_level'].map(declared_value) if 'amplicon_level' in key.columns
+                else pd.Series(None, index=key.index, dtype=object))
+    derived = (key['trafo_ID'].map(derive_amplicon_level) if 'trafo_ID' in key.columns
+               else pd.Series(AMPLICON_LEVEL_UNKNOWN, index=key.index, dtype=object))
+    return declared.where(declared.notna(), derived)
 
 
 def _attach_sample_scope(frame, row, source):
@@ -594,15 +629,15 @@ def load_2x300_data(
         combined_key = plate_key
 
     # Derive the amplicon level explicitly rather than leaving it implied by
-    # sample_number (trafo-level vs trafos-pooled-before-barcoding).
+    # sample_number (trafo-level vs trafos-pooled-before-barcoding). A level the key
+    # declares is kept; only missing levels are derived, as build_pcr_replicate_id does.
+    combined_key['amplicon_level'] = _declared_or_derived_amplicon_level(combined_key)
     if 'trafo_ID' in combined_key.columns:
-        combined_key['amplicon_level'] = combined_key['trafo_ID'].apply(derive_amplicon_level)
         lvl = combined_key['amplicon_level'].value_counts().to_dict()
-        logger.info(f"  Amplicon levels (from trafo_ID): {lvl}")
-    else:
-        combined_key['amplicon_level'] = AMPLICON_LEVEL_UNKNOWN
+        logger.info(f"  Amplicon levels (declared, else from trafo_ID): {lvl}")
+    elif (combined_key['amplicon_level'] == AMPLICON_LEVEL_UNKNOWN).any():
         logger.warning(
-            "  No trafo_ID column -> amplicon_level='unknown' for every row. "
+            "  No trafo_ID column -> amplicon_level='unknown' where the key declares none. "
             "Trafo-level and pooled-yL amplicons cannot be distinguished, so a "
             "bc1 present in both will still be counted correctly ONLY because "
             "they carry different sample_numbers."
@@ -617,6 +652,13 @@ def load_2x300_data(
                     if c in combined_key.columns]
     if file_id_cols:
         before = len(combined_key)
+        if _KEY_CONFLICTS in combined_key.columns:
+            # A conflicting row must not be de-duplicated away behind an agreeing
+            # sibling that names the same file: every row for the file carries the
+            # conflicts of all of them, and the file is refused when it loads.
+            combined_key[_KEY_CONFLICTS] = combined_key.groupby(
+                file_id_cols, dropna=False, sort=False)[_KEY_CONFLICTS].transform(
+                lambda values: ';'.join(sorted({c for value in values for c in value.split(';') if c})))
         # Rows sharing a file can DIFFER in the descriptive columns -- yL406's
         # sample_key lists each sample_number twice (once per polymerase) and the
         # second row is often blank (`trafo_ID='empty'`). drop_duplicates keeps
@@ -820,8 +862,7 @@ def load_2x150_bc1_donor_bc0_data(
 
     if 'plate_polymerase' not in combined_key and 'polymerase' in combined_key:
         combined_key = combined_key.rename(columns={'polymerase': 'plate_polymerase'})
-    combined_key['amplicon_level'] = (combined_key['trafo_ID'].map(derive_amplicon_level)
-        if 'trafo_ID' in combined_key else AMPLICON_LEVEL_UNKNOWN)
+    combined_key['amplicon_level'] = _declared_or_derived_amplicon_level(combined_key)
 
     # Filter to bc1-donor-bc0 amplicons from 2x150 run
     if 'description' in combined_key.columns:

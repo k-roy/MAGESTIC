@@ -57,7 +57,8 @@ from rapidfuzz.distance import Levenshtein as _lev
 
 from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS, BC1_ORIENTATION
 from magestic.pipelines.bc1_donor_bc0.readers.data_loader import (
-    PCR_REPLICATE_ID_FIELDS, build_pcr_replicate_id, declared_value, derive_amplicon_level)
+    PCR_REPLICATE_ID_FIELDS, _cross_merge_keys, build_pcr_replicate_id, declared_value,
+    derive_amplicon_level)
 from magestic.pipelines.bc1_donor_bc0.core.link_collapse import (
     aggregate_links, collapse_links, attach_short_donors, merge_orphan_bc1,
     mask_columns, masks_for_codes, popcount_rows, decode_masks)
@@ -101,7 +102,13 @@ def build_manifest(args) -> pd.DataFrame:
         plate_key = pd.read_csv(args.plate_key, sep="\t", dtype=str, keep_default_na=False)
         sample_key = pd.read_csv(args.sample_key, sep="\t", dtype=str, keep_default_na=False)
         plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
-        man = plate_key.merge(sample_key, how="cross")
+        # Same explicit renames and shared-column resolution as the 2x300 loader, so both
+        # producers read one pair of keyfiles into the same declarations.
+        plate_key = plate_key.rename(columns={"polymerase": "plate_polymerase",
+                                              "plate_category": "plate_category_from_plate_key"})
+        sample_key = sample_key.rename(columns={"polymerase": "sample_listed_polymerase",
+                                                "plate_category": "plate_category_from_sample_key"})
+        man = _cross_merge_keys(plate_key, sample_key)
         man["sequencing_date"] = args.run_date
         man["sample_id"] = (args.run_date + "_" + man["outer_primers"].astype(str)
                             + "_" + man["sample_number"].astype(str))
@@ -165,6 +172,12 @@ def build_manifest(args) -> pd.DataFrame:
         log(f"WARNING: {len(missing_files)} parsed files missing -- proceeding (--allow-missing): "
             f"{missing_files[:5]}")
     man["present"] = [Path(p).is_file() for p in man["parsed_path"]]
+    if "_key_conflicts" in man.columns:
+        conflicted = man["present"] & (man["_key_conflicts"] != "")
+        if conflicted.any():
+            die(f"plate_key and sample_key declare conflicting values for present samples: "
+                f"{man.loc[conflicted, ['sample_id', '_key_conflicts']].head(5).values.tolist()}")
+        man = man.drop(columns="_key_conflicts")
     return man
 
 
