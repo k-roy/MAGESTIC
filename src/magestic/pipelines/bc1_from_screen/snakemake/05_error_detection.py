@@ -22,6 +22,10 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, Set, Tuple, Optional
 import sys
+from magestic.utils.provenance import StepProvenance
+
+ERROR_MAPPING_COLUMNS = ['error_bc1', 'parent_bc1', 'hamming_distance',
+                         'error_counts', 'parent_counts', 'count_ratio', 'error_type']
 
 
 def detect_count_column(df: pd.DataFrame) -> str:
@@ -278,7 +282,8 @@ def identify_errors_reference_based(
 
             print(f"  Novel errors identified (HD=1 among non-ref): {novel_errors:,}")
 
-    result_df = pd.DataFrame(error_mappings)
+    # A run with no detected errors is ordinary and still feeds Step06.
+    result_df = pd.DataFrame(error_mappings, columns=ERROR_MAPPING_COLUMNS)
 
     stats = {
         'observed_bc1s': len(observed_bc1s),
@@ -315,10 +320,26 @@ def main():
 
     args = parser.parse_args()
 
+    # Bind the two input files before processing; every requested data output
+    # gets its own sidecar, including an empty-but-valid error mapping.
+    provenances = {}
+    for path, step in ((args.output, '05_error_mapping'), (args.stats_output, '05_bc1_statistics')):
+        if path is not None:
+            prov = StepProvenance('bc1_from_screen', step, path)
+            prov.add_input(args.counts, role='combined_counts')
+            prov.add_input(args.bc1_reference, role='bc1_reference')
+            prov.set_parameters(min_count_ratio=args.min_count_ratio,
+                                max_error_count=args.max_error_count,
+                                max_error_samples=args.max_error_samples,
+                                expected_bc1_length=20, hamming_distance=1)
+            provenances[path] = prov
+
     # Load counts
     print(f"Loading counts from {args.counts}...")
     counts_df = pd.read_csv(args.counts, sep='\t')
     print(f"Loaded {len(counts_df):,} rows")
+    if counts_df.empty:
+        raise ValueError('No count rows; an empty analysis is not supported by error detection')
 
     # Auto-detect count column
     count_col = detect_count_column(counts_df)
@@ -329,6 +350,10 @@ def main():
     ref_df = pd.read_csv(args.bc1_reference, sep='\t')
     ref_bc1s = set(ref_df['bc1'].values)
     print(f"Loaded {len(ref_bc1s):,} reference BC1s")
+    for prov in provenances.values():
+        prov.set_parameters(count_column=count_col)
+        prov.set_counts(input_rows=len(counts_df), input_reads=int(counts_df[count_col].sum()),
+                        reference_barcodes=len(ref_bc1s))
 
     # Calculate BC1 statistics
     print("\nCalculating BC1 statistics...")
@@ -344,6 +369,10 @@ def main():
         print(f"\nSaving BC1 statistics to {args.stats_output}...")
         args.stats_output.parent.mkdir(parents=True, exist_ok=True)
         bc1_stats.to_csv(args.stats_output, sep='\t', index=False)
+        prov = provenances[args.stats_output]
+        prov.set_counts(output_rows=len(bc1_stats))
+        prov.add_output(args.stats_output, rows=len(bc1_stats))
+        prov.write()
 
     # Reference-based error detection
     error_mappings, stats = identify_errors_reference_based(
@@ -358,6 +387,10 @@ def main():
     print(f"\nSaving error mappings to {args.output}...")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     error_mappings.to_csv(args.output, sep='\t', index=False)
+    prov = provenances[args.output]
+    prov.set_counts(output_rows=len(error_mappings), **stats)
+    prov.add_output(args.output, rows=len(error_mappings))
+    prov.write()
 
     # Summary
     print("\n" + "="*60)
