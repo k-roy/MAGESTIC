@@ -48,19 +48,32 @@ TABLE_NAME = "outcome_join.tsv"
 MATRIX_NAME = "outcome_agreement_matrix.tsv"
 DISAGREEMENT_NAME = "outcome_disagreements.tsv"
 
-# The three comparable edit states, plus the explicit absence-of-evidence state.
+# The comparable edit states, plus the explicit absence-of-evidence state.
+#
+# PARTIAL and MIXTURE were one `mixed` state until 2026-09-23. Collapsing them made
+# Stage 2's `designed_variant_partially_installed` and Stage 4's `CONTAMINATION` score
+# as AGREEMENT, but they are different claims about different things: one clone whose
+# donor installed incompletely is not the same observation as signal from more than one
+# genotype in a well. Stage 4 says as much itself by flagging `MIXTURE_SIGNAL_NOT_PROOF`.
+# They are kept apart, and the pair gets its own verdict rather than being scored as
+# agreement or as contradiction (Kevin 2026-09-23: "your call for now, likely we need to
+# revisit when the data comes in").
 EDIT = "edit"
 NO_EDIT = "no_edit"
-MIXED = "mixed"
+PARTIAL = "partial_install"
+MIXTURE = "mixture_signal"
 UNDETERMINED = "undetermined"
-STATES = (EDIT, NO_EDIT, MIXED, UNDETERMINED)
+STATES = (EDIT, NO_EDIT, PARTIAL, MIXTURE, UNDETERMINED)
+
+#: The one cross-state pair that is neither agreement nor contradiction.
+MIXED_STATE_MISMATCH = "mixed_state_mismatch"
 
 #: Stage 2 `editing_outcome` (a `;spontaneous_mutations` / `;synthetic_error_installed`
 #: suffix is stripped first) -> comparable state. Anything unlisted — `unknown`
 #: included — is UNDETERMINED.
 OUTCOME_TO_STATE = {
     "designed_variant_installed": EDIT,
-    "designed_variant_partially_installed": MIXED,
+    "designed_variant_partially_installed": PARTIAL,
     "designed_variant_unedited": NO_EDIT,
 }
 
@@ -69,7 +82,7 @@ LABEL_TO_STATE = {
     "SINGLE_EDIT": EDIT,
     "MULTI_EDIT": EDIT,
     "NO_EDIT": NO_EDIT,
-    "CONTAMINATION": MIXED,
+    "CONTAMINATION": MIXTURE,
     "LOW_CONF": UNDETERMINED,
 }
 
@@ -176,17 +189,26 @@ def run_step_5(config: WGSConfig) -> list[Path]:
             [[p, r, matrix.get((p, r), 0)] for p in STATES for r in STATES],
         )
 
-    disagreements = [r for r in rows if r[-1] == "disagree"]
+    # The review artifact carries both true contradictions and the mixed-state pair; the
+    # `agreement` column keeps them distinguishable.
+    disagreements = [r for r in rows if r[-1] in ("disagree", MIXED_STATE_MISMATCH)]
     disagreement_out = disagreement_path(config)
     with atomic(disagreement_out) as tmp:
         write_table(tmp, JOIN_COLUMNS, disagreements)
 
     agree = sum(1 for r in rows if r[-1] == "agree")
     undetermined = sum(1 for r in rows if r[-1] == UNDETERMINED)
+    mixed_mismatch = sum(1 for r in rows if r[-1] == MIXED_STATE_MISMATCH)
+    contradictions = sum(1 for r in rows if r[-1] == "disagree")
     comparable = len(rows) - undetermined
+    # A `low` confidence Stage 4 call is still compared, because dropping it would
+    # silently shrink the denominator, but an agreement resting on one is weaker evidence
+    # than the headline count suggests, so it is reported on its own line.
+    agree_low_confidence = sum(1 for r in rows if r[-1] == "agree" and r[4] == "low")
     logger.info(
         "step_5: %d samples joined (Stage 2 had %d, Stage 4 had %d); %d comparable, "
-        "%d agree (%s), %d disagree, %d undetermined",
+        "%d agree (%s; %d resting on a low-confidence Stage 4 call), "
+        "%d disagree, %d mixed-state mismatch, %d undetermined",
         len(rows),
         len(precall),
         len(reconcile_rows),
@@ -195,7 +217,9 @@ def run_step_5(config: WGSConfig) -> list[Path]:
         f"{100.0 * agree / comparable:.1f}% of the {comparable} comparable"
         if comparable
         else "n/a — nothing comparable",
-        len(disagreements),
+        agree_low_confidence,
+        contradictions,
+        mixed_mismatch,
         undetermined,
     )
 
@@ -211,7 +235,10 @@ def run_step_5(config: WGSConfig) -> list[Path]:
         "reconcile_rows": len(reconcile_rows),
         "comparable": comparable,
         "agree": agree,
-        "disagree": len(disagreements),
+        "agree_low_confidence": agree_low_confidence,
+        "disagree": contradictions,
+        "mixed_state_mismatch": mixed_mismatch,
+        "review_rows": len(disagreements),
         "undetermined": undetermined,
     }
     for artifact, artifact_rows in ((out, len(rows)), (disagreement_out, len(disagreements)),
@@ -222,8 +249,13 @@ def run_step_5(config: WGSConfig) -> list[Path]:
             inputs=inputs,
             parameters={
                 "artifact": artifact.name,
-                "agreement_rule": "three-valued; `unknown` (Stage 2) and `LOW_CONF` "
-                "(Stage 4) are undetermined, never counted as agreement or disagreement",
+                "agreement_rule": (
+                "`unknown` (Stage 2) and `LOW_CONF` (Stage 4) are undetermined, never counted as "
+                "agreement or disagreement. Partial installation against mixture signal is "
+                "`mixed_state_mismatch`, counted separately and listed for review. A low-confidence "
+                "Stage 4 call stays comparable; agreements resting on one are counted separately in "
+                "`agree_low_confidence`."
+            ),
             },
             counts={**counts, "artifact_rows": artifact_rows},
         )
@@ -231,10 +263,20 @@ def run_step_5(config: WGSConfig) -> list[Path]:
 
 
 def _agreement(precall_state: str, reconcile_state: str) -> str:
-    """agree / disagree / undetermined for one sample."""
+    """agree / disagree / mixed_state_mismatch / undetermined for one sample.
+
+    `mixed_state_mismatch` is partial installation on one side against mixture signal on
+    the other. Calling that agreement would assert the two describe one phenomenon;
+    calling it disagreement would assert they contradict. Neither is supported, so it is
+    counted on its own and listed for review.
+    """
     if UNDETERMINED in (precall_state, reconcile_state):
         return UNDETERMINED
-    return "agree" if precall_state == reconcile_state else "disagree"
+    if precall_state == reconcile_state:
+        return "agree"
+    if {precall_state, reconcile_state} == {PARTIAL, MIXTURE}:
+        return MIXED_STATE_MISMATCH
+    return "disagree"
 
 
 def outcome_states(outcomes: Sequence[str]) -> list[str]:
