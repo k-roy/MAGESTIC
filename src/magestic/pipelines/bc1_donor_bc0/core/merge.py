@@ -412,14 +412,20 @@ def merge_gdb_data(df_gdb, existing_records):
 
 
 def resolve_donor_conflicts(records):
-    """Flag conflicts only where both sequence identities/boundaries are known."""
+    """Flag conflicts only where both sequence identities/boundaries are known.
+
+    Every fragment the link was observed with is checked. donor_bc0_fragment holds only the
+    smallest one, so checking it alone let a disagreeing fragment pass whenever an agreeing
+    one happened to sort first.
+    """
     for record in records.values():
         donor = record.donor_full or record.donor_recovered
-        suffix = _fragment_suffix(record.donor_bc0_fragment, record.SPS, record.bc0)
+        fragments = record.fragments or {record.donor_bc0_fragment}
+        suffixes = {_fragment_suffix(fragment, record.SPS, record.bc0) for fragment in fragments} - {None}
         if donor and record.donor_from_gdb and donor != record.donor_from_gdb:
             record.has_donor_conflict = True
             record.conflict_details = 'Observed/recovered donor differs from GDB donor'
-        if donor and suffix and not donor.endswith(suffix):
+        if donor and any(not donor.endswith(suffix) for suffix in suffixes):
             record.has_donor_conflict = True
             record.conflict_details = 'Explicit fragment boundary disagrees with donor suffix'
     return records

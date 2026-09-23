@@ -263,7 +263,14 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     # Identity strings from routes that declare different fields can name one PCR, so
     # support is the fewest PCRs consistent with them; an inferred merge is inexact.
     support = [count_distinct_pcrs(value) for value in result['_pcr_ids']]
-    result['num_PCR_replicates'] = [max(count, bound) for (count, _), bound in zip(support, result['_pcr_lower_bound'])]
+    per_source = {source: [max(count_distinct_pcrs(value)[0], bound) for value, bound in
+                           zip(result['_pcr_ids_' + source], result['_pcr_lower_bound_' + source])]
+                  for source in source_fields}
+    # An exact minimum cover never shrinks when identities are added, but the search's
+    # fallback lower bound can, so the total is floored at every per-source count, as
+    # BC1Record._pcr_support does in merge.
+    result['num_PCR_replicates'] = [max([count, bound] + [per_source[source][i] for source in per_source])
+                                    for i, ((count, _), bound) in enumerate(zip(support, result['_pcr_lower_bound']))]
     result['pcr_support_exact'] = [bool(flag) and identities_exact for flag, (_, identities_exact)
                                    in zip(result['pcr_support_exact'], support)]
     result['total_pcr_replicates'] = result['num_PCR_replicates']
@@ -271,8 +278,7 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     if 'pcr_replicate_id' in result:
         result['pcr_replicate_id'] = [next(iter(value)) if len(value) == 1 else None for value in result['_pcr_ids']]
     for source in source_fields:
-        result['pcr_replicates_' + source] = [max(count_distinct_pcrs(value)[0], bound) for value, bound in
-            zip(result['_pcr_ids_' + source], result['_pcr_lower_bound_' + source])]
+        result['pcr_replicates_' + source] = per_source[source]
         result['pcr_ids_' + source] = [json.dumps(sorted(value)) for value in result['_pcr_ids_' + source]]
     result['original_bc1s'] = [json.dumps(sorted(value)) for value in result['_original_bc1s']]
     result['support_tier'] = np.where(result['num_PCR_replicates'] >= max(min_pcr_replicates, 1), 'confident', 'provisional')
