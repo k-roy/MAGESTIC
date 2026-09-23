@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Set
 import numpy as np
 import pandas as pd
 from ..config import COMMON_SEQUENCE_START, BC0_LENGTH
+from ..readers.data_loader import count_distinct_pcrs
 
 logger = logging.getLogger(__name__)
 # These namespaces stay separate. In particular, SPS is not transformation ID.
@@ -96,12 +97,18 @@ class BC1Record:
     def total_counts(self):
         return self.counts_2x150 + self.counts_2x300
 
+    def _pcr_support(self):
+        # One PCR sequenced by two routes whose keyfiles declare different fields has
+        # two identity strings; count_distinct_pcrs counts it once and reports whether
+        # that merge had to be inferred. Without identities the largest supplied scalar
+        # is only a lower bound.
+        count, exact = count_distinct_pcrs(self.pcr_ids_2x150 | self.pcr_ids_2x300)
+        return max(count, self.anonymous_pcr_2x150, self.anonymous_pcr_2x300,
+                   self.pcr_replicates_2x150, self.pcr_replicates_2x300), exact
+
     @property
     def total_pcr_replicates(self):
-        # Without identities the largest supplied scalar is only a lower bound.
-        return max(len(self.pcr_ids_2x150 | self.pcr_ids_2x300),
-                   self.anonymous_pcr_2x150, self.anonymous_pcr_2x300,
-                   self.pcr_replicates_2x150, self.pcr_replicates_2x300)
+        return self._pcr_support()[0]
 
     @property
     def best_donor(self):
@@ -118,17 +125,18 @@ class BC1Record:
 
     def to_dict(self):
         ids = self.pcr_ids_2x150 | self.pcr_ids_2x300
+        total_pcr_replicates, identities_exact = self._pcr_support()
         result = dict(bc1=self.bc1, bc0=self.bc0, donor=self.best_donor,
             donor_full=self.donor_full, donor_recovered=self.donor_recovered,
             donor_bc0_fragment=self.donor_bc0_fragment, donor_from_gdb=self.donor_from_gdb,
             guide=self.guide, has_2x150=self.has_2x150, has_2x300=self.has_2x300, has_gdb=self.has_gdb,
             counts_2x150=self.counts_2x150, counts_2x300=self.counts_2x300, counts_gdb=self.counts_gdb,
             total_counts=self.total_counts, pcr_replicates_2x150=self.pcr_replicates_2x150,
-            pcr_replicates_2x300=self.pcr_replicates_2x300, total_pcr_replicates=self.total_pcr_replicates,
+            pcr_replicates_2x300=self.pcr_replicates_2x300, total_pcr_replicates=total_pcr_replicates,
             pcr_replicate_ids=';'.join(sorted(ids)),
             pcr_ids_2x150=json.dumps(sorted(self.pcr_ids_2x150)),
             pcr_ids_2x300=json.dumps(sorted(self.pcr_ids_2x300)),
-            pcr_support_exact=not self.support_unknown,
+            pcr_support_exact=not self.support_unknown and identities_exact,
             has_donor_conflict=self.has_donor_conflict, conflict_details=self.conflict_details,
             library_id=self.library_id, scaffold=self.scaffold, SPS=self.SPS,
             input_library_scope=json.dumps(dict(zip(SCOPE_COLUMNS, self.scope)), sort_keys=True),
@@ -164,7 +172,7 @@ def _key(record):
 def _refresh_support(record):
     for source in ('2x150', '2x300'):
         setattr(record, 'pcr_replicates_' + source,
-                max(len(getattr(record, 'pcr_ids_' + source)),
+                max(count_distinct_pcrs(getattr(record, 'pcr_ids_' + source))[0],
                     getattr(record, 'anonymous_pcr_' + source)))
 
 

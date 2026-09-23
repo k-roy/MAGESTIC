@@ -9,13 +9,15 @@ Handles loading processed bc1-donor-bc0 data from various sources:
 All loaders return DataFrames with standardized columns for downstream processing.
 """
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 import json
 import re
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import pandas as pd
 import logging
 from tqdm import tqdm
@@ -181,6 +183,176 @@ def build_pcr_replicate_id(row) -> str:
     encoded = json.dumps([values[key] for key in PCR_REPLICATE_ID_FIELDS],
                          separators=(',', ':'))
     return 'pcr:v1:' + quote(encoded, safe='')
+
+
+_PCR_V1_PREFIX = 'pcr:v1:'
+_AMPLICON_LEVEL_POSITION = PCR_REPLICATE_ID_FIELDS.index('amplicon_level')
+# Branch-and-bound steps allowed for one group of compatible identities. Past this the
+# count falls back to a proven lower bound and is reported as inexact.
+PCR_COVER_SEARCH_LIMIT = 100_000
+# Components larger than this skip the exact search (it also bounds recursion depth).
+_PCR_COVER_EXACT_MAX = 40
+
+
+@lru_cache(maxsize=65536)
+def pcr_identity_fields(identity: str) -> Optional[Tuple[Optional[str], ...]]:
+    """Invert :func:`build_pcr_replicate_id`.
+
+    Returns the :data:`PCR_REPLICATE_ID_FIELDS` values of a ``pcr:v1:`` identity, with
+    None for a field the producer did not declare. Any other encoding (a legacy
+    underscore-joined id, a bare sample_number, a test label) returns None and is
+    treated by callers as an opaque identity, equal only to itself.
+    """
+    if not isinstance(identity, str) or not identity.startswith(_PCR_V1_PREFIX):
+        return None
+    try:
+        values = json.loads(unquote(identity[len(_PCR_V1_PREFIX):]))
+    except ValueError:
+        return None
+    if (not isinstance(values, list) or len(values) != len(PCR_REPLICATE_ID_FIELDS)
+            or any(value is not None and not isinstance(value, str) for value in values)):
+        return None
+    return tuple(values)
+
+
+def _declared_pcr_fields(identity):
+    """The fields an identity declares; None where nothing was declared.
+
+    A derived ``amplicon_level`` of ``unknown`` means no trafo_ID was declared, so it
+    counts as undeclared too.
+    """
+    fields = pcr_identity_fields(identity)
+    if fields is not None and fields[_AMPLICON_LEVEL_POSITION] == AMPLICON_LEVEL_UNKNOWN:
+        fields = (fields[:_AMPLICON_LEVEL_POSITION] + (None,)
+                  + fields[_AMPLICON_LEVEL_POSITION + 1:])
+    return fields
+
+
+def _can_be_one_pcr(a, b) -> bool:
+    """Two declarations can describe one PCR when every field both declare agrees."""
+    return all(x is None or y is None or x == y for x, y in zip(a, b))
+
+
+def _fields_order(fields):
+    return tuple((value is None, value or '') for value in fields)
+
+
+def _signature(fields):
+    return tuple(value is None for value in fields)
+
+
+def _proven_lower_bound(vertices) -> int:
+    """Size of a set of pairwise incompatible identities: each needs its own PCR."""
+    degree = {v: sum(_can_be_one_pcr(v, w) for w in vertices if w != v) for v in vertices}
+    chosen = []
+    for fields in sorted(vertices, key=lambda v: (degree[v], _fields_order(v))):
+        if not any(_can_be_one_pcr(fields, other) for other in chosen):
+            chosen.append(fields)
+    # Identities declaring the same fields are pairwise incompatible, so the largest such
+    # class is also a set of provably distinct PCRs.
+    return max(len(chosen), max(Counter(map(_signature, vertices)).values()))
+
+
+def _fewest_pcrs(vertices) -> int:
+    """Minimum number of groups of mutually compatible identities (a minimum clique cover).
+
+    Exact branch and bound: each identity joins a group it is compatible with or opens a
+    new one, and a branch stops once it cannot beat the best cover found. Being
+    compatible with a group's merged declaration is the same as being compatible with
+    every member, so no valid grouping is missed. When the search budget runs out, a
+    proven lower bound is returned instead of the best cover found so far, because a
+    cover found by an incomplete search can exceed the true minimum.
+    """
+    order = sorted(vertices, key=lambda v: (-sum(x is not None for x in v), _fields_order(v)))
+    best, steps = len(order), 0
+
+    def place(index, groups):
+        nonlocal best, steps
+        steps += 1
+        if steps > PCR_COVER_SEARCH_LIMIT or len(groups) >= best:
+            return
+        if index == len(order):
+            best = len(groups)
+            return
+        fields = order[index]
+        for position, merged in enumerate(groups):
+            if _can_be_one_pcr(fields, merged):
+                groups[position] = tuple(a if a is not None else b for a, b in zip(merged, fields))
+                place(index + 1, groups)
+                groups[position] = merged
+        groups.append(fields)
+        place(index + 1, groups)
+        groups.pop()
+
+    if len(order) <= _PCR_COVER_EXACT_MAX:
+        place(0, [])
+        if steps <= PCR_COVER_SEARCH_LIMIT:
+            return best
+    return _proven_lower_bound(order)
+
+
+def count_distinct_pcrs(identities: Iterable[str]) -> Tuple[int, bool]:
+    """Fewest physical PCRs consistent with a set of PCR identities, and whether that is exact.
+
+    Two ``pcr:v1:`` identities can be one physical PCR when they agree on every field
+    both declare: a field one producer did not declare is unknown, not different. This
+    matters when one PCR is sequenced by two routes whose keyfiles declare different
+    fields (the yL437/yL442 2x150 combined key has no gDNA plate, inner primers or
+    polymerase; its 2x300 plate keys do). Counting the identity strings would count that
+    one PCR twice.
+
+    The count is the minimum number of PCRs that explains every identity, so it is a
+    lower bound and never raises support above what the declarations prove. It is exact
+    when no two distinct identities could be the same PCR. When a merge had to be
+    inferred, the under-declared PCR may still be a different one, so the second value
+    is False. Identities in any other encoding are opaque and count once each.
+
+    Returns:
+        ``(count, exact)``.
+    """
+    atoms, declared = 0, set()
+    for identity in set(identities):
+        fields = _declared_pcr_fields(identity)
+        if fields is None:
+            atoms += 1
+        else:
+            declared.add(fields)
+    by_signature = defaultdict(list)
+    for fields in declared:
+        by_signature[_signature(fields)].append(fields)
+    # Within one signature, compatible means equal, so only pairs across signatures
+    # need checking.
+    if len(by_signature) < 2:
+        return atoms + len(declared), True
+    vertices = sorted(declared, key=_fields_order)
+    index = {fields: i for i, fields in enumerate(vertices)}
+    parent = list(range(len(vertices)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    groups = sorted(by_signature.values(), key=lambda group: _fields_order(min(group, key=_fields_order)))
+    for g, first in enumerate(groups):
+        for second in groups[g + 1:]:
+            for a in first:
+                for b in second:
+                    if _can_be_one_pcr(a, b):
+                        parent[root(index[a])] = root(index[b])
+    components = defaultdict(list)
+    for fields in vertices:
+        components[root(index[fields])].append(fields)
+    count, exact = atoms, True
+    for members in components.values():
+        if len(members) == 1:
+            count += 1
+        else:
+            # A component of two or more contains a compatible pair, so a merge is inferred.
+            exact = False
+            count += _fewest_pcrs(members)
+    return count, exact
 
 
 # Declarations that identify the sample, population or PCR event. When both the plate

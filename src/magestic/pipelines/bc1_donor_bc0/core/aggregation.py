@@ -7,6 +7,7 @@ import pandas as pd
 from rapidfuzz.distance.Levenshtein import distance
 
 from .merge import SCOPE_COLUMNS, _count, _ids, _text
+from ..readers.data_loader import count_distinct_pcrs
 
 # These identify the sampled biological population. V_library/library_ID/SPS
 # are retained as link evidence, never used to partition a purity denominator.
@@ -233,13 +234,18 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     result['barcode_identity_ambiguous'] = ambiguities
     result['bc1_purity'] = result['counts'] / result['total_bc1_counts'].replace(0, np.nan)
     result['num_distinct_donors'] = result.groupby(scopes + ['bc1'], dropna=False)['donor'].transform('nunique')
-    result['num_PCR_replicates'] = [max(len(value), bound) for value, bound in zip(result['_pcr_ids'], result['_pcr_lower_bound'])]
+    # Identity strings from routes that declare different fields can name one PCR, so
+    # support is the fewest PCRs consistent with them; an inferred merge is inexact.
+    support = [count_distinct_pcrs(value) for value in result['_pcr_ids']]
+    result['num_PCR_replicates'] = [max(count, bound) for (count, _), bound in zip(support, result['_pcr_lower_bound'])]
+    result['pcr_support_exact'] = [bool(flag) and identities_exact for flag, (_, identities_exact)
+                                   in zip(result['pcr_support_exact'], support)]
     result['total_pcr_replicates'] = result['num_PCR_replicates']
     result['pcr_replicate_ids'] = [';'.join(sorted(value)) for value in result['_pcr_ids']]
     if 'pcr_replicate_id' in result:
         result['pcr_replicate_id'] = [next(iter(value)) if len(value) == 1 else None for value in result['_pcr_ids']]
     for source in source_fields:
-        result['pcr_replicates_' + source] = [max(len(value), bound) for value, bound in
+        result['pcr_replicates_' + source] = [max(count_distinct_pcrs(value)[0], bound) for value, bound in
             zip(result['_pcr_ids_' + source], result['_pcr_lower_bound_' + source])]
         result['pcr_ids_' + source] = [json.dumps(sorted(value)) for value in result['_pcr_ids_' + source]]
     result['original_bc1s'] = [json.dumps(sorted(value)) for value in result['_original_bc1s']]
