@@ -1002,6 +1002,44 @@ def load_2x300_data(
     return combined, info
 
 
+def _key_row_patterns(row, exact_suffixes, loose_pattern):
+    """Exact ``{date}_{outer}_{sample}{suffix}`` names, or the loose glob only when none can be built.
+
+    A loose ``*_{sample}_*`` glob accepts a single match from any other date or plate, so a
+    row whose own file is absent would silently load another row's file under its metadata.
+    It is used only when the key cannot name the file (no date, outer primers or sample).
+    """
+    fields = [row.get(column) if column in row else None
+              for column in ('sequencing_date', 'outer_primers', 'sample_number')]
+    values = [declared_value(value) for value in fields]
+    if all(value is not None for value in values):
+        # declared_value renders an integer-valued float date (20251125.0) as 20251125.
+        stem = '_'.join(values)
+        return [stem + suffix for suffix in exact_suffixes]
+    if 'sample_number' in row and declared_value(row.get('sample_number')) is not None:
+        return [loose_pattern.format(sample=row['sample_number'])]
+    return []
+
+
+def _claim_physical_file(claims, filepath, row, description):
+    """Register ``filepath`` for one key row; True when it was already loaded for the same row.
+
+    One physical file (the same device and inode, however it is named) loads once. A second
+    key row naming it with different metadata is refused, because loading it again would
+    count its reads twice under two sets of metadata.
+    """
+    status = filepath.stat()
+    identity = (status.st_dev, status.st_ino)
+    metadata = tuple(sorted((str(column), declared_value(value)) for column, value in row.items()))
+    if identity in claims:
+        if claims[identity] != metadata:
+            raise ValueError(f'The combined key names one physical file under conflicting '
+                             f'{description} rows: {filepath}')
+        return True
+    claims[identity] = metadata
+    return False
+
+
 def load_2x150_bc1_donor_bc0_data(
     data_dir: Path,
     keyfile_dir: Path,
@@ -1009,6 +1047,7 @@ def load_2x150_bc1_donor_bc0_data(
     debug_mode: bool = False,
     debug_n_samples: int = 4,
     allow_ambiguous: bool = False,
+    require_full_coverage: bool = True,
 ) -> Tuple[pd.DataFrame, DataSourceInfo]:
     """
     Load 2x150 bp bc1-donor-bc0 fragment data.
@@ -1016,12 +1055,18 @@ def load_2x150_bc1_donor_bc0_data(
     The 2x150 bp reads capture bc1 + partial donor (donor_bc0_fragment).
     Full donor must be recovered via separate donor-bc0 amplicon.
 
+    Each key row loads its own ``{date}_{outer}_{sample}_bc1_donor_bc0_fragment_counts.tsv`` or
+    nothing; a row naming a file that is not in ``data_dir`` (for example another sequencing
+    run) is logged and skipped. Every fragment table in ``data_dir`` must be named by a row.
+
     Args:
         data_dir: Directory containing processed TSV files
         keyfile_dir: Directory containing keyfiles
         combined_key_name: Name of combined keyfile
         debug_mode: If True, only load a few samples
         debug_n_samples: Number of samples to load in debug mode
+        require_full_coverage: If True (default), raise when a fragment table in
+            ``data_dir`` is named by no key row. Suppressed in debug_mode.
 
     Returns:
         Tuple of (DataFrame, DataSourceInfo)
@@ -1056,14 +1101,13 @@ def load_2x150_bc1_donor_bc0_data(
 
     dfs = []
     loaded_files = []
+    claims = {}
+    unnamed_rows = []
 
     for _, row in tqdm(combined_key.iterrows(), total=len(combined_key),
                        desc="Loading 2x150 bc1-donor-bc0", disable=len(combined_key) < 10):
-        patterns = []
-        if 'sequencing_date' in row and 'outer_primers' in row and 'sample_number' in row:
-            patterns.append(f"{row['sequencing_date']}_{row['outer_primers']}_{row['sample_number']}_bc1_donor_bc0_fragment_counts.tsv")
-        if 'sample_number' in row:
-            patterns.append(f"*_{row['sample_number']}_*fragment*.tsv")
+        patterns = _key_row_patterns(row, ['_bc1_donor_bc0_fragment_counts.tsv'],
+                                     '*_{sample}_*fragment*.tsv')
 
         # Shared resolver: refuses to guess between multiple glob matches.
         # (2026-07-28 -- same defect class as the 2x300 loader; see
@@ -1074,7 +1118,9 @@ def load_2x150_bc1_donor_bc0_data(
             allow_ambiguous=allow_ambiguous,
         )
 
-        if filepath and filepath.exists():
+        if not (filepath and filepath.exists()):
+            unnamed_rows.append(patterns[0] if patterns else f"sample_number={row.get('sample_number')}")
+        elif not _claim_physical_file(claims, filepath, row, 'bc1-donor-bc0'):
             df = pd.read_csv(filepath, sep='\t')
 
             df = _attach_sample_scope(df, row, filepath)
@@ -1098,6 +1144,12 @@ def load_2x150_bc1_donor_bc0_data(
 
             dfs.append(df)
             loaded_files.append(filepath)
+
+    if unnamed_rows:
+        logger.info(f"  {len(unnamed_rows)} combined-key row(s) name no file in {data_dir} "
+                    f"(for example {unnamed_rows[:3]}); they are not loaded")
+    _assert_full_coverage(data_dir, loaded_files, "2x150", glob_pattern="*fragment_counts.tsv",
+                          require_full_coverage=require_full_coverage, debug_mode=debug_mode)
 
     if not dfs:
         logger.warning("No 2x150 bc1-donor-bc0 data files loaded")
@@ -1171,12 +1223,9 @@ def load_donor_bc0_lookup(
 
     for _, row in tqdm(combined_key.iterrows(), total=len(combined_key),
                        desc="Loading donor-bc0", disable=len(combined_key) < 10):
-        patterns = []
-        if 'sequencing_date' in row and 'outer_primers' in row and 'sample_number' in row:
-            patterns.append(f"{row['sequencing_date']}_{row['outer_primers']}_{row['sample_number']}_complete_donor_bc0_counts.tsv")
-            patterns.append(f"{row['sequencing_date']}_{row['outer_primers']}_{row['sample_number']}_donor_bc0_counts.tsv")
-        if 'sample_number' in row:
-            patterns.append(f"*_{row['sample_number']}_*donor_bc0*.tsv")
+        # A row whose own table is absent loads nothing rather than another date's table.
+        patterns = _key_row_patterns(row, ['_complete_donor_bc0_counts.tsv', '_donor_bc0_counts.tsv'],
+                                     '*_{sample}_*donor_bc0*.tsv')
 
         # Shared resolver: refuses to guess between multiple glob matches.
         # (2026-07-28 -- same defect class as the 2x300 loader; see
