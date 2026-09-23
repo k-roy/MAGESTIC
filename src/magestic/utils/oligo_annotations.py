@@ -115,6 +115,12 @@ COLUMNS_BC1_DONOR_BC0 = [
     # to the donor SEQUENCE, which splits one edit ~2.67 ways and flips is_unambiguous on 18% of 20210822 fixture
     # links (planning 30_ IO-XF1).
     "individual_variants",
+    # Donor geometry for edit certification (core/matching.py:design_edit_positions; planning 218, ledger
+    # item 10). Without these three the matcher cannot place a design's intended alleles in DONOR
+    # coordinates, and every window-only match is reported not_assessable instead of certified.
+    "donor_start_coord",
+    "donor_end_coord",
+    "donor_strand",
 ]
 
 

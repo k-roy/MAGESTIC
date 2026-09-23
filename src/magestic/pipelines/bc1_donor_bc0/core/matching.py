@@ -74,10 +74,96 @@ DEFAULT_ANCHOR_POS = 98
 DEFAULT_ANCHOR_POS_SLACK = 10
 DEFAULT_ANCHOR_MAX_MISMATCH = 1
 
+# ---------------------------------------------------------------------------
+# Edit certification (planning 218, ledger item 10; BDB-H05 / DONOR-WINDOW-R1)
+# ---------------------------------------------------------------------------
+# A window hit says a 60-mer of the read equals a 60-mer of a design. It does NOT say the read carries the
+# edit that design installs: for a 129-nt donor a window avoiding any single offset always exists, so the
+# UNEDITED donor of a design still hits that design. 98 real registry rows keep oligo, perfect_middle_region
+# and closest-middle ED0 after their annotated SNVs are reverted to reference. Certification therefore asks a
+# separate question -- does the read carry this design's intended allele at every intended position, inside an
+# exactly matched window? -- and answers with one of these statuses. No new threshold: the only length used is
+# the lookup's existing window_size.
+EDIT_FULL_DONOR = "full_donor"
+EDIT_POSITIONS_MATCHED = "edit_positions_matched"
+EDIT_POSITIONS_MISMATCHED = "edit_positions_mismatched"
+EDIT_POSITIONS_NOT_COVERED = "edit_positions_not_covered"
+EDIT_POSITIONS_UNCONFIRMED = "edit_positions_unconfirmed"
+EDIT_NOT_ASSESSABLE = "not_assessable"
+EDIT_NO_DONOR_EVIDENCE = "no_donor_evidence"
+# Ordered by how much the row tells you about the edit, certifying first; used to summarise a candidate SET.
+EDIT_EVIDENCE_STATUSES = (
+    EDIT_FULL_DONOR, EDIT_POSITIONS_MATCHED, EDIT_POSITIONS_MISMATCHED, EDIT_POSITIONS_NOT_COVERED,
+    EDIT_POSITIONS_UNCONFIRMED, EDIT_NOT_ASSESSABLE, EDIT_NO_DONOR_EVIDENCE,
+)
+EDIT_CERTIFYING = frozenset({EDIT_FULL_DONOR, EDIT_POSITIONS_MATCHED})
+
+# Registry columns that place a designed donor on the genome. The convention is INFERRED from the 2026-09
+# geometry scan of the shipped registry and validated per row in design_edit_positions: the donor occupies the
+# zero-based half-open interval [donor_start_coord, donor_end_coord) on the forward strand and variant
+# coordinates are one-based. Of the four conventions tested, that one passed 94,586 of 146,250 rows and the
+# zero-based-variant alternative never passed alone (216/preflight/donor_geometry/summaries.json).
+# 35.3% of shipped rows lack donor_strand and so stay not_assessable until the registry generator backfills
+# it (Kevin, decision D-1, 2026-09-23: accept fail-closed, then backfill).
+DONOR_GEOMETRY_COLUMNS = ("donor_start_coord", "donor_end_coord", "donor_strand")
+EDIT_POSITION_VARIANT_COLUMN = "individual_variants"
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
+_SNV_TOKEN = re.compile(r"(?:chr[^_]+_)?(\d+)_([ACGT])_([ACGT])(?:_(?:SNP|SNV))?")
+
 
 def _hamming(a: str, b: str) -> int:
     """Count mismatches between two equal-length strings. N counts as mismatch."""
     return sum(x != y for x, y in zip(a, b))
+
+
+def _coord(value) -> Optional[int]:
+    """An integer coordinate, or None. Accepts the registry's float spelling ('344980.0')."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number != int(number):      # NaN, or not an integer
+        return None
+    return int(number)
+
+
+def design_edit_positions(donor, individual_variants, donor_start, donor_end, donor_strand):
+    """0-based offsets, in the DESIGNED donor, of every allele this design intends to install.
+
+    Returns ``(offsets, None)`` or ``(None, reason)``. The row is accepted only when the designed donor itself
+    carries the alternate allele (complemented on '-') at every projected offset, so a wrong convention, a
+    gapped design or a stale annotation fails closed instead of pointing at the wrong base. Only single-base
+    substitutions are projected: multi-base and indel alleles need a gapped transform this registry does not
+    carry, and they are reported not assessable rather than guessed at.
+    """
+    if not isinstance(donor, str) or not donor:
+        return None, "no_donor"
+    if donor_strand not in ("+", "-"):
+        return None, "no_donor_strand"
+    start, end = _coord(donor_start), _coord(donor_end)
+    if start is None or end is None:
+        return None, "no_donor_coordinates"
+    if end - start != len(donor):
+        return None, "interval_length_disagrees_with_donor"
+    if not isinstance(individual_variants, str) or not individual_variants.strip():
+        return None, "no_individual_variants"
+    offsets = []
+    for raw in re.split(r"[,;]", individual_variants):
+        token = raw.strip().strip("[]").strip().strip("'\"")
+        parsed = _SNV_TOKEN.fullmatch(token)
+        if not parsed:
+            return None, "not_a_single_base_substitution"
+        position, ref, alt = int(parsed.group(1)), parsed.group(2), parsed.group(3)
+        if ref == alt:
+            return None, "ref_equals_alt"
+        offset = (position - 1 - start) if donor_strand == "+" else (end - position)
+        expected = alt if donor_strand == "+" else alt.translate(_COMPLEMENT)
+        if not (0 <= offset < len(donor)) or donor[offset] != expected:
+            return None, "alternate_allele_not_at_projected_offset"
+        offsets.append(offset)
+    if len(set(offsets)) != len(offsets):
+        return None, "two_alleles_at_one_offset"
+    return tuple(sorted(offsets)), None
 
 
 def _find_anchor_tolerant(
@@ -193,6 +279,7 @@ class OligoMatch:
 
     # Match quality indicators
     perfect_donor: bool = False
+    # True only when the EDIT-bearing region matched: edit_evidence in EDIT_CERTIFYING (planning 218).
     perfect_middle_region: bool = False
 
     # `guide_match` is a BOOLEAN and therefore conflates states that mean opposite things: False was
@@ -219,10 +306,19 @@ class OligoMatch:
     # variant in ~100% of perfect-donor matches even though the oligo count is
     # 4-6. A match is therefore "unambiguous" when all candidate oligos agree
     # on the installed variant, regardless of how many redundant guides exist.
+    # Since planning 218 (ledger item 10) it ALSO requires certifying edit evidence: a window-only
+    # match that cannot show the design's intended allele stays a candidate.
     is_unambiguous: bool = False
     num_candidate_oligos: int = 0     # distinct candidate oligo_names
-    num_candidate_variants: int = 0   # distinct installed variants among candidates
-    variant: Optional[str] = None     # donor_changes (installed edit) when unambiguous
+    num_candidate_variants: int = 0   # distinct installed variants among candidates (the OLD is_unambiguous)
+    variant: Optional[str] = None     # installed edit when unambiguous AND certified
+
+    # What the observed donor SHOWS about the candidates' designed edit (planning 218, ledger item 10).
+    # `edit_evidence` summarises the candidate SET -- the strongest status any candidate reaches -- and
+    # certifies `oligo_name` only when `is_unambiguous` is True, because an ambiguous row's `oligo_name` is
+    # merely the sorted-first candidate. A window hit alone is a CANDIDATE, never a certification.
+    edit_evidence: str = EDIT_NO_DONOR_EVIDENCE
+    num_edit_certified_variants: int = 0
 
     # Details
     match_method: str = "none"  # "perfect", "middle_region", "guide_only", "none"
@@ -252,6 +348,12 @@ class OligoLookupTables:
     # candidate oligos that share a donor to the single edit they all install,
     # so variant-level unambiguity can be assessed in every match branch.
     oligo_to_variant: Dict[str, str] = field(default_factory=dict)
+
+    # oligo_name -> its designed donor, and -> the 0-based donor offsets of the alleles it installs
+    # (None when the design's geometry cannot be projected; see design_edit_positions). Both are needed to
+    # ask whether a read actually shows a candidate's edit.
+    oligo_to_donor: Dict[str, Optional[str]] = field(default_factory=dict)
+    oligo_to_edit_positions: Dict[str, Optional[Tuple[int, ...]]] = field(default_factory=dict)
 
     # Metadata
     window_size: int = DEFAULT_WINDOW_SIZE
@@ -486,6 +588,41 @@ def build_lookup_tables(
         variant_series = valid_df['donor']
     tables.oligo_to_variant = dict(zip(valid_df['oligo_name'], variant_series))
 
+    # 6. Edit geometry: the donor and the donor-coordinate offsets of the alleles each design installs.
+    # One extra pass over the designs (no extra pass over windows). A design whose geometry cannot be
+    # projected is not assessable: such rows can only be certified by the full donor being present.
+    conflicting = set()
+    for name, donor in zip(valid_df['oligo_name'], valid_df['donor']):
+        previous = tables.oligo_to_donor.get(name)
+        if previous is not None and previous != donor:
+            conflicting.add(name)
+        tables.oligo_to_donor[name] = donor
+    for name in conflicting:
+        # One name, two donors: the dict keeps only the last, so neither the full-donor test nor a projected
+        # position can be trusted for it. Blanking the donor makes design_edit_evidence return not_assessable
+        # (it guards `if not design`). load_and_build_lookup dedupes by name, so production never gets here;
+        # without this line a duplicated name could certify full_donor against the wrong donor.
+        tables.oligo_to_donor[name] = None
+    reasons = {}
+    have_geometry = all(c in valid_df.columns for c in DONOR_GEOMETRY_COLUMNS)
+    if have_geometry and EDIT_POSITION_VARIANT_COLUMN in valid_df.columns:
+        cols = ['oligo_name', 'donor', EDIT_POSITION_VARIANT_COLUMN, *DONOR_GEOMETRY_COLUMNS]
+        for name, donor, variants, start, end, strand in valid_df[cols].itertuples(index=False, name=None):
+            positions, reason = design_edit_positions(donor, variants, start, end, strand)
+            if name in conflicting:
+                positions, reason = None, "oligo_name_has_conflicting_donors"
+            tables.oligo_to_edit_positions[name] = positions
+            reasons[reason or "assessable"] = reasons.get(reason or "assessable", 0) + 1
+        logger.info(f"  Edit positions by design: {reasons}")
+    else:
+        missing = [c for c in (*DONOR_GEOMETRY_COLUMNS, EDIT_POSITION_VARIANT_COLUMN)
+                   if c not in valid_df.columns]
+        tables.oligo_to_edit_positions = {name: None for name in tables.oligo_to_donor}
+        logger.warning(
+            f"  Design table lacks {missing}: no design's intended alleles can be placed in donor "
+            f"coordinates, so a window-only match can never be certified (edit_evidence=not_assessable). "
+            f"Only reads containing the FULL designed donor will be certified.")
+
     stats = tables.get_stats()
     logger.info(f"  Built lookup tables:")
     logger.info(f"    Unique donors: {stats['num_unique_donors']}")
@@ -570,6 +707,76 @@ def _resolve_candidates(
         result.match_method = method_ambiguous
 
 
+def _observed_windows(donor: str, window_size: int) -> Dict[str, List[int]]:
+    """Every window of the OBSERVED donor -> the offsets it starts at. Built once per read."""
+    windows: Dict[str, List[int]] = {}
+    for i in range(len(donor) - window_size + 1):
+        windows.setdefault(donor[i:i + window_size], []).append(i)
+    return windows
+
+
+def design_edit_evidence(observed, observed_windows, design, positions, window_size) -> str:
+    """What the observed donor shows about ONE design's intended alleles (the EDIT_* statuses).
+
+    An intended position counts as SEEN only inside a window of the design that occurs exactly in the read;
+    inside such a window the read's base at that position is the design's allele by construction. Positions
+    outside every exact window are classified from the diagonals of the matched windows, which is diagnosis,
+    not certification.
+    """
+    if not design:
+        return EDIT_NOT_ASSESSABLE
+    if design in observed:
+        return EDIT_FULL_DONOR
+    if not positions:
+        return EDIT_NOT_ASSESSABLE
+    starts, diagonals = set(), set()
+    for j in range(len(design) - window_size + 1):
+        hits = observed_windows.get(design[j:j + window_size])
+        if hits:
+            starts.add(j)
+            diagonals.update(i - j for i in hits)
+    uncovered = [p for p in positions if not any((p - k) in starts for k in range(window_size))]
+    if not uncovered:
+        return EDIT_POSITIONS_MATCHED
+    mismatched = truncated = False
+    for p in uncovered:
+        spanning = [d for d in diagonals if 0 <= p + d < len(observed)]
+        if not spanning:
+            truncated = True
+        elif all(observed[p + d] != design[p] for d in spanning):
+            mismatched = True
+    if mismatched:
+        return EDIT_POSITIONS_MISMATCHED
+    if truncated:
+        return EDIT_POSITIONS_NOT_COVERED
+    return EDIT_POSITIONS_UNCONFIRMED
+
+
+def _certify_candidates(result: OligoMatch, observed: str, tables: OligoLookupTables) -> None:
+    """Replace the window branch's assumed certification with what the read actually shows.
+
+    Candidates, counts, `oligo_name` and `match_method` are untouched -- a window-only match remains a
+    CANDIDATE. Only `perfect_middle_region`, `is_unambiguous` and `variant` change, and only downwards.
+    """
+    windows = _observed_windows(observed, tables.window_size)
+    cache, statuses = {}, {}
+    for name in result.candidate_oligos:
+        design = tables.oligo_to_donor.get(name)
+        positions = tables.oligo_to_edit_positions.get(name)
+        key = (design, positions)
+        if key not in cache:
+            cache[key] = design_edit_evidence(observed, windows, design, positions, tables.window_size)
+        statuses[name] = cache[key]
+    certified = [n for n, s in statuses.items() if s in EDIT_CERTIFYING]
+    result.num_edit_certified_variants = len(_variant_set(certified, tables))
+    if statuses:
+        result.edit_evidence = min(statuses.values(), key=EDIT_EVIDENCE_STATUSES.index)
+    result.perfect_middle_region = result.edit_evidence in EDIT_CERTIFYING
+    if not result.perfect_middle_region:
+        result.is_unambiguous = False
+        result.variant = None
+
+
 def match_sequence(
     donor: Optional[str],
     guide: Optional[str],
@@ -646,6 +853,8 @@ def match_sequence(
             method_unique="perfect",
             method_ambiguous="perfect_ambiguous",
         )
+        result.edit_evidence = EDIT_FULL_DONOR
+        result.num_edit_certified_variants = result.num_candidate_variants
         return result
 
     # 2. Try sliding window match on donor
@@ -653,8 +862,6 @@ def match_sequence(
         window_matches = match_donor_sliding_window(donor, tables)
 
         if window_matches:
-            result.perfect_middle_region = True
-
             if guide_oligos is not None:
                 overlap = window_matches & set(guide_oligos)
                 if overlap:
@@ -668,6 +875,8 @@ def match_sequence(
                 method_unique="sliding_window",
                 method_ambiguous="sliding_window_ambiguous",
             )
+            # A matched 60-mer names CANDIDATES. Whether the read shows their edit is a separate question.
+            _certify_candidates(result, donor, tables)
             return result
 
     # 3. Guide-only match (fallback): nothing to conflict WITH, so a designed guide is a match.
@@ -680,6 +889,13 @@ def match_sequence(
             method_unique="guide_only",
             method_ambiguous="guide_only_ambiguous",
         )
+        # A designed guide names a construct; it is no evidence that this plasmid's donor carries that
+        # construct's edit -- the donor on this row matched nothing. Certification needs donor evidence
+        # (reviews/bdb_attribution_contract/PLAN_AND_REVIEW.md, `variant_candidates` row). Decision D-2,
+        # implemented as recommended; reversing it means deleting these three lines and test_guideonly_*.
+        result.edit_evidence = EDIT_NO_DONOR_EVIDENCE
+        result.is_unambiguous = False
+        result.variant = None
         return result
 
     return result
@@ -802,15 +1018,17 @@ def match_dataframe(
     Adds columns for match results:
     - {prefix}oligo_name: Matched oligo name
     - {prefix}perfect_donor: True if perfect donor match
-    - {prefix}perfect_middle_region: True if middle region matched
+    - {prefix}perfect_middle_region: True if the EDIT-bearing region matched (edit_evidence certifies)
     - {prefix}guide_match: True if guide contributed to match (kept for back-compat)
     - {prefix}guide_status: no_guide / guide_not_designed / match / conflict -- see OligoMatch
     - {prefix}num_guide_oligos: how many designs carry this guide (0 when it is not a designed guide)
-    - {prefix}is_unambiguous: True if match is unambiguous
+    - {prefix}is_unambiguous: True if match is unambiguous and its edit is certified
     - {prefix}match_method: Description of how match was made
     - {prefix}num_candidates / {prefix}num_candidate_variants: candidate oligos / distinct installed variants
-    - {prefix}variant: installed variant id when unambiguous
+    - {prefix}variant: installed variant id when unambiguous and certified
     - {prefix}candidate_oligos: ';'-joined candidates when num_candidate_variants > 1, else None
+    - {prefix}edit_evidence: what the donor shows about the candidates' designed edit (EDIT_* statuses)
+    - {prefix}num_edit_certified_variants: distinct installed variants whose edit the donor certifies
 
     PERFORMANCE: Supports parallel processing with n_jobs > 1 and
     processes in chunks for memory efficiency.
@@ -850,6 +1068,8 @@ def match_dataframe(
     ncandv = [0] * n
     var = [None] * n
     cands = [None] * n
+    editev = [EDIT_NO_DONOR_EVIDENCE] * n
+    ncertv = [0] * n
 
     # ---------------------------------------------------------------------
     # VECTORIZED FAST PATH (2026-06-02) — the perfect-donor majority.
@@ -892,6 +1112,8 @@ def match_dataframe(
             # the fast path is only taken where the guide is NOT a designed guide (~g_block), so the
             # guide can never have narrowed here: it is absent, or present and undesigned.
             gstatus[i] = GUIDE_NOT_DESIGNED if g_present[i] else GUIDE_NO_GUIDE
+            editev[i] = EDIT_FULL_DONOR          # the fast path is exact full-donor equality
+            ncertv[i] = int(t[4])                # every candidate of a perfect donor is certified
 
     # ---------------------------------------------------------------------
     # FALLBACK — unchanged per-row match_sequence for every non-fast row.
@@ -915,6 +1137,7 @@ def match_dataframe(
         gstatus[i] = r.guide_status; ngoligo[i] = r.num_guide_oligos
         ncand[i] = r.num_candidate_oligos; ncandv[i] = r.num_candidate_variants; var[i] = r.variant
         cands[i] = format_candidates(r.candidate_oligos, r.num_candidate_variants)
+        editev[i] = r.edit_evidence; ncertv[i] = r.num_edit_certified_variants
 
     # Single vectorized writeback
     df[f'{prefix}oligo_name'] = oligo
@@ -929,6 +1152,8 @@ def match_dataframe(
     df[f'{prefix}num_candidate_variants'] = ncandv
     df[f'{prefix}variant'] = var
     df[f'{prefix}candidate_oligos'] = cands
+    df[f'{prefix}edit_evidence'] = editev
+    df[f'{prefix}num_edit_certified_variants'] = ncertv
 
     n_matched = sum(1 for o in oligo if o is not None)
     n_perfect = sum(1 for x in pdon if x)
@@ -944,6 +1169,18 @@ def match_dataframe(
             f"naming no design the donor allows. The donor answer was kept. These were invisible before "
             f"(guide_match=False meant this and 'no guide' alike)."
         )
+    evidence_counts = {}
+    for status in editev:
+        evidence_counts[status] = evidence_counts.get(status, 0) + 1
+    logger.info(f"  edit_evidence: {evidence_counts}")
+    uncertified = sum(1 for status, how in zip(editev, method)
+                      if how.startswith("sliding_window") and status not in EDIT_CERTIFYING)
+    if uncertified:
+        logger.warning(
+            f"  {uncertified:,} rows matched a designed 60-mer window but do NOT show that design's intended "
+            f"allele(s). They keep their candidate names and are NOT certified (is_unambiguous=False, "
+            f"perfect_middle_region=False). Before this change they were reported perfect_middle_region=True "
+            f"and could be unambiguous (ledger item 10).")
     return df
 
 

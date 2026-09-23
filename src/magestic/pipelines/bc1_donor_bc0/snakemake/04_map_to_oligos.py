@@ -209,6 +209,9 @@ def main():
         counts["gdb01_bridge_repaired_rows"] = int(out["guide_repaired_gdb01"].sum())
     if "guide_match" in out.columns:
         counts["guide_match"] = {str(k): int(v) for k, v in out["guide_match"].value_counts(dropna=False).items()}
+    if "edit_evidence" in out.columns:
+        # planning 218 item 10: the before/after measure of how many rows the edit certification changes.
+        counts["edit_evidence"] = {str(k): int(v) for k, v in out["edit_evidence"].value_counts().items()}
     prov.set_counts(**counts)
     prov.add_output(args.output, rows=int(n))
     print(f"sidecar: {prov.write()}")
