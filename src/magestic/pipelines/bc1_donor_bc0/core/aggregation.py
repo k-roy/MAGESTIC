@@ -59,7 +59,11 @@ def _gdb_records(value):
 
 def _combine(group, count_columns, representative=None):
     """Retain a real representative and combine only declared evidence fields."""
-    records = group.to_dict('records')
+    return _combine_records(group.to_dict('records'), set(group.columns), count_columns, representative)
+
+
+def _combine_records(records, columns, count_columns, representative=None):
+    """_combine over one group's records; `columns` are the frame's column labels."""
     row = dict(representative if representative is not None else
                max(records, key=lambda item: item['_representative_reads']))
     for column in count_columns:
@@ -76,12 +80,12 @@ def _combine(group, count_columns, representative=None):
         row[column] = max(item[column] for item in records)
     row['pcr_support_exact'] = all(item['pcr_support_exact'] for item in records if item['counts'] > 0)
     for column in ('has_2x150', 'has_2x300', 'has_gdb', 'has_donor_conflict', 'gdb_ambiguous'):
-        if column in group:
+        if column in columns:
             row[column] = any(_flag(item[column]) for item in records)
-    if 'gdb_candidates' in group:
+    if 'gdb_candidates' in columns:
         row['gdb_candidates'] = '[' + ', '.join(sorted(row['_gdb_candidates'])) + ']'
         row['gdb_ambiguous'] = _flag(row.get('gdb_ambiguous')) or len(row['_gdb_candidates']) > 1
-    if 'guide' in group:
+    if 'guide' in columns:
         guides = row['_guide_candidates']
         row['guide_candidates'] = json.dumps(sorted(guides))
         conflict = len(guides) > 1 or any(_flag(item.get('guide_evidence_conflict')) for item in records)
@@ -102,23 +106,53 @@ def _combine(group, count_columns, representative=None):
     return row
 
 
+def _group_positions(frame, group_columns):
+    """Row positions of each group, in the order iterating frame.groupby(..., sort=False) visits them.
+
+    Converting each group to its own frame and records costs pandas overhead per group, which made
+    aggregation take hours on a screen of a few million links (lane 218, 2026-09-23). ngroup() numbers
+    the groups in iteration order, so the output order is unchanged.
+    """
+    if not len(frame):
+        return []
+    codes = frame.groupby(group_columns, dropna=False, sort=False).ngroup().to_numpy()
+    positions = [[] for _ in range(int(codes.max()) + 1)]
+    for position, code in enumerate(codes):
+        positions[code].append(position)
+    return positions
+
+
+def _combine_groups(frame, group_columns, count_columns):
+    """_combine for every group of `frame`, converting the frame to records once."""
+    records, columns = frame.to_dict('records'), set(frame.columns)
+    return [_combine_records([records[position] for position in group], columns, count_columns)
+            for group in _group_positions(frame, group_columns)]
+
+
 def _collapse(frame, group_columns, sequence_column, count_columns, threshold):
-    """Greedy existing-distance policy, preserving each row's evidence bundle."""
+    """Greedy existing-distance policy, preserving each row's evidence bundle.
+
+    Within a group, the row with the most reads (the first such row on a tie) absorbs every remaining
+    row whose sequence is within `threshold` edits of its own; a row with an unknown sequence absorbs
+    only itself. Works on records, not per-group frames (see _group_positions).
+    """
     rows = []
-    for _, group in frame.groupby(group_columns, dropna=False, sort=False):
-        group = group.reset_index(drop=True)
-        while len(group):
-            top_index = group['counts'].idxmax()
-            representative = group.loc[top_index].to_dict()
+    records, columns = frame.to_dict('records'), set(frame.columns)
+    for positions in _group_positions(frame, group_columns):
+        group = [records[position] for position in positions]
+        while group:
+            top = max(range(len(group)), key=lambda index: group[index]['counts'])
+            representative = group[top]
             sequence = _text(representative[sequence_column])
             if sequence is None:
                 # Unknown sequences cannot be error-collapsed; still consume the row.
-                mask = group.index == top_index
+                taken = [index == top for index in range(len(group))]
             else:
-                mask = group[sequence_column].map(
-                    lambda value: _text(value) is not None and distance(str(value), sequence) <= threshold)
-            rows.append(_combine(group.loc[mask], count_columns, representative))
-            group = group.loc[~mask].reset_index(drop=True)
+                taken = [_text(item[sequence_column]) is not None
+                         and distance(str(item[sequence_column]), sequence) <= threshold for item in group]
+            rows.append(_combine_records([item for item, take in zip(group, taken) if take], columns,
+                                         count_columns, representative))
+            group = [item for item, take in zip(group, taken) if not take]
     return pd.DataFrame(rows, columns=frame.columns.union(pd.Index(['guide_candidates', 'guide_evidence_conflict']), sort=False))
 
 
@@ -228,7 +262,7 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     frame['_unresolved_fragment'] = [row.get('donor_bc0_fragment') if row['donor'] is None else None
                                       for row in frame.to_dict('records')]
     groups = link_scopes + ['bc1', 'donor', 'bc0', '_unresolved_fragment']
-    result = pd.DataFrame([_combine(group, count_columns) for _, group in frame.groupby(groups, dropna=False, sort=False)])
+    result = pd.DataFrame(_combine_groups(frame, groups, count_columns))
     if collapse_sequences:
         # Unknown link components cannot establish that two observations belong
         # to the same construct. Keep their exact rows and read mass intact.
