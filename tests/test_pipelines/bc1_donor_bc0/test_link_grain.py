@@ -1,24 +1,31 @@
-"""A BDB link is the plasmid linkage; where it was sampled is evidence (218 regression 2).
+"""A BDB link lives in one transformation (218 patch 45, superseding patch 41's link key).
 
-Kevin, 2026-09-23 (ledger §7 item 4): separate PCRs count toward a BDB link, because the concern
-is PCR recombination. So a trafo-level plate and the pooled-yL outgrowth of that transformation
-share a link, and so do the transformations of one construct library. The sampled population
-(yeast_library, yeast_sublibrary, trafo_ID) is kept per link in ``population_counts`` and no
-longer splits a link, its PCR support or its barcode's purity denominator. The construct scope
-(library_ID, V_library, SPS) still separates links.
+Kevin, 2026-09-23: "For a given trafo, we require that a bc1 be matched up to a given donor by at
+least two independent PCR wells. This guards against spurious associations due to PCR recombination.
+When comparing two separate trafos, we simply want to make sure that the bc1 is observed in one trafo
+with much higher read counts/purity than in the other."
 
-Design: planning/218_magestic_production_corrections/reviews/merge_regressions_repair/DESIGN.md §1.
-Each test asserts the link grain first, so at a parent that splits by population it fails on
-that behaviour before it reaches the new ``population_counts`` column.
+The bc1 PCR fragment is joined to the cut guide-donor plasmid in yeast at each transformation, so a
+linkage is one assembly event in one transformation. The loaders map each key row's sample label to
+its transformation (through the screen's trafo key for a pooled outgrowth, and 'trafo_N-M' plates to
+'trafo_N') and keep the label in trafo_label. Links, PCR support, the purity denominator and donor
+recovery are keyed by transformation; the labels a link was seen under are evidence in
+population_counts.
+
+Design: planning/218_magestic_production_corrections/reviews/merge_regressions_repair/DESIGN.md §6.
+Each test asserts the link grain first, so at a parent with patch 41's population-free key it fails
+on that behaviour.
 """
 import json
+from urllib.parse import unquote
 
 import pandas as pd
 import pytest
 
 from magestic.pipelines.bc1_donor_bc0.core.merge import merge_data_sources
 from magestic.pipelines.bc1_donor_bc0.pipeline.run_pipeline import aggregate_and_filter
-from magestic.pipelines.bc1_donor_bc0.readers.data_loader import load_2x150_bc1_donor_bc0_data
+from magestic.pipelines.bc1_donor_bc0.readers.data_loader import (
+    load_2x150_bc1_donor_bc0_data, load_donor_bc0_lookup, recover_full_donors)
 
 SPS = 'CGTATGGAGATGACGTCAGG'
 BC1, BC0 = 'G' * 20, 'A' * 10
@@ -31,102 +38,140 @@ def aggregate(frame, collapse=False):
                                 collapse_sequences=collapse, show_progress=False)
 
 
-def populations(row):
-    return {(item['trafo_ID'], item['counts']) for item in json.loads(row['population_counts'])}
+def labels(row):
+    entries = json.loads(row['population_counts'])
+    assert {item['trafo_ID'] for item in entries} == {row['trafo_ID']}
+    return {(item['trafo_label'], item['counts']) for item in entries}
+
+
+def _layout(tmp_path, wells, trafo_key=None, donor_wells=()):
+    """A 2x150 run on plate_3F; `wells` is (sample, trafo label, reads); donor_wells add donor-bc0 rows.
+
+    The donor-bc0 tables carry SPS, as the real complete_donor_bc0_counts tables do (20250912 plate_3A).
+    """
+    data, keys = tmp_path / 'data', tmp_path / 'keys'
+    data.mkdir()
+    keys.mkdir()
+    rows = [dict(description='bc1-donor-bc0', sequencing_date='20250101', outer_primers='plate_3F',
+                 sample_number=well, condition='plate wash', trafo_ID=label, gDNA_plate_name='prep_A',
+                 inner_primers='KR1967-KR1590', polymerase='Q5') for well, label, _ in wells]
+    rows += [dict(description='donor-bc0', sequencing_date='20250101', outer_primers='plate_3A',
+                  sample_number=well, condition='plate wash', trafo_ID=label, gDNA_plate_name='prep_A',
+                  inner_primers='KR1967-KR1590', polymerase='Q5') for well, label, _ in donor_wells]
+    pd.DataFrame(rows).to_csv(keys / 'bc1_donor_bc0_combined_key.tsv', sep='\t', index=False)
+    for well, _, count in wells:
+        pd.DataFrame([dict(counts=count, bc1=BC1, bc0=BC0, SPS=SPS, donor_bc0_fragment=FRAGMENT)]).to_csv(
+            data / f'20250101_plate_3F_{well}_bc1_donor_bc0_fragment_counts.tsv', sep='\t', index=False)
+    for well, _, count in donor_wells:
+        pd.DataFrame([dict(counts=count, donor=DONOR, donor_bc0_fragment=FRAGMENT, SPS=SPS, bc0=BC0)]).to_csv(
+            data / f'20250101_plate_3A_{well}_complete_donor_bc0_counts.tsv', sep='\t', index=False)
+    if trafo_key:
+        pd.DataFrame([dict(yL=yl, trafo_ID=trafo, replicate='rep_1') for yl, trafo in trafo_key.items()]).to_csv(
+            keys / 'bc1_donor_bc0_amplicons_trafo_key.tsv', sep='\t', index=False)
+    return data, keys
+
+
+YL406_LIKE = [(2, 'trafo_2-1', 7), (14, 'trafo_2-2', 3), (50, 'yL387', 5)]
+
+
+def test_plates_and_the_pooled_outgrowth_of_one_transformation_are_one_link(tmp_path):
+    """yL406: the washes of plates trafo_2-1 to 2-3 were pooled into the yL387 outgrowth."""
+    data, keys = _layout(tmp_path, YL406_LIKE, trafo_key={'yL387': 'trafo_2'})
+    frame, _ = load_2x150_bc1_donor_bc0_data(data, keys)
+    merged = merge_data_sources(df_2x150=frame)
+    assert len(merged) == 1
+    row = merged.iloc[0]
+    assert row['trafo_ID'] == 'trafo_2' and row['total_counts'] == 15 and row['total_pcr_replicates'] == 3
+    assert labels(row) == {('trafo_2-1', 7), ('trafo_2-2', 3), ('yL387', 5)}
+    row = aggregate(merged).iloc[0]
+    assert row['num_PCR_replicates'] == 3 and row['support_tier'] == 'confident' and row['bc1_purity'] == 1
+
+
+def test_without_a_trafo_key_a_pooled_outgrowth_is_its_own_scope(tmp_path):
+    data, keys = _layout(tmp_path, YL406_LIKE)
+    merged = merge_data_sources(df_2x150=load_2x150_bc1_donor_bc0_data(data, keys)[0])
+    assert len(merged) == 2
+    support = dict(zip(merged['trafo_ID'], merged['total_pcr_replicates']))
+    assert support == {'trafo_2': 2, 'yL387': 1}
+
+
+def test_a_pooled_outgrowth_keeps_its_amplicon_level_in_the_pcr_identity(tmp_path):
+    data, keys = _layout(tmp_path, YL406_LIKE, trafo_key={'yL387': 'trafo_2'})
+    frame, _ = load_2x150_bc1_donor_bc0_data(data, keys)
+    levels = {label: json.loads(unquote(pcr[len('pcr:v1:'):]))[5]
+              for label, pcr in zip(frame['trafo_label'], frame['pcr_replicate_id'])}
+    assert levels == {'trafo_2-1': 'trafo', 'trafo_2-2': 'trafo', 'yL387': 'pooled_yL'}
+    assert set(frame['trafo_ID']) == {'trafo_2'}
+
+
+def test_conflicting_trafo_keys_are_refused(tmp_path):
+    data, keys = _layout(tmp_path, YL406_LIKE, trafo_key={'yL387': 'trafo_2'})
+    pd.DataFrame([dict(trafo_ID='trafo_3', yL='yL387')]).to_csv(keys / 'trafo_key.tsv', sep='\t', index=False)
+    with pytest.raises(ValueError, match='yL387'):
+        load_2x150_bc1_donor_bc0_data(data, keys)
 
 
 def full(count, pcr, donor=DONOR, **scope):
     return dict(counts=count, bc1=BC1, bc0=BC0, donor=donor, SPS=SPS, pcr_replicate_id=pcr, **scope)
 
 
-def test_trafo_plate_and_pooled_outgrowth_are_one_link(tmp_path):
-    """yL406: plate trafo_2-1 is one of the three plates whose washes were pooled into yL387."""
-    data, keys = tmp_path / 'data', tmp_path / 'keys'
-    data.mkdir()
-    keys.mkdir()
-    pd.DataFrame([dict(description='bc1-donor-bc0', sequencing_date='20250101', outer_primers='plate_3F',
-                       sample_number=well, condition='plate wash', trafo_ID=trafo,
-                       gDNA_plate_name='prep_A', inner_primers='KR1967-KR1590', polymerase='Q5')
-                  for well, trafo in ((2, 'trafo_2-1'), (14, 'yL387'))]).to_csv(
-        keys / 'bc1_donor_bc0_combined_key.tsv', sep='\t', index=False)
-    for well, count in ((2, 7), (14, 5)):
-        pd.DataFrame([dict(counts=count, bc1=BC1, bc0=BC0, SPS=SPS, donor_bc0_fragment=FRAGMENT)]).to_csv(
-            data / f'20250101_plate_3F_{well}_bc1_donor_bc0_fragment_counts.tsv', sep='\t', index=False)
-    frame, _ = load_2x150_bc1_donor_bc0_data(data, keys)
-    merged = merge_data_sources(df_2x150=frame)
-    assert len(merged) == 1
-    row = merged.iloc[0]
-    assert row['total_counts'] == 12 and row['total_pcr_replicates'] == 2
-    assert pd.isna(row['trafo_ID'])
-    assert populations(row) == {('trafo_2-1', 7), ('yL387', 5)}
-    row = aggregate(merged).iloc[0]
-    assert row['num_PCR_replicates'] == 2 and row['support_tier'] == 'confident'
-    assert row['bc1_purity'] == 1
-    assert populations(row) == {('trafo_2-1', 7), ('yL387', 5)}
-
-
-def test_transformations_of_one_construct_library_are_one_link():
-    """20250912: trafo_3 (SpG) and trafo_4 (SpCas9) were transformed with the same cV586."""
+def test_different_transformations_of_one_construct_library_stay_separate():
+    """20250912: trafo_3 (SpG) and trafo_4 (SpCas9) share cV586; each is its own assembly."""
     merged = merge_data_sources(df_2x300=pd.DataFrame([
         full(10, 'p1', trafo_ID='trafo_3'), full(20, 'p2', trafo_ID='trafo_4')]))
-    assert len(merged) == 1
-    row = merged.iloc[0]
-    assert row['total_counts'] == 30 and row['total_pcr_replicates'] == 2
-    assert populations(row) == {('trafo_3', 10), ('trafo_4', 20)}
-    result = aggregate(merged)
-    assert len(result) == 1
-    assert result.iloc[0]['num_PCR_replicates'] == 2 and result.iloc[0]['bc1_purity'] == 1
+    assert len(merged) == 2
+    assert dict(zip(merged['trafo_ID'], merged['total_pcr_replicates'])) == {'trafo_3': 1, 'trafo_4': 1}
 
 
-def test_purity_denominator_spans_every_population_of_the_barcode():
+def test_purity_is_per_transformation():
     merged = merge_data_sources(df_2x300=pd.DataFrame([
-        full(10, 'p1', trafo_ID='trafo_3'),
-        full(90, 'p2', donor='C' * 130, trafo_ID='trafo_4')]))
+        full(10, 'p1', trafo_ID='trafo_3'), full(90, 'p2', donor='C' * 130, trafo_ID='trafo_4')]))
     result = aggregate(merged)
-    assert len(result) == 2
-    assert result['total_bc1_counts'].tolist() == [100, 100]
-    assert sorted(result['bc1_purity']) == pytest.approx([0.1, 0.9])
+    assert sorted(result['total_bc1_counts']) == [10, 90]
+    assert result['bc1_purity'].tolist() == [1, 1]
 
 
-def test_a_population_column_keeps_a_value_only_when_all_observations_agree():
-    same = merge_data_sources(df_2x300=pd.DataFrame([
-        full(10, 'p1', trafo_ID='trafo_3'), full(5, 'p2', trafo_ID='trafo_3')])).iloc[0]
-    mixed = merge_data_sources(df_2x300=pd.DataFrame([
-        full(10, 'p1', trafo_ID='trafo_3'), full(5, 'p2', trafo_ID=None)]))
-    assert len(mixed) == 1
-    assert same['trafo_ID'] == 'trafo_3' and populations(same) == {('trafo_3', 15)}
-    assert pd.isna(mixed.iloc[0]['trafo_ID'])
-    assert populations(mixed.iloc[0]) == {('trafo_3', 10), (None, 5)}
+def test_an_empty_well_is_its_own_scope():
+    """A read in a well with no sample cannot add a PCR to a real link."""
+    merged = merge_data_sources(df_2x300=pd.DataFrame([
+        full(10, 'p1', trafo_ID='trafo_1'), full(1, 'p2', trafo_ID='empty')]))
+    assert len(merged) == 2
+    real = merged[merged['trafo_ID'] == 'trafo_1'].iloc[0]
+    assert real['total_pcr_replicates'] == 1
+    assert aggregate(merged).set_index('trafo_ID').loc['trafo_1', 'support_tier'] == 'provisional'
 
 
-def short(count, pcr, recovered=None, **scope):
-    return dict(counts=count, bc1=BC1, bc0=BC0, SPS=SPS, donor_bc0_fragment=FRAGMENT,
-                donor=recovered, pcr_replicate_id=pcr, **scope)
+def test_donor_recovery_crosses_the_labels_of_one_transformation(tmp_path):
+    """The yL387 fragment recovers from the donor-bc0 amplicon of plate trafo_2-1 (same transformation)."""
+    data, keys = _layout(tmp_path, [(50, 'yL387', 5)], trafo_key={'yL387': 'trafo_2'},
+                         donor_wells=[(2, 'trafo_2-1', 11)])
+    frame, _ = load_2x150_bc1_donor_bc0_data(data, keys)
+    recovered = recover_full_donors(frame, load_donor_bc0_lookup(data, keys))
+    assert recovered['donor_recovery_status'].tolist() == ['recovered_unique']
+    assert recovered['donor'].tolist() == [DONOR]
 
 
-def test_a_fragment_joins_its_recovered_link_without_2x300_data():
-    """20250912: yL442 has bc1-donor-bc0 samples but no donor-bc0 amplicon, so its fragments
-    cannot recover a donor within their own population; the same bc1 recovered in trafo_1 can."""
+def test_donor_recovery_does_not_cross_transformations(tmp_path):
+    """Control: without the trafo key, yL387 is its own scope and trafo_2-1's amplicon does not apply."""
+    data, keys = _layout(tmp_path, [(50, 'yL387', 5)], donor_wells=[(2, 'trafo_2-1', 11)])
+    frame, _ = load_2x150_bc1_donor_bc0_data(data, keys)
+    recovered = recover_full_donors(frame, load_donor_bc0_lookup(data, keys))
+    assert recovered['donor_recovery_status'].tolist() == ['no_positive_candidate']
+
+
+def test_no_short_link_attaches_after_a_2x150_only_merge():
+    """A fragment spelled with a shorter tail stays its own observation (no stacked inference)."""
+    short = DONOR[-25:] + SPS + BC0
     merged = merge_data_sources(df_2x150=pd.DataFrame([
-        short(6, 'p1', recovered=DONOR, trafo_ID='trafo_1'), short(4, 'p2', trafo_ID='yL442')]))
-    assert len(merged) == 1
-    row = merged.iloc[0]
-    assert row['donor'] == DONOR and row['total_counts'] == 10 and row['total_pcr_replicates'] == 2
-    assert populations(row) == {('trafo_1', 6), ('yL442', 4)}
+        dict(counts=6, bc1=BC1, bc0=BC0, SPS=SPS, donor_bc0_fragment=FRAGMENT, donor=DONOR,
+             pcr_replicate_id='p1', trafo_ID='trafo_1'),
+        dict(counts=4, bc1=BC1, bc0=BC0, SPS=SPS, donor_bc0_fragment=short, donor=None,
+             pcr_replicate_id='p2', trafo_ID='trafo_1')]))
+    assert len(merged) == 2
 
 
-def test_a_fragment_matching_two_recovered_links_stays_separate():
-    other = 'C' + DONOR[1:]  # same 30-nt tail, different donor
-    merged = merge_data_sources(df_2x150=pd.DataFrame([
-        short(6, 'p1', recovered=DONOR, trafo_ID='trafo_1'),
-        short(5, 'p3', recovered=other, trafo_ID='trafo_3'),
-        short(4, 'p2', trafo_ID='yL442')]))
-    assert len(merged) == 3
-    fragment_only = merged[merged['donor'].isna()].iloc[0]
-    assert fragment_only['total_counts'] == 4 and fragment_only['short_link_candidates'] == 2
-
-
-def test_gdb_annotation_ignores_the_sampled_population_but_not_the_construct():
+def test_gdb_annotation_ignores_the_sample_scope_but_not_the_construct():
+    """GDB is plasmid-level: a guide/donor/bc0 association exists before any transformation."""
     gdb = pd.DataFrame([dict(donor=DONOR, bc0=BC0, guide='T' * 20, library_ID='V546', trafo_ID='trafo_3',
                              counts=50)])
     seen = merge_data_sources(df_2x300=pd.DataFrame([full(10, 'p1', trafo_ID='trafo_4')]), df_gdb=gdb)

@@ -37,21 +37,19 @@ def test_unresolved_reads_stay_in_rows_and_in_denominator():
 
 
 def test_transformation_scope_survives_aggregation():
-    """Revised 2026-09-23 (218 patch 41; Kevin, ledger section 7 item 4).
+    """Original assertions, restored by 218 patch 45 after patch 41 had revised them.
 
-    This asserted two rows with purity [1, 1] and one PCR each. One linkage in two
-    transformations is now one row whose purity and PCR support span both, and the
-    transformation scope survives as each population's reads in population_counts.
+    Kevin, 2026-09-23: support and purity are per transformation; comparing transformations is
+    attribution, not support.
     """
     frame = pd.DataFrame(dict(bc1=['G'*20]*2, donor=['A'*129]*2, bc0=['A'*10]*2,
                               counts=[10, 20], trafo_ID=['trafo_3', 'trafo_4'],
                               pcr_replicate_id=['p1', 'p2']))
     result = aggregate(merge_data_sources(df_2x300=frame))
-    assert len(result) == 1 and result['counts'].tolist() == [30]
-    assert result['bc1_purity'].tolist() == [1]
-    assert result['num_PCR_replicates'].tolist() == [2]
-    assert {(p['trafo_ID'], p['counts']) for p in json.loads(result.iloc[0]['population_counts'])} == {
-        ('trafo_3', 10), ('trafo_4', 20)}
+    assert len(result) == 2 and sorted(result['counts']) == [10, 20]
+    assert set(result['trafo_ID']) == {'trafo_3', 'trafo_4'}
+    assert result['bc1_purity'].tolist() == [1, 1]
+    assert result['num_PCR_replicates'].tolist() == [1, 1]
 
 
 def test_collapse_retains_guide_and_uses_pcr_union():

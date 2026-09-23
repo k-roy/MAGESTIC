@@ -457,6 +457,69 @@ def _declared_or_derived_amplicon_level(key: pd.DataFrame) -> pd.Series:
     return declared.where(declared.notna(), derived)
 
 
+# Transformation scope (planning 218 patch 45; Kevin, 2026-09-23). The bc1 PCR fragment is joined to
+# the I-SceI-cut guide-donor plasmid in yeast at each transformation (utils/harmonize_oligos.py
+# construction chain), so a bc1-donor-bc0 linkage is one assembly event in one transformation. Its
+# PCR support counts separate PCR wells WITHIN that transformation; another transformation is a
+# question of attribution, not support. A key row's trafo_ID is a SAMPLE label: a plate of a
+# transformation ('trafo_2-1'), a pooled outgrowth of one transformation ('yL387'), a pool of several
+# ('yL406', 'yL442'), or 'empty'. The loaders keep that label in `trafo_label` and set trafo_ID to the
+# transformation it belongs to, which is what merge, aggregation and donor recovery key on.
+TRAFO_LABEL_COLUMN = 'trafo_label'
+# 'trafo_N-M' is plate M of transformation N: the yL406 notebook (20240702_SpG_QTL_trafo, entry of
+# 20240705) washes each transformation's three plates separately and pools the washes for outgrowth.
+_TRAFO_PLATE = re.compile(r'^(trafo_\d+)-\d+$')
+
+
+def load_transformation_map(keyfile_dir: Path) -> Dict[str, str]:
+    """yL -> the one transformation it pools, from every ``*trafo_key.tsv`` in ``keyfile_dir``.
+
+    Each file needs ``yL`` and ``trafo_ID`` columns; identity rows (yL equal to trafo_ID) add nothing.
+    A yL mapped to two different transformations is refused rather than resolved by file order.
+    """
+    mapping, sources = {}, {}
+    for path in sorted(Path(keyfile_dir).glob('*trafo_key.tsv')):
+        table = pd.read_csv(path, sep='\t', dtype=str)
+        if not {'yL', 'trafo_ID'} <= set(table.columns):
+            continue
+        for yl, trafo in zip(table['yL'], table['trafo_ID']):
+            yl, trafo = declared_value(yl), declared_value(trafo)
+            if yl is None or trafo is None or yl == trafo:
+                continue
+            if mapping.get(yl, trafo) != trafo:
+                raise ValueError(f'Trafo keys map {yl} to both {mapping[yl]} ({sources[yl]}) '
+                                 f'and {trafo} ({path.name})')
+            mapping[yl], sources[yl] = trafo, path.name
+    return mapping
+
+
+def transformation_of(label, trafo_map: Dict[str, str]) -> Optional[str]:
+    """The transformation a sample label belongs to (see TRAFO_LABEL_COLUMN).
+
+    A yL the trafo key maps to one transformation takes it; 'trafo_N-M' becomes 'trafo_N'; any other
+    label (a transformation, a pool of several, 'empty') is its own scope.
+    """
+    value = declared_value(label)
+    if value is None:
+        return None
+    if value in trafo_map:
+        return trafo_map[value]
+    plate = _TRAFO_PLATE.fullmatch(value)
+    return plate.group(1) if plate else value
+
+
+def _stamp_transformation(frame, row, trafo_map):
+    """Keep the row's sample label and scope the frame by its transformation.
+
+    Called after the PCR identity is built from the raw row, so a pooled outgrowth keeps its
+    'pooled_yL' amplicon level.
+    """
+    label = declared_value(row.get('trafo_ID')) if 'trafo_ID' in row else None
+    frame[TRAFO_LABEL_COLUMN] = label
+    frame['trafo_ID'] = transformation_of(label, trafo_map)
+    return frame
+
+
 def _attach_sample_scope(frame, row, source):
     """Keep sequence evidence; validate physical scope against sample metadata."""
     from ..core.merge import SCOPE_COLUMNS, _text
@@ -740,6 +803,7 @@ def load_2x300_data(
             on incomplete coverage (unless require_full_coverage is False).
     """
     logger.info("Loading 2x300 bp data...")
+    trafo_map = load_transformation_map(keyfile_dir)
 
     # Load ALL matching plate keyfiles (recent screens ship one per sequencing
     # date; each carries that date's gDNA_plate_name needed by the replicate
@@ -927,6 +991,7 @@ def load_2x300_data(
                         'sample_listed_polymerase'):
                 df[col] = row.get(col) if pd.notna(row.get(col)) else 'NA'
             df['pcr_replicate_id'] = build_pcr_replicate_id(row)
+            df = _stamp_transformation(df, row, trafo_map)
             df['sequencing_run'] = '2x300'
             df['data_source'] = '2x300'
 
@@ -1084,6 +1149,7 @@ def load_2x150_bc1_donor_bc0_data(
             return pd.DataFrame(), DataSourceInfo("2x150", 0, 0, 0, [])
 
     combined_key = pd.read_csv(keyfile_path, sep='\t')
+    trafo_map = load_transformation_map(keyfile_dir)
 
     if 'plate_polymerase' not in combined_key and 'polymerase' in combined_key:
         combined_key = combined_key.rename(columns={'polymerase': 'plate_polymerase'})
@@ -1135,6 +1201,7 @@ def load_2x150_bc1_donor_bc0_data(
             for col in ('plate_polymerase', 'condition', 'amplicon_level'):
                 df[col] = row.get(col) if pd.notna(row.get(col)) else None
             df['pcr_replicate_id'] = build_pcr_replicate_id(row)
+            df = _stamp_transformation(df, row, trafo_map)
             df['sequencing_run'] = '2x150'
             df['data_source'] = '2x150'
 
@@ -1210,6 +1277,7 @@ def load_donor_bc0_lookup(
             return pd.DataFrame()
 
     combined_key = pd.read_csv(keyfile_path, sep='\t')
+    trafo_map = load_transformation_map(keyfile_dir)
 
     # Filter to donor-bc0 amplicons
     if 'description' in combined_key.columns:
@@ -1255,6 +1323,9 @@ def load_donor_bc0_lookup(
                     if column in df and any(_text(item) not in (None, value) for item in df[column]):
                         raise ValueError(f'Donor-recovery metadata conflicts for {column}: {filepath}')
                     df[column] = value
+            # Donor candidates pool within a transformation: a pooled outgrowth may recover
+            # from its own transformation's donor-bc0 amplicon (planning 218 patch 45).
+            df = _stamp_transformation(df, row, trafo_map)
             df['source_file'] = str(filepath.resolve())
             cols = ['counts', 'donor', 'donor_bc0_fragment', 'bc0', 'sample_number',
                     *SCOPE_COLUMNS, 'SPS', 'source_file']
