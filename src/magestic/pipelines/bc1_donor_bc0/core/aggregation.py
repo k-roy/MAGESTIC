@@ -1,6 +1,7 @@
 """Aggregate observed links while retaining scoped denominator and PCR evidence."""
 from collections import defaultdict
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,15 @@ from ..readers.data_loader import count_distinct_pcrs
 # transformation (planning 218 patch 45): a barcode's purity denominator is taken within
 # it. V_library/library_ID/SPS are retained as link evidence, never used to partition a
 # purity denominator. Each link keeps its reads per sample label in population_counts.
+
+# A real transformation is a trafo_N scope: the loaders map a plate (trafo_N-M) and a trafo-key yL
+# to it (patch 45). Pools of several transformations, 'empty' wells and undeclared rows are not.
+REAL_TRANSFORMATION = re.compile(r'trafo_\d+')
+
+
+def _real_transformation(value):
+    text = _text(value)
+    return text if text is not None and REAL_TRANSFORMATION.fullmatch(text) else None
 
 
 def _flag(value, default=False):
@@ -151,7 +161,8 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
                               ('unresolved_bc1_counts', float), ('num_distinct_donors', int),
                               ('num_PCR_replicates', int), ('support_tier', object),
                               ('pcr_replicate_ids', object), ('barcode_identity_ambiguous', bool),
-                              ('population_counts', object)]:
+                              ('population_counts', object), ('bc1_real_transformations', int),
+                              ('bc1_transformation_reads', object), ('transformation_read_share', float)]:
             frame[column] = pd.Series(dtype=dtype)
         return frame
 
@@ -249,6 +260,23 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
     result['barcode_identity_ambiguous'] = ambiguities
     result['bc1_purity'] = result['counts'] / result['total_bc1_counts'].replace(0, np.nan)
     result['num_distinct_donors'] = result.groupby(scopes + ['bc1'], dropna=False)['donor'].transform('nunique')
+    # Cross-transformation attribution (patch 46; Kevin, 2026-09-23). A bc1 seen in two
+    # transformations is a collision or carry-over, judged by comparing its reads there rather than
+    # by adding support. Each row reports its bc1's reads per real transformation, how many there
+    # are and its own transformation's share. All reads count, as in the purity denominator, and no
+    # threshold is applied.
+    real = (result['trafo_ID'].map(_real_transformation) if 'trafo_ID' in result
+            else pd.Series(None, index=result.index, dtype=object))
+    per_bc1 = defaultdict(dict)
+    for bc1, transformation, count in zip(result['bc1'], real, result['counts']):
+        if bc1 is not None and transformation is not None and count:
+            per_bc1[bc1][transformation] = per_bc1[bc1].get(transformation, 0) + count
+    reads = [per_bc1.get(bc1, {}) for bc1 in result['bc1']]
+    result['bc1_real_transformations'] = [len(value) for value in reads]
+    result['bc1_transformation_reads'] = [json.dumps(dict(sorted(value.items()))) for value in reads]
+    result['transformation_read_share'] = [value.get(transformation, 0) / sum(value.values())
+                                           if transformation is not None and value else np.nan
+                                           for value, transformation in zip(reads, real)]
     # Identity strings from routes that declare different fields can name one PCR, so
     # support is the fewest PCRs consistent with them; an inferred merge is inexact.
     support = [count_distinct_pcrs(value) for value in result['_pcr_ids']]
