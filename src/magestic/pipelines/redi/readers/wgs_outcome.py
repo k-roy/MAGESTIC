@@ -15,6 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+from .keyfiles import _read_key
 
 
 def load_wgs_outcome(
@@ -31,11 +32,18 @@ def load_wgs_outcome(
     keep_cols : optional whitelist; if provided, only these columns are kept
         (besides the renamed `bc1`).
     """
-    df = pd.read_csv(path, sep="\t")
-    if bc1_col in df.columns and bc1_col != "bc1":
+    df = _read_key(path)
+    if bc1_col not in df:
+        raise ValueError(f'WGS outcome missing barcode observation column {bc1_col!r}')
+    if bc1_col != 'bc1' and 'bc1' in df:
+        raise ValueError('barcode observation rename collision with existing bc1')
+    if bc1_col != "bc1":
         df = df.rename(columns={bc1_col: "bc1"})
     if keep_cols is not None:
-        cols = [c for c in keep_cols if c in df.columns]
+        missing = set(keep_cols) - set(df)
+        if missing:
+            raise ValueError(f'WGS outcome missing requested columns: {sorted(missing)}')
+        cols = list(dict.fromkeys(keep_cols))
         if "bc1" not in cols:
             cols.append("bc1")
         df = df[cols].drop_duplicates().reset_index(drop=True)
@@ -44,25 +52,44 @@ def load_wgs_outcome(
 
 def load_wgs_plate_key(
     wgs_plate_key_path: str | Path,
-    plate_384_to_96_format_path: str | Path,
+    plate_384_to_96_format_path: str | Path | None = None,
 ) -> pd.DataFrame:
-    """Load WGS_plate_key.tsv and attach 96-well sample_number via 384→96 format.
+    """Load independent sample→physical-position registration.
 
-    Ports step_g's `WGS_plate_key_df` construction. The result has columns:
-
-        plate_384, row_384, col_384, row_96, col_96, sample_number,
-        sequencing_date, "Nextera outer primer set", sample_name
+    Prefer explicit sample_name and four position columns. Legacy plate-level
+    tables require an explicit sample_number in the 384→96 format. Row order
+    never defines identity.
     """
-    plate_384_to_96 = pd.read_csv(plate_384_to_96_format_path, sep="\t")
-    plate_96 = plate_384_to_96[["row_96", "col_96"]].drop_duplicates().reset_index(drop=True)
-    plate_96["sample_number"] = "sample_" + (plate_96.index + 1).astype(str)
-    plate_384_to_96 = plate_384_to_96.merge(
-        plate_96[["row_96", "col_96", "sample_number"]],
-        on=["row_96", "col_96"],
-        how="left",
-    )
-    wgs_plate_key = pd.read_csv(wgs_plate_key_path, sep="\t")
-    wgs_plate_key = wgs_plate_key.merge(plate_384_to_96)
+    from ..core.identity import POSITION_COLUMNS, keyed_frame
+    wgs_plate_key=_read_key(wgs_plate_key_path)
+    if 'sample_name' in wgs_plate_key:
+        out=keyed_frame(wgs_plate_key,['sample_name'],label='WGS plate registration')
+        return keyed_frame(out,POSITION_COLUMNS,label='WGS plate registration',unique=False)
+    if plate_384_to_96_format_path is None:
+        raise ValueError('legacy WGS registration requires format with explicit sample_number')
+    fmt=_read_key(plate_384_to_96_format_path)
+    # Require the real sequencing-index registration before choosing a geometry
+    # schema. Neither a 96-well nor 384-well row order establishes this identity.
+    fmt=keyed_frame(fmt,['sample_number'],label='384-to-96 format',unique=False)
+    if 'plate_96' in wgs_plate_key and 'plate_96' in fmt:
+        plate_column='plate_96'
+    elif 'plate_384' in wgs_plate_key and 'plate_384' in fmt:
+        plate_column='plate_384'
+    else:
+        raise ValueError('WGS key and geometry need the same explicit plate_96 or plate_384 registration')
+    fmt=keyed_frame(fmt,[plate_column,'row_384','col_384'],label='384-to-96 format')
+    fmt=keyed_frame(fmt,[plate_column,'sample_number'],label='format sequencing sample registration')
+    required=[plate_column,'sequencing_date','Nextera outer primer set']
+    wgs_plate_key=keyed_frame(wgs_plate_key,required,label='legacy WGS registration',unique=False)
+    join=[plate_column]+[c for c in ('row_384','col_384') if c in wgs_plate_key]
+    collisions=(set(wgs_plate_key)&set(fmt))-set(join)
+    if collisions:
+        raise ValueError(f'ambiguous legacy registration/format columns: {sorted(collisions)}')
+    wgs_plate_key=wgs_plate_key.merge(fmt,on=join,how='left',indicator=True)
+    if wgs_plate_key['_merge'].ne('both').any():
+        raise ValueError('plate format missing for explicitly registered WGS join coordinates')
+    wgs_plate_key=wgs_plate_key.drop(columns='_merge')
+    wgs_plate_key=keyed_frame(wgs_plate_key,['sample_number'],label='expanded WGS registration',unique=False)
     wgs_plate_key["sample_name"] = (
         wgs_plate_key["sequencing_date"].astype(str)
         + "_"
@@ -70,4 +97,4 @@ def load_wgs_plate_key(
         + "_"
         + wgs_plate_key["sample_number"]
     )
-    return wgs_plate_key
+    return keyed_frame(wgs_plate_key,['sample_name'],label='expanded WGS registration')

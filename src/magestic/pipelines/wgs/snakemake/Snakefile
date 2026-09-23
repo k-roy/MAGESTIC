@@ -1,105 +1,16 @@
-"""
-Snakemake workflow for the MAGESTIC wgs pipeline (per-sample fan-out over BAMs).
-===============================================================================
+"""Per-sample WGS workflow using the same config, manifest and stage CLIs as direct execution.
 
-PATH (B) of the dual-path program (ARCHITECTURE_POLICY §2/§4). Every rule's
-`shell:` block invokes the INSTALLED console script that path (A) also calls, so
-there is exactly ONE entry point per step and byte-identical output is
-STRUCTURAL rather than a convention someone has to maintain. This is the "REDI
-pattern" of §9, and it is why no rule here passes an analysis parameter on a
-command line (see PARITY RULE below).
-
-Unlike the REDI exemplar, this workflow ships a rule for EVERY step including the
-last — redi's `rule all` stops at step_e while steps f/g/h have console scripts
-but no rules, so the exemplar violates its own §2/§4.
-
-Invocation (either form resolves to this file):
-
-    snakemake --snakefile workflow/Snakefile.wgs \
-              --workflow-profile workflow/profiles/sherlock_wgs \
-              --config config=workflow/config/screens/<cohort>_wgs.yaml steps=1
-
-    snakemake --snakefile $(python -c "import magestic.pipelines.wgs.snakemake as m; print(m.__path__[0])")/Snakefile \
-              -j 24 --config config=/path/to/<cohort>_wgs.yaml steps=1
-
-🔴 `--config config=<yaml>`, NOT `--configfile <yaml>`.
-The cohort YAML is interpreted by `magestic.pipelines.wgs.config.load_config()`
-inside each step CLI. This workflow reads the same document only to compose file
-names, the fan-out list and scheduling resources — never to make an analysis
-decision. `--configfile` would make snakemake a second, divergent interpreter of
-it (different defaults, different coercions) and would break §4 parity silently.
-It also would not work: `load_config()` REJECTS any top-level key it does not
-know, so the workflow's own knobs (`steps`) cannot live in that document and are
-passed as snakemake config entries instead.
-
-PARITY RULE (do not weaken it)
-------------------------------
-Every rule's command is exactly
-
-    magestic-wgs-<step> --config {CONFIG_PATH} [--sample {wildcards.sample}] 2>&1 | tee {log}
-
-No value read from the cohort YAML may ever reach a command string — not a
-threshold, not a window size, not `{threads}`. The moment a rule renders
-`--min-support {params.x}`, path A (via `load_config`) and path B (via
-`yaml.safe_load` here) can disagree, and the dual-path parity test dies quietly.
-`threads:` / `resources:` from the YAML are fine: they are scheduling, and they
-never appear in a command.
-
-CONTRACT WITH THE STEP CLIs (implemented in `pipeline/`, called from here)
--------------------------------------------------------------------------
-1. `magestic-wgs-<step> --config <yaml> --sample <S>` writes exactly that
-   sample's shard(s). It is idempotent and skip-checks its own outputs at task
-   start (§6), which is what makes an interrupted SLURM array task resumable;
-   snakemake's DAG gives the same skip independently.
-2. `magestic-wgs-<step> --config <yaml>` with NO `--sample` is the cohort fan-in:
-   it computes only the shards that are missing and then concatenates every
-   shard IN MANIFEST ORDER. Under path (B) the per-sample rules have already
-   produced them all, so it degenerates to a pure ordered concatenation — one
-   code path for both orchestrators, which is what makes §4 structural.
-   A missing shard must RAISE (`_common.collect_shards` does), never yield a
-   short cohort table.
-3. Row order in every cohort table is MANIFEST order in both paths. Not glob
-   order, not sorted basename — sorted basename puts `clone_10` before `clone_2`,
-   and the two paths would then differ for an entirely boring reason.
-
-PATHS ARE COMPOSED FROM `config.py`'s LITERALS
-----------------------------------------------
-This file cannot import magestic (the snakemake env need not have it), so it
-re-derives the output layout from the same subdirectory literals `config.py`
-declares (`BC1_SUBDIR` = "bc1_calls", …) and the same `_under_root` defaulting
-`load_config()` applies. If the two derivations drift, the paths write to
-different directories and the §4 test fails looking like a DATA difference
-rather than a path bug. Anything changed there must be changed here in the same
-commit — config.py's own comment says so from the other side.
-
-CHUNKED / ARRAY EXECUTION (§5, §6)
-----------------------------------
-Each per-sample rule carries a `group:`. Set `--group-components <group>=N` (see
-workflow/profiles/sherlock_wgs/config.yaml) to pack N samples into one cluster
-job and land in the 20–60 min window the preemptible queue requires. N is
-scheduling only: it changes neither the outputs nor their order.
-
-SNAKEMAKE CONFIG ENTRIES (passed with `--config`, NOT in the cohort YAML)
--------------------------------------------------------------------------
-    config=<path>   REQUIRED. The cohort YAML both paths read.
-    steps=1,3,4     Optional. Mirrors path (A)'s `--steps`. Default "1,2,3,4,5",
-                    the same default `run_pipeline.main` applies
-                    (`--from-step 1 --end-step 5`). 🔴 If the two paths select
-                    different steps they emit different FILE SETS, and the parity
-                    diff reports a config mismatch as a §4 violation.
-
-NOT SUPPORTED HERE: `--use-scratch`. The per-step CLIs expose no such flag (only
-the `magestic-wgs` umbrella does), so path (B) always writes to
-`paths.processed`. Running path (A) with `--use-scratch` and path (B) without it
-compares two different trees.
-
-Author: Kevin R. Roy
+Run with --config config=/path/to/cohort.yaml steps=1,2,3,4,5.
+The Snakemake environment must import the same MAGESTIC/TRACE checkout as its
+stage commands. Analysis parameters are read only by the shared config loader;
+resources below affect scheduling only. Shell values use Snakemake :q quoting.
+Completion caches validate source, inputs and all stage companions. Snakemake
+also declares companions so deleting one invokes that validation on restart.
 """
 
 import re
 from pathlib import Path
 
-import pandas as pd
 import yaml
 
 # `2>&1 | tee {log}` returns *tee's* exit status, so without pipefail a step CLI
@@ -187,34 +98,18 @@ PATHS = CFG.get("paths") or {}
 if not PATHS.get("project_root"):
     raise ValueError(f"{CONFIG_PATH}: `paths.project_root` is required")
 
-PROJECT_ROOT = Path(PATHS["project_root"]).expanduser()
+from magestic.pipelines.wgs.config import load_config as _load_wgs_config
+from magestic.pipelines.wgs.core.manifest import load_manifest as _load_wgs_manifest
+from magestic.pipelines.wgs.pipeline._common import cache_key as _stage_cache_key
+from magestic.pipelines.wgs.readers.bam_inventory import index_path as _bam_index_path
+import json as _json
 
-
-def under_root(key, default):
-    """Resolve one `paths:` key, mirroring `config.load_config`'s `_under_root`."""
-    raw = Path(PATHS.get(key) or default).expanduser()
-    return raw if raw.is_absolute() else PROJECT_ROOT / raw
-
-
-MANIFEST_PATH = under_root("manifest", "keyfiles/sample_manifest.tsv")
-PROCESSED_DIR = under_root("processed", "processed_data")
-INTERMEDIATE_DIR = under_root("intermediate", "intermediate_data")
-
-# `paths.logs` is a DERIVED property in config.py (`processed / "logs"`), not a
-# YAML key — so it is composed, never read.
-#
-# 🔴 Consequence for the §4 parity diff, stated here because it is not free: the
-# logs live INSIDE paths.processed, and only path (B) writes them (`2>&1 | tee
-# {log}`), with wall-clock text inside. A diff of the two processed trees must
-# therefore exclude `<processed>/logs/` alongside the pre-registered
-# `*.provenance.json` / `PROVENANCE.json` carve-out. Source of nondeterminism:
-# wall-clock time and per-rule scheduling. Everything else is diffed unmodified.
-# 🔴 INTERMEDIATE, not PROCESSED — must track `config.WGSPaths.logs`. These logs are
-# written by path (B) only and carry wall-clock text, so inside `processed/` they make a
-# literal diff of the two paths' processed trees differ on every run and be reported as a
-# §4 parity violation (F6) when it is nothing of the kind. Keeping them out of the
-# compared tree removes the need for a second pre-registered carve-out.
-LOGS_DIR = INTERMEDIATE_DIR / LOGS_SUBDIR
+_WGS_CONFIG = _load_wgs_config(CONFIG_PATH)
+PROJECT_ROOT = _WGS_CONFIG.paths.project_root
+MANIFEST_PATH = _WGS_CONFIG.paths.manifest
+PROCESSED_DIR = _WGS_CONFIG.paths.processed
+INTERMEDIATE_DIR = _WGS_CONFIG.paths.intermediate
+LOGS_DIR = _WGS_CONFIG.paths.logs
 
 BC1_DIR = PROCESSED_DIR / BC1_SUBDIR
 DONOR_DIR = PROCESSED_DIR / DONOR_PRECALL_SUBDIR
@@ -232,9 +127,7 @@ JOIN_TABLE = PROCESSED_DIR / JOIN_TABLE_NAME
 JOIN_MATRIX = PROCESSED_DIR / JOIN_MATRIX_NAME
 JOIN_DISAGREEMENTS = PROCESSED_DIR / JOIN_DISAGREEMENT_NAME
 
-PLATE_VCFS = [
-    str(Path(p).expanduser()) for p in (CFG.get("donor_precall") or {}).get("plate_vcfs", [])
-]
+PLATE_VCFS = [str(p) for p in _WGS_CONFIG.donor_precall.plate_vcfs]
 
 
 # =============================================================================
@@ -251,74 +144,28 @@ MANIFEST_OPTIONAL_COLUMNS = ("cohort", "plate", "background")
 if not MANIFEST_PATH.is_file():
     raise ValueError(f"{CONFIG_PATH}: paths.manifest does not exist: {MANIFEST_PATH}")
 
-MANIFEST = pd.read_csv(MANIFEST_PATH, sep="\t", dtype=str, comment="#").fillna("")
-
-_missing_cols = [c for c in MANIFEST_REQUIRED_COLUMNS if c not in MANIFEST.columns]
-if _missing_cols:
-    raise ValueError(
-        f"{MANIFEST_PATH}: missing required column(s) {_missing_cols}; "
-        f"required={list(MANIFEST_REQUIRED_COLUMNS)} "
-        f"optional={list(MANIFEST_OPTIONAL_COLUMNS)} (found={list(MANIFEST.columns)})"
-    )
-
-SAMPLES = [s.strip() for s in MANIFEST["sample"].tolist() if s.strip()]
-if not SAMPLES:
-    raise ValueError(
-        f"{MANIFEST_PATH}: 0 usable rows — the fan-out would be empty and `rule all` "
-        "would succeed having produced nothing."
-    )
-
-_duplicates = sorted({s for s in SAMPLES if SAMPLES.count(s) > 1})
-if _duplicates:
-    raise ValueError(
-        f"{MANIFEST_PATH}: duplicate sample id(s) {_duplicates} — one shard path would "
-        "be claimed by two rows and the cohort row count would not match the manifest."
-    )
-
-for _column in MANIFEST_REQUIRED_COLUMNS:
-    _blank = [
-        row["sample"] for _, row in MANIFEST.iterrows() if row["sample"] and not row[_column].strip()
-    ]
-    if _blank:
-        raise ValueError(
-            f"{MANIFEST_PATH}: {len(_blank)} row(s) have a blank {_column!r} "
-            f"(first: {_blank[0]}). Reference in particular is a per-SAMPLE attribute "
-            "(D1) — one BAM directory was measured to span two references, so a blank "
-            "cannot be defaulted to the cohort's."
-        )
-
-BAM_BY_SAMPLE = dict(zip(MANIFEST["sample"].str.strip(), MANIFEST["bam"].str.strip()))
+_RECORDS = _load_wgs_manifest(MANIFEST_PATH, reference_root=_WGS_CONFIG.paths.reference_root)
+_RECORD_BY_SAMPLE = {r.sample: r for r in _RECORDS}
+SAMPLES = [r.sample for r in _RECORDS]
+COMMON_INPUTS = [str(CONFIG_PATH), str(MANIFEST_PATH)]
 
 
 def bam_path(sample):
-    """Absolute BAM path for a sample.
-
-    Relative manifest values resolve against the MANIFEST'S OWN PARENT, exactly as
-    `core.manifest._resolve` does (so a manifest can be relocated with its data).
-    Resolving them against `paths.processed` or a `bam_dir` key would silently
-    disagree with path (A) — and `bam_dir` is a forbidden config key precisely
-    because BAMs are never discovered by glob.
-    """
-    raw = Path(BAM_BY_SAMPLE[sample]).expanduser()
-    return raw if raw.is_absolute() else MANIFEST_PATH.parent / raw
+    return _RECORD_BY_SAMPLE[sample].bam
 
 
 def bam_index_path(sample):
-    """Index for a sample's BAM.
-
-    Stages 1, 3 and 4 all reach the BAM through `fetch`/`pileup`, which require an
-    index, and TRACE documents neither requirement. Declaring the index as a rule
-    input turns a missing `.bai` into a loud DAG error before any compute instead
-    of an opaque pysam failure inside a cluster job. Both house conventions are
-    accepted (`<name>.bam.bai` and `<name>.bai`); when neither exists the
-    companion form is returned so the error names the expected path.
-    """
     bam = bam_path(sample)
-    companion = Path(str(bam) + ".bai")
-    sibling = bam.with_suffix(".bai")
-    if companion.exists() or not sibling.exists():
-        return companion
-    return sibling
+    return _bam_index_path(bam) or Path(str(bam)+'.bai')
+
+
+def reference_path(sample):
+    return _RECORD_BY_SAMPLE[sample].reference
+
+
+def stage_identity(step, sample=None):
+    record = _RECORD_BY_SAMPLE[sample] if sample is not None else None
+    return _json.dumps(_stage_cache_key(_WGS_CONFIG, step, record), sort_keys=True)
 
 
 wildcard_constraints:
@@ -344,6 +191,9 @@ STEP_TARGETS = {
     "5": [JOIN_TABLE, JOIN_MATRIX, JOIN_DISAGREEMENTS],
 }
 STEP_REQUIRES = {"4": ("1",), "5": ("2", "4")}
+from magestic.pipelines.wgs.pipeline.step_4_reconcile import uses_cleaned_reads as _uses_cleaned_reads
+if _uses_cleaned_reads(_WGS_CONFIG):
+    STEP_REQUIRES["4"] = ("1", "3")
 
 _steps_arg = config.get("steps", ",".join(sorted(STEP_TARGETS)))
 STEPS = [s.strip() for s in str(_steps_arg).replace(" ", ",").split(",") if s.strip()]
@@ -427,7 +277,7 @@ rule all:
     """
     default_target: True
     input:
-        TARGETS,
+        lambda wildcards: TARGETS,
 
 
 # =============================================================================
@@ -441,11 +291,15 @@ rule wgs_step_1_bc1_call:
     genome-vs-plasmid canonical agreement acceptance criterion P5 is defined over.
     """
     input:
+        configuration=COMMON_INPUTS,
         bam=lambda wildcards: bam_path(wildcards.sample),
         bai=lambda wildcards: bam_index_path(wildcards.sample),
+        reference=lambda wildcards: reference_path(wildcards.sample),
     output:
         shard=BC1_DIR / ("{sample}" + BC1_SHARD_SUFFIX),
         tracks=BC1_DIR / ("{sample}" + BC1_TRACKS_SHARD_SUFFIX),
+    params:
+        identity=lambda wildcards: stage_identity("1", wildcards.sample),
     log:
         LOGS_DIR / "step_1_bc1_{sample}.log",
     group:
@@ -455,17 +309,20 @@ rule wgs_step_1_bc1_call:
         mem_mb=res("step_1_bc1", "mem_mb"),
         runtime=runtime_min("step_1_bc1"),
     shell:
-        "magestic-wgs-bc1 --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+        "magestic-wgs-bc1 --config {CONFIG_PATH:q} --sample {wildcards.sample:q} 2>&1 | tee {log:q}"
 
 
 rule wgs_step_1_combine:
     """Stage 1 fan-in — concatenate the bc1 shards in manifest order."""
     input:
+        configuration=COMMON_INPUTS,
         shards=expand(str(BC1_DIR / ("{sample}" + BC1_SHARD_SUFFIX)), sample=SAMPLES),
         tracks=expand(str(BC1_DIR / ("{sample}" + BC1_TRACKS_SHARD_SUFFIX)), sample=SAMPLES),
     output:
         table=BC1_TABLE,
         tracks_table=BC1_TRACKS_TABLE,
+    params:
+        identity=stage_identity("1"),
     log:
         LOGS_DIR / "step_1_bc1_combine.log",
     threads: res("step_1_bc1", "cpus")
@@ -473,25 +330,16 @@ rule wgs_step_1_combine:
         mem_mb=res("step_1_bc1", "mem_mb"),
         runtime=runtime_min("step_1_bc1"),
     shell:
-        "magestic-wgs-bc1 --config {CONFIG_PATH} 2>&1 | tee {log}"
+        "magestic-wgs-bc1 --config {CONFIG_PATH:q} 2>&1 | tee {log:q}"
 
 
 # =============================================================================
-# Stage 2 — donor-window editing outcome (TRACE donor_outcome)  🔴 GATED
+# Stage 2 — donor-window editing outcome (TRACE donor_outcome)
 # =============================================================================
-# Stage 2 ships GATED three ways (spec §8.1–§8.3) and cannot run on the cohorts
-# inventoried so far. The rules exist because §4 requires a rule per step, and
-# because enforcing the gates is the step CLI's job, not the workflow's:
-#   GATE 1  no per-oligo step-2 donor exists for the 2021 pool, so the
-#           SYNTHETIC_ERROR axis is disabled and the output must be STAMPED so;
-#   GATE 2  no gVCF exists anywhere, so `unedited` cannot be separated from
-#           `unknown`;
-#   GATE 3  `precall_sample` re-parses its own `chrom_pos_ref_to_alt` id with
-#           split("_") and crashes on the `integrated_plasmid_<oligo>` contigs the
-#           composite-reference standard puts in EVERY reference.
-# Selecting step 2 before those close is expected to fail loudly in the CLI.
+# Stage 2 requires explicit donor assignments, called variants and per-sample gVCF.
+# Missing empirical donor disables its synthetic-error axis; it is recorded in output.
 rule wgs_step_2_donor_precall:
-    """Stage 2 — donor-window editing outcome for ONE sample (GATED; see §8).
+    """Stage 2 — donor-window editing outcome for ONE sample.
 
     The per-plate 96-sample bcftools VCFs come from `donor_precall.plate_vcfs` in
     the cohort YAML (`core/vcf_adapter.py` splits them per sample and remaps AD
@@ -499,9 +347,16 @@ rule wgs_step_2_donor_precall:
     when a VCF changes; the list is legitimately empty on a cohort that has none.
     """
     input:
+        configuration=COMMON_INPUTS,
         plate_vcfs=PLATE_VCFS,
+        gvcf=lambda wildcards: _WGS_CONFIG.paths.precall_gvcf / f"{wildcards.sample}.g.vcf",
+        sample_vcf=lambda wildcards: [] if PLATE_VCFS else [_WGS_CONFIG.paths.precall_vcf / f"{wildcards.sample}.fil.vcf"],
+        reference=lambda wildcards: reference_path(wildcards.sample),
     output:
         shard=DONOR_DIR / ("{sample}" + DONOR_SHARD_SUFFIX),
+        samplesheet=_WGS_CONFIG.paths.samplesheets / "{sample}.samplesheet.tsv",
+    params:
+        identity=lambda wildcards: stage_identity("2", wildcards.sample),
     log:
         LOGS_DIR / "step_2_donor_{sample}.log",
     group:
@@ -511,15 +366,18 @@ rule wgs_step_2_donor_precall:
         mem_mb=res("step_2_donor_precall", "mem_mb"),
         runtime=runtime_min("step_2_donor_precall"),
     shell:
-        "magestic-wgs-donor-precall --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+        "magestic-wgs-donor-precall --config {CONFIG_PATH:q} --sample {wildcards.sample:q} 2>&1 | tee {log:q}"
 
 
 rule wgs_step_2_combine:
-    """Stage 2 fan-in — concatenate the donor-outcome shards (GATED; see §8)."""
+    """Stage 2 fan-in — concatenate the donor-outcome shards."""
     input:
+        configuration=COMMON_INPUTS,
         shards=expand(str(DONOR_DIR / ("{sample}" + DONOR_SHARD_SUFFIX)), sample=SAMPLES),
     output:
         table=DONOR_TABLE,
+    params:
+        identity=stage_identity("2"),
     log:
         LOGS_DIR / "step_2_donor_combine.log",
     threads: res("step_2_donor_precall", "cpus")
@@ -527,25 +385,35 @@ rule wgs_step_2_combine:
         mem_mb=res("step_2_donor_precall", "mem_mb"),
         runtime=runtime_min("step_2_donor_precall"),
     shell:
-        "magestic-wgs-donor-precall --config {CONFIG_PATH} 2>&1 | tee {log}"
+        "magestic-wgs-donor-precall --config {CONFIG_PATH:q} 2>&1 | tee {log:q}"
 
 
 # =============================================================================
 # Stage 3 — plasmid integration + donor-read cleaning (TRACE sv_plasmid)
 # =============================================================================
-# Half B also writes TRACE's `{out_bam}.target_filtering.anno` and a cleaned BAM
-# beside the shard. Those are deliberately NOT declared as rule outputs: they
-# exist only for samples that have a donor window, and declaring them would turn
-# an expected condition into a "missing output" failure. They are still covered
-# by the §4 parity diff, which walks paths.processed rather than the declared
-# outputs.
+# Optional Half B companions have separate recovery rules after the sample shard.
+# Their targets are derived using the same assignment/window contract as Stage 3.
+from magestic.pipelines.wgs.pipeline import step_3_sv_plasmid as _s3
+HALF_B_SAMPLES = []
+if "3" in STEPS and _WGS_CONFIG.reconcile.oligo_windows is not None and _WGS_CONFIG.reconcile.oligo_assignments is not None:
+    _windows = _s3._donor_windows(_WGS_CONFIG)
+    HALF_B_SAMPLES = [s for s in SAMPLES if _s3._assigned_oligo(_WGS_CONFIG, s) in _windows]
+HALF_B_BAMS = [str(_s3.cleaned_bam_path(_WGS_CONFIG,s)) for s in HALF_B_SAMPLES]
+HALF_B_ANNOS = [p+".target_filtering.anno" for p in HALF_B_BAMS]
+HALF_B_INDEXES = [str(_s3.cleaned_bam_index_path(_WGS_CONFIG,s)) for s in HALF_B_SAMPLES]
+TARGETS.extend(HALF_B_BAMS + HALF_B_ANNOS + HALF_B_INDEXES)
+
 rule wgs_step_3_sv_plasmid:
     """Stage 3 — plasmid-integration counts and donor-read cleaning for ONE sample."""
     input:
+        configuration=COMMON_INPUTS,
         bam=lambda wildcards: bam_path(wildcards.sample),
         bai=lambda wildcards: bam_index_path(wildcards.sample),
+        reference=lambda wildcards: reference_path(wildcards.sample),
     output:
         shard=SV_DIR / ("{sample}" + SV_SHARD_SUFFIX),
+    params:
+        identity=lambda wildcards: stage_identity("3", wildcards.sample),
     log:
         LOGS_DIR / "step_3_sv_{sample}.log",
     group:
@@ -555,7 +423,42 @@ rule wgs_step_3_sv_plasmid:
         mem_mb=res("step_3_sv_plasmid", "mem_mb"),
         runtime=runtime_min("step_3_sv_plasmid"),
     shell:
-        "magestic-wgs-sv-plasmid --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+        "magestic-wgs-sv-plasmid --config {CONFIG_PATH:q} --sample {wildcards.sample:q} 2>&1 | tee {log:q}"
+
+
+rule wgs_step_3_cleaned_companions:
+    """Restore a missing cleaned BAM/annotation through the actual Stage 3 cache."""
+    input:
+        shard=SV_DIR / ("{sample}" + SV_SHARD_SUFFIX),
+    output:
+        bam=SV_DIR / "{sample}.donor_cleaned.bam",
+        anno=SV_DIR / "{sample}.donor_cleaned.bam.target_filtering.anno",
+    log:
+        LOGS_DIR / "step_3_companions_{sample}.log",
+    threads: 1
+    resources:
+        mem_mb=res("step_3_sv_plasmid", "mem_mb"),
+        runtime=runtime_min("step_3_sv_plasmid"),
+    shell:
+        "magestic-wgs-sv-plasmid --config {CONFIG_PATH:q} --sample {wildcards.sample:q} 2>&1 | tee {log:q}"
+
+
+rule wgs_step_3_cleaned_index:
+    """BAI or CSI is a real recoverable output, never an existence-only marker."""
+    input:
+        bam=SV_DIR / "{sample}.donor_cleaned.bam",
+    output:
+        index=SV_DIR / "{sample}.donor_cleaned.bam.{index_type}",
+    wildcard_constraints:
+        index_type="bai|csi",
+    log:
+        LOGS_DIR / "step_3_index_{sample}.{index_type}.log",
+    threads: 1
+    resources:
+        mem_mb=res("step_3_sv_plasmid", "mem_mb"),
+        runtime=runtime_min("step_3_sv_plasmid"),
+    shell:
+        "magestic-wgs-sv-plasmid --config {CONFIG_PATH:q} --sample {wildcards.sample:q} 2>&1 | tee {log:q}"
 
 
 rule wgs_step_3_combine:
@@ -565,10 +468,16 @@ rule wgs_step_3_combine:
     `plasmid_integration_summary.tsv` is orchestration-owned (spec §2.5).
     """
     input:
+        configuration=COMMON_INPUTS,
         shards=expand(str(SV_DIR / ("{sample}" + SV_SHARD_SUFFIX)), sample=SAMPLES),
+        cleaned=HALF_B_BAMS,
+        annotations=HALF_B_ANNOS,
+        indexes=HALF_B_INDEXES,
     output:
         table=SV_TABLE,
         integration=SV_INTEGRATION_TABLE,
+    params:
+        identity=stage_identity("3"),
     log:
         LOGS_DIR / "step_3_sv_combine.log",
     threads: res("step_3_sv_plasmid", "cpus")
@@ -576,7 +485,7 @@ rule wgs_step_3_combine:
         mem_mb=res("step_3_sv_plasmid", "mem_mb"),
         runtime=runtime_min("step_3_sv_plasmid"),
     shell:
-        "magestic-wgs-sv-plasmid --config {CONFIG_PATH} 2>&1 | tee {log}"
+        "magestic-wgs-sv-plasmid --config {CONFIG_PATH:q} 2>&1 | tee {log:q}"
 
 
 # =============================================================================
@@ -585,14 +494,20 @@ rule wgs_step_3_combine:
 rule wgs_step_4_reconcile:
     """Stage 4 — reconcile edits for ONE sample against its Stage 1 barcode counts."""
     input:
+        configuration=COMMON_INPUTS,
         bam=lambda wildcards: bam_path(wildcards.sample),
         bai=lambda wildcards: bam_index_path(wildcards.sample),
         # The per-TRACK shard, not the cohort table: it carries this sample's
         # n_genome_bc / n_plasmid_bc / bc_confidence, so the fan-out stays
         # pipelined instead of stalling on a cohort-wide barrier.
         bc1_tracks=BC1_DIR / ("{sample}" + BC1_TRACKS_SHARD_SUFFIX),
+        reference=lambda wildcards: reference_path(wildcards.sample),
+        cleaned=lambda wildcards: [_s3.cleaned_bam_path(_WGS_CONFIG,wildcards.sample),
+            _s3.cleaned_bam_index_path(_WGS_CONFIG,wildcards.sample)] if _uses_cleaned_reads(_WGS_CONFIG) else [],
     output:
         shard=RECONCILE_DIR / ("{sample}" + RECONCILE_SHARD_SUFFIX),
+    params:
+        identity=lambda wildcards: stage_identity("4", wildcards.sample),
     log:
         LOGS_DIR / "step_4_reconcile_{sample}.log",
     group:
@@ -602,15 +517,18 @@ rule wgs_step_4_reconcile:
         mem_mb=res("step_4_reconcile", "mem_mb"),
         runtime=runtime_min("step_4_reconcile"),
     shell:
-        "magestic-wgs-reconcile --config {CONFIG_PATH} --sample {wildcards.sample} 2>&1 | tee {log}"
+        "magestic-wgs-reconcile --config {CONFIG_PATH:q} --sample {wildcards.sample:q} 2>&1 | tee {log:q}"
 
 
 rule wgs_step_4_combine:
     """Stage 4 fan-in — concatenate the reconciliation shards in manifest order."""
     input:
+        configuration=COMMON_INPUTS,
         shards=expand(str(RECONCILE_DIR / ("{sample}" + RECONCILE_SHARD_SUFFIX)), sample=SAMPLES),
     output:
         table=RECONCILE_TABLE,
+    params:
+        identity=stage_identity("4"),
     log:
         LOGS_DIR / "step_4_reconcile_combine.log",
     threads: res("step_4_reconcile", "cpus")
@@ -618,7 +536,7 @@ rule wgs_step_4_combine:
         mem_mb=res("step_4_reconcile", "mem_mb"),
         runtime=runtime_min("step_4_reconcile"),
     shell:
-        "magestic-wgs-reconcile --config {CONFIG_PATH} 2>&1 | tee {log}"
+        "magestic-wgs-reconcile --config {CONFIG_PATH:q} 2>&1 | tee {log:q}"
 
 
 # =============================================================================
@@ -633,12 +551,15 @@ rule wgs_step_4_combine:
 rule wgs_step_5_join_outcomes:
     """Stage 5 — agreement matrix and disagreement list for Stage 2 vs Stage 4."""
     input:
+        configuration=COMMON_INPUTS,
         donor=DONOR_TABLE,
         reconcile=RECONCILE_TABLE,
     output:
         join=JOIN_TABLE,
         matrix=JOIN_MATRIX,
         disagreements=JOIN_DISAGREEMENTS,
+    params:
+        identity=stage_identity("5"),
     log:
         LOGS_DIR / "step_5_join.log",
     threads: res("step_5_join", "cpus")
@@ -646,4 +567,4 @@ rule wgs_step_5_join_outcomes:
         mem_mb=res("step_5_join", "mem_mb"),
         runtime=runtime_min("step_5_join"),
     shell:
-        "magestic-wgs-join --config {CONFIG_PATH} 2>&1 | tee {log}"
+        "magestic-wgs-join --config {CONFIG_PATH:q} 2>&1 | tee {log:q}"

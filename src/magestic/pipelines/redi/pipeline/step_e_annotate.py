@@ -10,6 +10,8 @@ import pandas as pd
 
 from ..core.annotate import annotate_with_bc1_reference
 from ..core.config import REDIConfig
+from ..core.io import provenance, publish_tables
+from ..readers.keyfiles import _read_key
 
 
 def run_step_e(
@@ -27,15 +29,17 @@ def run_step_e(
     if top_clone_path is None:
         top_clone_path = combined_data / "top_REDI_bc_MAGESTIC_bc1_df.tsv"
 
-    top_clone = pd.read_csv(top_clone_path, sep="\t")
-    bc1_ref = pd.read_csv(config.bc1_reference_table, sep="\t")
+    out = combined_data / "annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv"
+    prov = provenance('e_annotate', out)
+    prov.add_input(top_clone_path, role='observed_clone_distributions')
+    prov.add_input(config.bc1_reference_table, role='candidate_design_reference')
+    top_clone = _read_key(top_clone_path)
+    bc1_ref = _read_key(config.bc1_reference_table)
     annotated = annotate_with_bc1_reference(top_clone, bc1_ref)
 
-    out = combined_data / "annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv"
-    annotated.to_csv(out, sep="\t", index=False)
-    annotated.head(100).to_csv(
-        combined_data / "annotated_top_REDI_bc_MAGESTIC_bc1_df_head_100.tsv",
-        sep="\t",
-        index=False,
-    )
+    prov.set_counts(input_rows=len(top_clone), reference_rows=len(bc1_ref), output_rows=len(annotated),
+        ambiguous_rows=int(annotated.bc1_reference_ambiguous.sum()),
+        unmatched_rows=int(annotated.bc1_reference_match_count.eq(0).sum()))
+    publish_tables([(out, annotated),
+        (combined_data / 'annotated_top_REDI_bc_MAGESTIC_bc1_df_head_100.tsv', annotated.head(100))], prov)
     return out

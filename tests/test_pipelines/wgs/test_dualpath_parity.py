@@ -53,7 +53,9 @@ from .conftest import (
 
 # --- the pre-registered carve-out, as auditable constants ------------------
 PARITY_EXCLUDE_NAMES = ("PROVENANCE.json",)
-PARITY_EXCLUDE_GLOBS = ("*.provenance.json",)
+PARITY_EXCLUDE_GLOBS = ("*.provenance.json", "*.cache.json")
+# Completion attestations contain output-specific paths and filesystem identities;
+# they are verified by restart tests rather than compared across output roots.
 
 #: Env var naming a prepared fixture directory for the executable half. It must
 #: contain `config_a.yaml` and `config_b.yaml`, whose runs write into `smoke_a/`
@@ -391,6 +393,7 @@ def test_cli_and_snakemake_paths_are_byte_identical(repo_root, parity_fixture_di
             str(repo_root / "workflow" / "Snakefile.wgs"),
             "--config",
             f"config={fixture / 'config_b.yaml'}",
+            "steps=1",
             "-j",
             "1",
         ],
@@ -454,14 +457,13 @@ def test_provenance_sidecar_is_written_and_carries_a_sha(parity_fixture_dir):
     empty = []
     for s in sidecars:
         payload = json.loads(s.read_text())
-        sha = str(
-            payload.get("git_sha")
-            or payload.get("git", {}).get("sha")
-            or payload.get("git_state", {}).get("sha")
-            or ""
-        ).strip()
-        if not sha:
+        sha = str(payload.get("code", {}).get("commit") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
             empty.append(s.name)
+        assert re.fullmatch(r"[0-9a-f]{64}",
+                           payload.get("code", {}).get("magestic_wgs_source_sha256", ""))
+        assert re.fullmatch(r"[0-9a-f]{64}",
+                           payload.get("trace", {}).get("trace_wgs_source_sha256", ""))
     assert not empty, (
         f"provenance sidecars record an empty git sha: {empty}. "
         "Sherlock's git predates `git -C` (exit 129, empty stdout), so a "

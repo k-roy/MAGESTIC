@@ -2,14 +2,15 @@
 Step 3 — plasmid-integration detection (Half A) and donor-read cleaning (Half B).
 
 Orchestration over TRACE's `trace_crispr.wgs.sv_plasmid`. Half A is a port of
-Kevin R. Roy's `screen_bam_for_plasmid_integration.py`; Half B is a bit-for-bit
-port of Shengdi Li's `clean_donor_reads.pl`.
+Kevin R. Roy's `screen_bam_for_plasmid_integration.py`; Half B derives from
+Shengdi Li's `clean_donor_reads.pl`, with strict production defaults and explicit
+historical parity mode.
 
 Three things this step owns that TRACE deliberately does not:
 
 * **The `samtools` preflight.** `sv_plasmid` shells out to `samtools` three times
   with a bare `"samtools"` default. An external binary is not expressible as a
-  Python dependency, so PATH is checked before any work is done.
+  Python dependency, so PATH is checked when Half B actually runs.
 * **The write of `plasmid_integration_summary.tsv`.** TRACE returns rows; writing
   is orchestration (`core.emit.write_plasmid_integration_summary`). The cohort
   table is assembled by fan-in over shards in manifest order and then STABLY
@@ -18,13 +19,13 @@ Three things this step owns that TRACE deliberately does not:
   `summarize_plasmid_integration` itself is a cohort-wide loop; calling it on path
   (A) while path (B) fans in would put two orchestrations over the same numbers,
   and §4 parity is worth more than the one saved call.
-* **Per-contig `junction_distance`.** TRACE's `1129` default is, in its own
-  docstring, "the parity literal"; production should derive
-  `upstream_arm_length + donor_length` per contig. This step derives it with
-  `integrated_plasmid_junction` and REFUSES when a contig's donor sequence is
-  unavailable — because `detect_plasmid_integration` silently `continue`s past any
-  contig missing from a `{contig: distance}` mapping, which under-counts
-  integration rather than failing.
+* **Per-contig `junction_distance`.** Derive `upstream_arm_length + donor_length`
+  and verify both donor copies against the actual sample reference. The historical
+  1129 parity literal is no longer an implicit default. Missing distances fail;
+  zero eligible integration contigs produce an unmeasured status and blank counts.
+* **Reference-specific blacklist and resumability.** Standard Half B requires the
+  explicit source reference for blacklist coordinates, exact sequence identity,
+  and all output artifacts before a cache completion record is published.
 
 🔴 **Correction to the spec's dependency diagram (§3, D2).** Stage 3 is described
 as independent of Stage 1. That holds for Half A, which needs only a BAM. It does
@@ -41,6 +42,8 @@ Author: Kevin R. Roy
 from __future__ import annotations
 
 import logging
+import hashlib
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -50,10 +53,12 @@ from trace_crispr.wgs import sv_plasmid
 from ..config import SV_PLASMID_SUBDIR, WGSConfig
 from ..core.emit import write_plasmid_integration_summary, write_table
 from ..core.manifest import WGSSample
-from ..core.reconcile_driver import load_oligo_windows
 from ._common import (
     StepIncompleteError,
     atomic,
+    cache_key,
+    cache_valid,
+    cache_commit,
     cohort_table,
     collect_shards,
     manifest_samples,
@@ -87,6 +92,7 @@ SHARD_COLUMNS = (
     "downstream_count",
     "total_count",
     "n_integrated_contigs",
+    "half_a_status",
     "half_b_status",
     "read_count_mid_point",
     "frags_genome",
@@ -98,6 +104,7 @@ HALF_B_NO_WINDOW_TABLE = "not_run_no_oligo_window_table"
 HALF_B_NO_ASSIGNMENT = "not_run_no_oligo_assignment"
 HALF_B_WINDOW_UNKNOWN = "not_run_oligo_window_unknown"
 HALF_B_RUN = "run"
+HALF_A_NO_CONTIGS = "not_run_no_integrated_contigs"
 
 
 def shard_path(config: WGSConfig, sample: str) -> Path:
@@ -106,8 +113,22 @@ def shard_path(config: WGSConfig, sample: str) -> Path:
 
 
 def cleaned_bam_path(config: WGSConfig, sample: str) -> Path:
-    """Half B's cleaned BAM. NOT re-sorted and NOT indexed — TRACE writes it as-is."""
+    """Half B's complete, coordinate-order-preserving, indexed cleaned BAM."""
     return shard_dir(config, SV_PLASMID_SUBDIR) / f"{sample}.donor_cleaned.bam"
+
+
+def cleaned_bam_index_path(config: WGSConfig, sample: str, *, record: WGSSample | None = None) -> Path:
+    """Deterministic BAI/CSI companion selected from the source reference lengths."""
+    record = record if record is not None else record_for(config, sample)
+    with pysam.AlignmentFile(str(record.bam), "rb") as bam:
+        suffix = sv_plasmid.bam_index_suffix(bam.lengths)
+    return Path(str(cleaned_bam_path(config, sample)) + suffix)
+
+
+def _remove_cleaned_indexes(path: Path) -> None:
+    for suffix in (".bai", ".csi"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+        path.with_suffix(suffix).unlink(missing_ok=True)
 
 
 def table_path(config: WGSConfig) -> Path:
@@ -127,26 +148,57 @@ def run_step_3(config: WGSConfig, sample: str | None = None) -> list[Path]:
     return _combine(config)
 
 
-def _run_one_sample(config: WGSConfig, sample: str) -> Path:
+def _run_one_sample(config: WGSConfig, sample: str, *, record: WGSSample | None = None) -> Path:
+    """Serialize a complete sample generation, including its cache check/commit."""
+    record = record if record is not None else record_for(config, sample)
+    if record.sample != sample:
+        raise ValueError("Stage 3 record and requested sample disagree")
+    with sv_plasmid.output_lock(str(shard_path(config, sample))):
+        # Also honor standalone TRACE's destination lock. Holding both locks
+        # through cache publication prevents mixed generations across entry points.
+        with sv_plasmid.output_lock(str(cleaned_bam_path(config, sample))):
+            return _run_one_sample_locked(config, sample, record=record)
+
+
+def _run_one_sample_locked(config: WGSConfig, sample: str, *, record: WGSSample | None = None) -> Path:
     """One sample. Idempotent: the shard is written atomically, so its presence
     means both halves finished (or were recorded as not-run, with a reason)."""
     out = shard_path(config, sample)
+    record = record if record is not None else record_for(config, sample)
+    bam_path = require_indexed_bam(record)
+    key = cache_key(config, STEP, record)
+    outputs = [out]
     if out.exists():
-        logger.info("step_3: %s already complete — skipping", sample)
+        try:
+            existing = list(read_table(out))
+        except (OSError, ValueError, StepIncompleteError):
+            existing = []
+        if len(existing) == 1 and existing[0].get("half_b_status") == HALF_B_RUN:
+            cleaned = cleaned_bam_path(config, sample)
+            outputs.extend([cleaned, cleaned_bam_index_path(config, sample, record=record), Path(str(cleaned) + ".target_filtering.anno")])
+    if cache_valid(outputs, key):
+        logger.info("step_3: %s complete for current inputs — skipping", sample)
         return out
 
-    require_binary(config.sv_plasmid.samtools)
-    record = record_for(config, sample)
-    bam_path = require_indexed_bam(record)
-
     contigs = _integrated_contigs(bam_path)
-    counts = sv_plasmid.detect_plasmid_integration(
-        str(bam_path),
-        integrated_contigs=contigs,
-        junction_distance=_junction_distances(config, contigs),
-    )
-    total = counts["upstream_count"] + counts["downstream_count"]
+    half_a_status = "run" if contigs else HALF_A_NO_CONTIGS
+    counts = {"upstream_count": None, "downstream_count": None}
+    total = None
+    if contigs:
+        kwargs = {k: getattr(config.sv_plasmid, k) for k in ("min_mapq", "min_anchor") if getattr(config.sv_plasmid, k) is not None}
+        counts = sv_plasmid.detect_plasmid_integration(
+            str(bam_path), integrated_contigs=contigs,
+            junction_distance=_junction_distances(config, contigs, Path(record.reference)), **kwargs,
+        )
+        total = counts["upstream_count"] + counts["downstream_count"]
     status, anno = _run_half_b(config, record)
+    if status != HALF_B_RUN:
+        # A changed assignment/config can turn a prior measured result into a
+        # not-run result. Remove generated companions so they cannot look current.
+        stale = cleaned_bam_path(config, sample)
+        stale.unlink(missing_ok=True)
+        _remove_cleaned_indexes(stale)
+        Path(str(stale) + ".target_filtering.anno").unlink(missing_ok=True)
 
     with atomic(out) as tmp:
         write_table(
@@ -159,13 +211,14 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
                     counts["downstream_count"],
                     total,
                     len(contigs),
+                    half_a_status,
                     status,
                     *anno,
                 ]
             ],
         )
     logger.info(
-        "step_3: %s integration up=%d down=%d total=%d over %d contig(s); half_b=%s",
+        "step_3: %s integration up=%s down=%s total=%s over %d contig(s); half_b=%s",
         sample,
         counts["upstream_count"],
         counts["downstream_count"],
@@ -173,6 +226,11 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
         len(contigs),
         status,
     )
+    outputs = [out]
+    if status == HALF_B_RUN:
+        cleaned = cleaned_bam_path(config, sample)
+        outputs.extend([cleaned, cleaned_bam_index_path(config, sample, record=record), Path(str(cleaned) + ".target_filtering.anno")])
+    cache_commit(outputs, key)
     return out
 
 
@@ -182,19 +240,19 @@ def _integrated_contigs(bam_path: Path) -> list[str]:
         return [ref for ref in bam.references if ref.startswith(INTEGRATED_PREFIX)]
 
 
-def _junction_distances(config: WGSConfig, contigs: Sequence[str]) -> dict[str, int] | int:
+def _junction_distances(config: WGSConfig, contigs: Sequence[str], reference: Path | None = None) -> dict[str, int] | int:
     """Per-contig junction distance, derived — not the `1129` parity literal.
 
     Returns the scalar `config.sv_plasmid.junction_distance` only when it has been
     set explicitly, which is the documented way to ask for legacy parity behavior.
-    Otherwise every integrated contig must resolve to a donor sequence: a PARTIAL
-    mapping makes `detect_plasmid_integration` skip the unmapped contigs in
-    silence, which reads as "no integration" rather than "not measured".
+    Otherwise every integrated contig must resolve to a donor sequence. TRACE
+    independently rejects partial mappings; neither layer turns missing inputs
+    into an observed integration-negative zero.
     """
     if config.sv_plasmid.junction_distance is not None:
         logger.warning(
-            "step_3: pinning junction_distance=%s for every contig — TRACE's own "
-            "docstring calls 1129 'the parity literal'; production derives it per contig",
+            "step_3: explicitly pinning junction_distance=%s for every contig; "
+            "the default derives distances from reference-validated donor sequences",
             config.sv_plasmid.junction_distance,
         )
         return int(config.sv_plasmid.junction_distance)
@@ -216,10 +274,17 @@ def _junction_distances(config: WGSConfig, contigs: Sequence[str]) -> dict[str, 
         raise StepIncompleteError(
             f"step_3: {len(unresolved)} of {len(contigs)} integrated-plasmid contig(s) have "
             f"no donor sequence (first: {', '.join(unresolved[:5])}). "
-            "detect_plasmid_integration skips a contig missing from the mapping without a "
-            "word, under-counting integration instead of failing. Supply the oligo table, "
-            "or set sv_plasmid.junction_distance to opt into the parity literal."
+            "Supply sv_plasmid.donor_sequences, or an explicit verified uniform junction_distance."
         )
+    if reference is not None:
+        with pysam.FastaFile(str(reference)) as fasta:
+            for contig, distance in distances.items():
+                donor = donors[contig[len(INTEGRATED_PREFIX):]].upper()
+                length = fasta.get_reference_length(contig)
+                left = fasta.fetch(contig, config.sv_plasmid.bp_to_extend, distance).upper()
+                right = fasta.fetch(contig, length - distance, length - config.sv_plasmid.bp_to_extend).upper()
+                if left != donor or right != donor:
+                    raise StepIncompleteError(f"step_3: derived donor boundaries disagree with reference sequence for {contig}")
     return distances
 
 
@@ -244,13 +309,7 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
     oligo = _assigned_oligo(config, record.sample)
     if oligo is None:
         return HALF_B_NO_ASSIGNMENT, blank
-    windows = load_oligo_windows(
-        str(config.reconcile.oligo_windows),
-        oligo_col=config.columns.oligo_col,
-        chrom_col=config.columns.chrom_col,
-        start_col=config.columns.start_col,
-        end_col=config.columns.end_col,
-    )
+    windows = _donor_windows(config)
     window = windows.get(oligo)
     if window is None:
         return HALF_B_WINDOW_UNKNOWN, blank
@@ -263,34 +322,67 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
         )
 
     chrom, start, end = window
+    if config.sv_plasmid.dup_mode == "standard" and config.sv_plasmid.blacklist_reference is None:
+        raise StepIncompleteError("step_3: standard Half B requires sv_plasmid.blacklist_reference to establish coordinate identity")
+    require_binary(config.sv_plasmid.samtools)
     final_bam = cleaned_bam_path(config, record.sample)
-    staged = final_bam.with_name(final_bam.name + ".part")
-    staged.parent.mkdir(parents=True, exist_ok=True)
-    result = sv_plasmid.clean_donor_reads(
-        str(record.bam),
-        str(staged),
-        chrom,
-        start,
-        end,
-        str(blacklist),
-        flexible_bases=config.sv_plasmid.flexible_bases,
-        dup_mode=config.sv_plasmid.dup_mode,
-        samtools=config.sv_plasmid.samtools,
-    )
-    publish(staged, final_bam)
-    publish(
-        staged.with_name(staged.name + ".target_filtering.anno"),
-        final_bam.with_name(final_bam.name + ".target_filtering.anno"),
-    )
-
-    anno = result.anno_row().strip("\n").split("\t")
-    expected = len(sv_plasmid.ANNO_HEADER.split("\t"))
-    if len(anno) != expected:
-        raise StepIncompleteError(
-            f"step_3: clean_donor_reads returned {len(anno)} .anno field(s) for "
-            f"{record.sample}, expected {expected} ({sv_plasmid.ANNO_HEADER!r})"
+    final_index = cleaned_bam_index_path(config, record.sample, record=record)
+    final_bam.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{record.sample}.cleaned_", dir=final_bam.parent) as temp:
+        staged = Path(temp) / "cleaned.bam"
+        result = sv_plasmid.clean_donor_reads(
+            str(record.bam), str(staged), chrom, start, end, str(blacklist),
+            flexible_bases=config.sv_plasmid.flexible_bases,
+            dup_mode=config.sv_plasmid.dup_mode,
+            samtools=config.sv_plasmid.samtools,
+            reference_path=str(record.reference),
+            blacklist_reference=str(config.sv_plasmid.blacklist_reference) if config.sv_plasmid.blacklist_reference is not None else None,
+            **({"min_mapq": config.sv_plasmid.min_mapq} if config.sv_plasmid.min_mapq is not None else {}),
         )
+        anno = result.anno_row().strip("\n").split("\t")
+        expected = len(sv_plasmid.ANNO_HEADER.split("\t"))
+        if len(anno) != expected:
+            raise StepIncompleteError(
+                f"step_3: clean_donor_reads returned {len(anno)} .anno field(s) for "
+                f"{record.sample}, expected {expected} ({sv_plasmid.ANNO_HEADER!r})"
+            )
+        with pysam.AlignmentFile(str(staged), "rb") as checked:
+            checked.check_index()
+        _remove_cleaned_indexes(final_bam)
+        publish(staged, final_bam)
+        publish(Path(str(staged) + final_index.suffix), final_index)
+        publish(Path(str(staged) + ".target_filtering.anno"), Path(str(final_bam) + ".target_filtering.anno"))
     return HALF_B_RUN, anno
+
+
+_WINDOWS: dict[tuple, dict[str, tuple[str, int, int]]] = {}
+
+
+def _donor_windows(config: WGSConfig) -> dict[str, tuple[str, int, int]]:
+    """Read donor coordinates without requiring Stage 4 intended edit alleles."""
+    from ..readers.oligo_tables import read_oligo_table
+    path = Path(config.reconcile.oligo_windows)
+    columns = (config.columns.oligo_col, config.columns.chrom_col, config.columns.start_col, config.columns.end_col)
+    stat = path.stat()
+    key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, columns)
+    if key not in _WINDOWS:
+        windows = {}
+        for row in read_oligo_table(path, columns=columns):
+            name, chrom = row[columns[0]], row[columns[1]]
+            try:
+                start, end = int(row[columns[2]]), int(row[columns[3]])
+            except ValueError as exc:
+                raise StepIncompleteError(f"step_3: invalid donor coordinates for {name}") from exc
+            if not name or not chrom or start < 1 or end < start:
+                raise StepIncompleteError(f"step_3: invalid donor window for {name!r}")
+            window = (chrom, start, end)
+            if name in windows and windows[name] != window:
+                raise StepIncompleteError(f"step_3: conflicting donor windows for {name}")
+            windows[name] = window
+        if not windows:
+            raise StepIncompleteError(f"step_3: no donor windows in {path}")
+        _WINDOWS[key] = windows
+    return _WINDOWS[key]
 
 
 def _assigned_oligo(config: WGSConfig, sample: str) -> str | None:
@@ -302,28 +394,32 @@ def _assigned_oligo(config: WGSConfig, sample: str) -> str | None:
     runs Half A only, and says so per sample.
     """
     table = config.reconcile.oligo_assignments
-    if table is None or not Path(table).exists():
+    if table is None:
         return None
+    if not Path(table).is_file():
+        raise StepIncompleteError(f"step_3: configured oligo assignments missing: {table}")
     return _assignment_index(Path(table), config.columns.oligo_col).get(sample)
 
 
-#: `(resolved path, mtime) -> {sample: oligo}`. A plain per-sample scan is O(n^2)
-#: over a fan-in, which is 657 re-reads for the rearray cohort; keying on mtime
-#: means an edited table is still picked up within the same process.
-_ASSIGNMENTS: dict[tuple[str, float], dict[str, str]] = {}
+#: Assignment content and configured column are part of the cache identity.
+_ASSIGNMENTS: dict[tuple[str, str, str], dict[str, str]] = {}
 
 
 def _assignment_index(table: Path, oligo_col: str) -> dict[str, str]:
-    """`{sample: oligo}` from the assignment table, memoized on path + mtime."""
-    key = (str(table.resolve()), table.stat().st_mtime)
+    """`{sample: oligo}` memoized on path, content hash and configured column."""
+    key = (str(table.resolve()), hashlib.sha256(table.read_bytes()).hexdigest(), oligo_col)
     cached = _ASSIGNMENTS.get(key)
     if cached is None:
         cached = {}
-        for row in read_table(table):
+        from ..readers.oligo_tables import read_oligo_table
+        for row in read_oligo_table(table, columns=("sample", oligo_col)):
             sample = row.get("sample", "").strip()
             oligo = row.get(oligo_col, "").strip()
-            if sample and oligo:
-                cached.setdefault(sample, oligo)
+            if not sample or not oligo:
+                raise StepIncompleteError(f"step_3: blank sample or oligo in {table}")
+            if sample in cached and cached[sample] != oligo:
+                raise StepIncompleteError(f"step_3: conflicting oligo assignments for {sample}")
+            cached[sample] = oligo
         _ASSIGNMENTS[key] = cached
     return cached
 
@@ -332,7 +428,7 @@ def _combine(config: WGSConfig) -> list[Path]:
     """Fan-in: every sample, then the cohort table and the integration summary."""
     records = manifest_samples(config)
     for record in records:
-        _run_one_sample(config, record.sample)
+        _run_one_sample(config, record.sample, record=record)
 
     header, rows = collect_shards(
         records, lambda r: shard_path(config, r.sample), label="step_3 sv/plasmid"
@@ -345,7 +441,7 @@ def _combine(config: WGSConfig) -> list[Path]:
     with atomic(integration_out) as tmp:
         write_plasmid_integration_summary(summary, tmp)
 
-    with_evidence = sum(1 for row in summary if row["total_count"] > 0)
+    with_evidence = sum(1 for row in summary if row["total_count"] is not None and row["total_count"] > 0)
     status_idx = SHARD_COLUMNS.index("half_b_status")
     half_b_run = sum(1 for row in rows if row.split("\t")[status_idx] == HALF_B_RUN)
     logger.info(
@@ -364,6 +460,10 @@ def _combine(config: WGSConfig) -> list[Path]:
             "bp_to_extend": config.sv_plasmid.bp_to_extend,
             "flexible_bases": config.sv_plasmid.flexible_bases,
             "dup_mode": config.sv_plasmid.dup_mode,
+            "min_mapq": config.sv_plasmid.min_mapq if config.sv_plasmid.min_mapq is not None else 20,
+            "min_anchor": config.sv_plasmid.min_anchor if config.sv_plasmid.min_anchor is not None else 1,
+            "integration_count_unit": "qualifying alignment records, including duplicates",
+            "blacklist_reference": str(config.sv_plasmid.blacklist_reference) if config.sv_plasmid.blacklist_reference is not None else None,
             "junction_distance": (
                 "derived per contig via integrated_plasmid_junction"
                 if config.sv_plasmid.junction_distance is None
@@ -373,6 +473,7 @@ def _combine(config: WGSConfig) -> list[Path]:
         counts={
             "samples": n,
             "samples_with_integration_evidence": with_evidence,
+            "half_a_run": sum(row["half_a_status"] == "run" for row in summary),
             "half_b_run": half_b_run,
         },
     )
@@ -390,11 +491,12 @@ def _integration_summary(rows: Sequence[str]) -> list[dict[str, object]]:
     summary: list[dict[str, object]] = [
         {
             "sample_name": fields[idx["sample"]],
-            "upstream_count": int(fields[idx["upstream_count"]]),
-            "downstream_count": int(fields[idx["downstream_count"]]),
-            "total_count": int(fields[idx["total_count"]]),
+            "upstream_count": int(fields[idx["upstream_count"]]) if fields[idx["upstream_count"]] else None,
+            "downstream_count": int(fields[idx["downstream_count"]]) if fields[idx["downstream_count"]] else None,
+            "total_count": int(fields[idx["total_count"]]) if fields[idx["total_count"]] else None,
+            "half_a_status": fields[idx["half_a_status"]],
         }
         for fields in (row.split("\t") for row in rows)
     ]
-    summary.sort(key=lambda r: int(r["total_count"]), reverse=True)
+    summary.sort(key=lambda r: -1 if r["total_count"] is None else int(r["total_count"]), reverse=True)
     return summary

@@ -124,7 +124,16 @@ def code_state() -> dict[str, Any]:
     Both are recorded: `commit` is what P6/F7 read, `commit_source` is what makes a
     later reader able to tell a checkout sha from a staged build sha.
     """
+    import hashlib
     state = dict(git_state())
+    # A commit alone does not identify dirty or staged source trees. Hash the
+    # actual imported algorithm/orchestration source in a path-independent order.
+    directory = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for source in sorted(directory.rglob("*.py")):
+        digest.update(str(source.relative_to(directory.parent)).encode())
+        digest.update(source.read_bytes())
+    state["magestic_wgs_source_sha256"] = digest.hexdigest()
     sha = build_sha()
     if sha:
         source = (
@@ -132,6 +141,7 @@ def code_state() -> dict[str, Any]:
             if os.environ.get(BUILD_SHA_ENV, "").strip()
             else (BUILD_SHA_FILE if _sha_from_file() else "git_state")
         )
+        state["checkout_commit"] = state.get("commit")
         state["commit"] = sha
         state["commit_source"] = source
     else:
@@ -163,6 +173,7 @@ def write_step_provenance(
     parameters: Mapping[str, Any] | None = None,
     counts: Mapping[str, Any] | None = None,
     require_sha: bool = True,
+    input_md5: Mapping[str, str] | None = None,
 ) -> Path:
     """Write `<output>.provenance.json` beside a step's output and return its path.
 
@@ -180,6 +191,10 @@ def write_step_provenance(
     require_sha : bool, default True
         Raise `ProvenanceError` when no sha can be resolved. Default True because a
         sidecar with a null sha passes a naive "the file exists" check and fails F7.
+    input_md5 : mapping, optional
+        `{role: raw md5}` already computed by the caller for the CURRENT bytes of that
+        input, so a large file shared by many receipts is hashed once. Roles absent
+        here are hashed as usual.
 
     Raises
     ------
@@ -204,7 +219,7 @@ def write_step_provenance(
 
     prov = StepProvenance(PIPELINE, step, out)
     for role, path in (inputs or {}).items():
-        prov.add_input(path, role=role)
+        prov.add_input(path, role=role, md5=(input_md5 or {}).get(role))
     if parameters:
         prov.set_parameters(**dict(parameters))
     if counts:

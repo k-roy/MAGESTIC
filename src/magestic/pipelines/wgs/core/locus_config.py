@@ -113,16 +113,20 @@ def write_locus_sidecar(path: str | Path, values: Mapping[str, str]) -> Path:
     cannot be derived from it. The reference's role here is *validation*
     (`validate_tracks`), not derivation.
     """
-    missing = [k for k in LOCUS_CONFIG_KEYS if not str(values.get(k, "")).strip()]
+    missing = [k for k in LOCUS_CONFIG_KEYS[:3] if not str(values.get(k, "")).strip()]
+    plasmid_present = [bool(str(values.get(k, '')).strip()) for k in LOCUS_CONFIG_KEYS[3:]]
+    if any(plasmid_present) and not all(plasmid_present):
+        missing += [k for k in LOCUS_CONFIG_KEYS[3:] if not str(values.get(k, '')).strip()]
     if missing:
         raise LocusConfigError(
-            f"locus sidecar is missing required key(s) {missing}. All six are required even "
-            "for a genome-only run: trace_crispr.wgs.bc1_consensus.tracks_from_config "
-            "indexes the plasmid_bc_* keys unconditionally."
+            f"locus sidecar is missing required key(s) {missing}; an optional plasmid "
+            "track needs all three plasmid fields when supplied."
         )
     ordered = list(LOCUS_CONFIG_KEYS) + [k for k in values if k not in LOCUS_CONFIG_KEYS]
     lines = []
     for key in ordered:
+        if key not in values or not str(values[key]).strip():
+            continue
         value = str(values[key]).strip()
         if "\n" in value or "\r" in value:
             raise LocusConfigError(f"locus sidecar value for {key!r} contains a newline")
@@ -142,7 +146,7 @@ def load_locus_sidecar(path: str | Path) -> dict[str, str]:
     file is validated against the code that will actually consume it.
     """
     cfg = dict(_trace.bc1_consensus().load_locus_config(str(path)))
-    missing = [k for k in LOCUS_CONFIG_KEYS if not cfg.get(k)]
+    missing = [k for k in LOCUS_CONFIG_KEYS[:3] if not cfg.get(k)]
     if missing:
         raise LocusConfigError(f"{path}: sidecar parsed but missing key(s) {missing}")
     return cfg
@@ -153,7 +157,9 @@ def build_tracks(
     *,
     amplicon_left_window: str | tuple[int, int] | None = None,
     amplicon_right_window: str | tuple[int, int] | None = None,
-) -> tuple[TrackConfig, TrackConfig]:
+    use_plasmid: bool | None = None,
+    min_mapq: int | None = None,
+) -> tuple[TrackConfig, TrackConfig | None]:
     """Build the `(genome, plasmid)` TRACE tracks from a sidecar path or parsed mapping.
 
     Parameters
@@ -179,7 +185,8 @@ def build_tracks(
         amplicon_right_window
     )
     return _trace.bc1_consensus().tracks_from_config(
-        cfg, amplicon_left_window=left, amplicon_right_window=right
+        cfg, amplicon_left_window=left, amplicon_right_window=right, use_plasmid=use_plasmid,
+        min_mapq=min_mapq,
     )
 
 

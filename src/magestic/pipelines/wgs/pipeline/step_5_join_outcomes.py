@@ -36,6 +36,7 @@ from ._common import (
     StepIncompleteError,
     atomic,
     cohort_table,
+    manifest_samples,
     read_table,
     write_provenance,
 )
@@ -122,15 +123,25 @@ def run_step_5(config: WGSConfig) -> list[Path]:
             f"step_5 needs Stage 4's reconciliation table ({reconcile_table}); run step 4."
         )
 
-    precall = {r["sample_name"]: r for r in read_table(precall_table)}
+    manifest = manifest_samples(config)
+    expected = {r.sample for r in manifest}
+    precall_rows = read_table(precall_table)
     reconcile_rows = read_table(reconcile_table)
-    shared = [r for r in reconcile_rows if r["sample"] in precall]
-    if not shared:
-        raise StepIncompleteError(
-            f"step_5: Stage 2 ({len(precall)} samples) and Stage 4 "
-            f"({len(reconcile_rows)} samples) share 0 sample names. An empty join is "
-            "not 100% agreement."
-        )
+    def by_sample(rows, column, label):
+        mapping = {}
+        for row in rows:
+            name = row.get(column, '')
+            if not name or name in mapping:
+                raise StepIncompleteError(f'step_5: {label} has blank or duplicate sample {name!r}')
+            mapping[name] = row
+        observed = set(mapping)
+        if observed != expected:
+            raise StepIncompleteError(f'step_5: {label} sample set differs from manifest; '
+                                      f'missing={sorted(expected-observed)}, extra={sorted(observed-expected)}')
+        return mapping
+    precall = by_sample(precall_rows, 'sample_name', 'Stage 2')
+    reconciliation = by_sample(reconcile_rows, 'sample', 'Stage 4')
+    shared = [reconciliation[r.sample] for r in manifest]
 
     rows: list[list[str]] = []
     matrix: dict[tuple[str, str], int] = {}
@@ -188,24 +199,34 @@ def run_step_5(config: WGSConfig) -> list[Path]:
         undetermined,
     )
 
-    write_provenance(
-        STEP,
-        out,
-        inputs={"donor_outcome": precall_table, "reconcile": reconcile_table},
-        parameters={
-            "agreement_rule": "three-valued; `unknown` (Stage 2) and `LOW_CONF` "
-            "(Stage 4) are undetermined, never counted as agreement or disagreement",
-        },
-        counts={
-            "joined": len(rows),
-            "precall_rows": len(precall),
-            "reconcile_rows": len(reconcile_rows),
-            "comparable": comparable,
-            "agree": agree,
-            "disagree": len(disagreements),
-            "undetermined": undetermined,
-        },
-    )
+    # Every published table gets its own receipt. The join, its disagreement subset
+    # and the cross-tab are separate artifacts; a reader of any one of them must be
+    # able to prove which Stage 2/4 tables and which manifest (the sample scope and
+    # row order) produced it.
+    inputs = {"donor_outcome": precall_table, "reconcile": reconcile_table,
+              "manifest": config.paths.manifest}
+    counts = {
+        "joined": len(rows),
+        "precall_rows": len(precall),
+        "reconcile_rows": len(reconcile_rows),
+        "comparable": comparable,
+        "agree": agree,
+        "disagree": len(disagreements),
+        "undetermined": undetermined,
+    }
+    for artifact, artifact_rows in ((out, len(rows)), (disagreement_out, len(disagreements)),
+                                    (matrix_out, len(STATES) ** 2)):
+        write_provenance(
+            STEP,
+            artifact,
+            inputs=inputs,
+            parameters={
+                "artifact": artifact.name,
+                "agreement_rule": "three-valued; `unknown` (Stage 2) and `LOW_CONF` "
+                "(Stage 4) are undetermined, never counted as agreement or disagreement",
+            },
+            counts={**counts, "artifact_rows": artifact_rows},
+        )
     return [out, disagreement_out, matrix_out]
 
 

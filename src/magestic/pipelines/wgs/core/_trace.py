@@ -28,6 +28,10 @@ grep answers "is this word present", never "is this capability present".)
 from __future__ import annotations
 
 import importlib
+import hashlib
+import os
+import subprocess
+from pathlib import Path
 from types import ModuleType
 
 __all__ = [
@@ -96,8 +100,31 @@ def trace_provenance() -> dict[str, str]:
     """
     trace = importlib.import_module("trace_crispr")
     wgs = importlib.import_module("trace_crispr.wgs")
+    package = Path(trace.__file__).resolve().parent
+    source_hash = hashlib.sha256()
+    for source in sorted((package/'wgs').rglob('*.py')):
+        source_hash.update(str(source.relative_to(package)).encode())
+        source_hash.update(source.read_bytes())
+    def git(*args):
+        try:
+            return subprocess.check_output(['git', *args], cwd=package,
+                                           stderr=subprocess.DEVNULL, text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return ''
+    commit = git('rev-parse', 'HEAD')
+    staged = os.environ.get('TRACE_BUILD_SHA', '').strip()
+    if not commit and not staged:
+        for root in (package, package.parent):
+            identity_file = root/'BUILD_SHA'
+            if identity_file.is_file():
+                staged = identity_file.read_text().strip()
+                break
     return {
         "trace_version": str(getattr(trace, "__version__", "unknown")),
         "trace_path": str(getattr(trace, "__file__", "unknown")),
         "trace_wgs_api_names": str(len(getattr(wgs, "__all__", ()))),
+        'trace_git_commit': commit or staged or 'unresolved',
+        'trace_commit_source': 'git' if commit else 'staged' if staged else 'unresolved',
+        'trace_worktree_dirty': str(bool(git('status', '--porcelain'))) if commit else 'unknown',
+        'trace_wgs_source_sha256': source_hash.hexdigest(),
     }

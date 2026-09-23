@@ -11,7 +11,7 @@ Registered in pyproject.toml `[project.scripts]`:
     magestic-redi-annotate     step_e   → annotate_main
     magestic-redi-cross-array  step_f   → cross_array_main
     magestic-redi-wgs-check    step_g   → wgs_check_main
-    magestic-redi-rearray      step_h_i → rearray_main
+    magestic-redi-rearray      step_h (legacy command name) → rearray_main
 """
 
 from __future__ import annotations
@@ -108,11 +108,10 @@ def wgs_check_main(argv: list[str] | None = None) -> int:
 
 
 def rearray_main(argv: list[str] | None = None) -> int:
-    """`magestic-redi-rearray` — step_h/i clone selection + rearray.
+    """`magestic-redi-rearray` — registered-position plots (legacy name).
 
-    Project-specific selection logic lives in `REDI/screens/<screen>/driver.py`;
-    this CLI runs the engine plotting (step_h) and points the user at the
-    screen driver for selection.
+    Collection-specific selection and robot worklists are not implemented by
+    this command. Stage I exposes a generic ranking helper only.
     """
     from .pipeline.step_h_plot import run_step_h
 
@@ -121,7 +120,7 @@ def rearray_main(argv: list[str] | None = None) -> int:
     for k, v in run_step_h(config).items():
         print(f"  {k}: {v}")
     print(
-        "Project-specific clone selection: see "
-        f"REDI/screens/{config.screen_name}/driver.py"
+        "Plots complete. Collection-specific clone selection and robot worklists "
+        "require a separate implementation; this command does not generate them."
     )
     return 0
