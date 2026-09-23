@@ -1,8 +1,10 @@
-"""Merge plasmid-assay evidence at the observed, scoped bc1/donor/bc0 link.
+"""Merge plasmid-assay evidence at the observed bc1/donor/bc0 link of one construct library.
 
 Read support is summed; PCR identities are unioned. Competing links and
 unresolved fragments remain separate observations. GDB reads are annotation
-evidence only and never enter BDB read or PCR totals.
+evidence only and never enter BDB read or PCR totals. Where a link was sampled
+(the yeast population a PCR was drawn from) is evidence about the link, kept in
+``population_counts``; it is not part of the link's identity.
 """
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -19,10 +21,51 @@ from ..readers.data_loader import count_distinct_pcrs
 logger = logging.getLogger(__name__)
 # These namespaces stay separate. In particular, SPS is not transformation ID.
 SCOPE_COLUMNS = ('yeast_library', 'yeast_sublibrary', 'trafo_ID', 'library_ID', 'V_library')
+# A BDB link is the plasmid linkage within one construct library, and every separate PCR
+# that observed it is support, because the error it guards against is PCR recombination
+# (Kevin, 2026-09-23, ledger section 7 item 4). The yeast population a PCR was drawn from
+# (a transformation plate, a pooled yL outgrowth, a yeast library) is therefore evidence
+# kept per link in population_counts; it never splits a link, its support or its barcode's
+# purity denominator. The construct scope and SPS still keep links apart.
+POPULATION_COLUMNS = ('yeast_library', 'yeast_sublibrary', 'trafo_ID')
+LINK_SCOPE_COLUMNS = tuple(column for column in SCOPE_COLUMNS if column not in POPULATION_COLUMNS)
+_POPULATION_POSITIONS = tuple(SCOPE_COLUMNS.index(column) for column in POPULATION_COLUMNS)
+_LINK_SCOPE_POSITIONS = tuple(SCOPE_COLUMNS.index(column) for column in LINK_SCOPE_COLUMNS)
 
 
 def _text(value):
     return str(value) if value is not None and not pd.isna(value) and str(value) else None
+
+
+def _link_scope(scope):
+    return tuple(scope[position] for position in _LINK_SCOPE_POSITIONS)
+
+
+def _population(scope):
+    return tuple(scope[position] for position in _POPULATION_POSITIONS)
+
+
+def _population_order(population):
+    return tuple((value is not None, value or '') for value in population)
+
+
+def encode_population_counts(populations):
+    """JSON list with one entry per sampled population and its reads, in a stable order."""
+    return json.dumps([dict(zip(POPULATION_COLUMNS, population), counts=int(count))
+                       for population, count in sorted(populations.items(),
+                                                       key=lambda item: _population_order(item[0]))],
+                      sort_keys=True)
+
+
+def decode_population_counts(value):
+    """Inverse of :func:`encode_population_counts`: ``{population tuple: reads}``."""
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    populations = {}
+    for entry in json.loads(value):
+        population = tuple(_text(entry.get(column)) for column in POPULATION_COLUMNS)
+        populations[population] = populations.get(population, 0) + _count(entry['counts'], 'population read count')
+    return populations
 
 
 def _count(value, label='read count'):
@@ -92,6 +135,8 @@ class BC1Record:
     fragments: Set[str] = field(default_factory=set)
     short_link_candidates: int = 0
     gdb_candidates: List[Dict] = field(default_factory=list)
+    # Reads per sampled population (POPULATION_COLUMNS values); empty means the record's scope.
+    populations: Dict[Tuple, int] = field(default_factory=dict)
 
     @property
     def total_counts(self):
@@ -140,6 +185,7 @@ class BC1Record:
             has_donor_conflict=self.has_donor_conflict, conflict_details=self.conflict_details,
             library_id=self.library_id, scaffold=self.scaffold, SPS=self.SPS,
             input_library_scope=json.dumps(dict(zip(SCOPE_COLUMNS, self.scope)), sort_keys=True),
+            population_counts=encode_population_counts(_observed_populations(self)),
             observed_fragments=json.dumps(sorted(self.fragments)),
             short_link_candidates=self.short_link_candidates,
             gdb_candidates=json.dumps(self.gdb_candidates, sort_keys=True),
@@ -165,8 +211,22 @@ def build_donor_bc0_key(donor: str, bc0: str, use_last_n_bp: int = 30) -> str:
 
 def _key(record):
     known = record.donor_full or record.donor_recovered
-    return (record.scope, record.bc1, record.bc0, known,
+    return (_link_scope(record.scope), record.bc1, record.bc0, known,
             None if known else record.donor_bc0_fragment, record.SPS)
+
+
+def _observed_populations(record):
+    """Reads per sampled population; a record built without them is one population, its scope."""
+    return record.populations or {_population(record.scope): record.total_counts}
+
+
+def _refresh_population_scope(record):
+    """A population column keeps a value only when every contributing observation agrees."""
+    scope = list(record.scope)
+    for index, position in enumerate(_POPULATION_POSITIONS):
+        values = {population[index] for population in record.populations}
+        scope[position] = next(iter(values)) if len(values) == 1 else None
+    record.scope = tuple(scope)
 
 
 def _refresh_support(record):
@@ -178,6 +238,12 @@ def _refresh_support(record):
 
 def _combine(target, other):
     """Transfer one observation exactly once, with SUM reads / UNION IDs."""
+    # Taken before the read counts move, so a record without populations counts its own reads once.
+    populations = dict(_observed_populations(target))
+    for population, count in _observed_populations(other).items():
+        populations[population] = populations.get(population, 0) + count
+    target.populations = populations
+    _refresh_population_scope(target)
     for source in ('2x150', '2x300'):
         setattr(target, 'counts_' + source, getattr(target, 'counts_' + source) + getattr(other, 'counts_' + source))
         setattr(target, 'has_' + source, getattr(target, 'has_' + source) or getattr(other, 'has_' + source))
@@ -219,7 +285,8 @@ def _merge_source(df, source, existing=None, show_progress=True):
         if source == '2x150' and 'donor_bc0_fragment' not in df:
             fragment = _text(row.get('donor'))
         donor = _text(row.get('donor', row.get('bdb_donor')))
-        record = BC1Record(bc1, bc0, scope=scope, SPS=_text(row.get('SPS')))
+        record = BC1Record(bc1, bc0, scope=scope, SPS=_text(row.get('SPS')),
+                           populations={_population(scope): count})
         if source == '2x300':
             record.donor_full = donor
         elif 'donor_bc0_fragment' in df:
@@ -260,7 +327,7 @@ def _attach_unique_short_links(records):
     candidates = defaultdict(list)
     for record in records.values():
         if record.best_donor and record.bc1 and record.bc0:
-            candidates[(record.scope, record.bc1, record.bc0)].append(record)
+            candidates[(_link_scope(record.scope), record.bc1, record.bc0)].append(record)
     remove = []
     for key, record in records.items():
         if record.best_donor or not record.bc1 or not record.bc0:
@@ -268,7 +335,7 @@ def _attach_unique_short_links(records):
         suffix = _fragment_suffix(record.donor_bc0_fragment, record.SPS, record.bc0)
         if not suffix:
             continue
-        matches = [parent for parent in candidates[(record.scope, record.bc1, record.bc0)]
+        matches = [parent for parent in candidates[(_link_scope(record.scope), record.bc1, record.bc0)]
                    if parent.best_donor.endswith(suffix)
                    and parent.SPS == record.SPS]
         record.short_link_candidates = len(matches)
@@ -319,8 +386,10 @@ def merge_gdb_data(df_gdb, existing_records):
                 continue
             if record.SPS and candidate.get('SPS') and record.SPS != candidate['SPS']:
                 continue
+            # Construct scope only: whether a link was sampled in one population or several
+            # must not decide whether a GDB candidate annotates it.
             if any(value and candidate.get(col) and value != candidate[col]
-                   for col, value in zip(SCOPE_COLUMNS, record.scope)):
+                   for col, value in zip(LINK_SCOPE_COLUMNS, _link_scope(record.scope))):
                 continue
             suffix = _fragment_suffix(record.donor_bc0_fragment, record.SPS, record.bc0)
             if not record.best_donor and suffix and not candidate['donor'].endswith(suffix):
@@ -367,6 +436,13 @@ def merge_data_sources(df_2x150=None, df_2x300=None, df_gdb=None, resolve_confli
         records = merge_2x150_data(df_2x150)
     if df_2x300 is not None and len(df_2x300):
         records = merge_2x300_data(df_2x300, records)
+    elif records:
+        # Without 2x300 data a fragment can still belong to a link whose donor was recovered
+        # from another population's donor-bc0 amplicon (for example yL442 in the 20250912
+        # screen, which has no donor-bc0 amplicon of its own). The same unique-candidate rule
+        # as after a 2x300 merge applies; within one population it cannot fire, because
+        # recovery gives every observation of one fragment, bc0 and scope the same outcome.
+        records = _attach_unique_short_links(records)
     if df_gdb is not None and len(df_gdb):
         records = merge_gdb_data(df_gdb, records)
     if resolve_conflicts:

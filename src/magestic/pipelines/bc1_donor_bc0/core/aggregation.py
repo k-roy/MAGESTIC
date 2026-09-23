@@ -6,12 +6,15 @@ import numpy as np
 import pandas as pd
 from rapidfuzz.distance.Levenshtein import distance
 
-from .merge import SCOPE_COLUMNS, _count, _ids, _text
+from .merge import (LINK_SCOPE_COLUMNS, POPULATION_COLUMNS, SCOPE_COLUMNS, _count, _ids, _text,
+                    decode_population_counts, encode_population_counts)
 from ..readers.data_loader import count_distinct_pcrs
 
-# These identify the sampled biological population. V_library/library_ID/SPS
-# are retained as link evidence, never used to partition a purity denominator.
-POPULATION_COLUMNS = ('yeast_library', 'yeast_sublibrary', 'trafo_ID')
+# A link is the plasmid linkage and every separate PCR that observed it is support
+# (Kevin, 2026-09-23), so neither links nor a barcode's purity denominator are split by
+# the sampled population (POPULATION_COLUMNS); each link keeps its reads per population
+# in population_counts. V_library/library_ID/SPS keep links apart but never partition a
+# purity denominator.
 
 
 def _flag(value, default=False):
@@ -52,6 +55,20 @@ def _combine(group, count_columns, representative=None):
                max(records, key=lambda item: item['_representative_reads']))
     for column in count_columns:
         row[column] = sum(item[column] for item in records)
+    populations = {}
+    for item in records:
+        for population, count in item['_populations'].items():
+            populations[population] = populations.get(population, 0) + count
+    row['_populations'] = populations
+    row['population_counts'] = encode_population_counts(populations)
+    # A population column keeps a value only when every contributing observation agrees.
+    for index, column in enumerate(POPULATION_COLUMNS):
+        if column in group:
+            values = {population[index] for population in populations}
+            row[column] = next(iter(values)) if len(values) == 1 else None
+    if 'input_library_scope' in group:
+        row['input_library_scope'] = json.dumps({column: _text(row.get(column)) for column in SCOPE_COLUMNS},
+                                                sort_keys=True)
     for column in ('_pcr_ids', '_original_bc1s', '_guide_candidates', '_pcr_ids_2x150', '_pcr_ids_2x300', '_gdb_candidates'):
         row[column] = _union(item[column] for item in records)
     for column in ('_pcr_lower_bound', '_pcr_lower_bound_2x150', '_pcr_lower_bound_2x300'):
@@ -134,21 +151,25 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
         frame[column] = frame[column].map(_count)
     for column in ('bc1', 'donor', 'bc0'):
         frame[column] = frame[column].map(_text)
-    scopes = [column for column in POPULATION_COLUMNS if column in frame]
-    # SPS identifies construct evidence, not an independently transformed pool.
-    # It can constrain link collapsing but cannot split a barcode denominator.
-    link_scopes = [column for column in (*SCOPE_COLUMNS, 'input_library_scope', 'SPS') if column in frame]
+    # A barcode's denominator is all of its BDB reads in the input: the link grain spans
+    # sampled populations, so a per-population denominator would divide a link seen in two
+    # populations by one population's reads.
+    scopes = []
+    # The construct scope and SPS keep links apart during collapse; the sampled population
+    # does not (it is evidence in population_counts).
+    link_scopes = [column for column in (*LINK_SCOPE_COLUMNS, 'SPS') if column in frame]
     if frame.empty:
         for column, dtype in [('total_bc1_counts', float), ('bc1_purity', float),
                               ('unresolved_bc1_counts', float), ('num_distinct_donors', int),
                               ('num_PCR_replicates', int), ('support_tier', object),
-                              ('pcr_replicate_ids', object), ('barcode_identity_ambiguous', bool)]:
+                              ('pcr_replicate_ids', object), ('barcode_identity_ambiguous', bool),
+                              ('population_counts', object)]:
             frame[column] = pd.Series(dtype=dtype)
         return frame
 
     original_totals = defaultdict(int)
     original_unresolved = defaultdict(int)
-    ids, lower, exact, origins, guides, gdb_evidence = [], [], [], [], [], []
+    ids, lower, exact, origins, guides, gdb_evidence, populations = [], [], [], [], [], [], []
     source_ids = {source: [] for source in ('2x150', '2x300')}
     source_lower = {source: [] for source in source_ids}
     source_fields = {source for source in source_ids if
@@ -191,6 +212,11 @@ def aggregate_link_evidence(df, min_reads=2, min_pcr_replicates=2, collapse_sequ
         guide_values.update({_text(item.get('guide')) for item in candidates} - {None})
         gdb_evidence.append({json.dumps(item, sort_keys=True) for item in candidates})
         guides.append(guide_values)
+        observed = decode_population_counts(row.get('population_counts'))
+        if observed and sum(observed.values()) != row['counts']:
+            raise ValueError('population_counts does not sum to the row read count')
+        populations.append(observed or {tuple(_text(row.get(column)) for column in POPULATION_COLUMNS): row['counts']})
+    frame['_populations'] = populations
     frame['_pcr_ids'], frame['_pcr_lower_bound'] = ids, lower
     frame['pcr_support_exact'], frame['_original_bc1s'] = exact, origins
     frame['_guide_candidates'] = guides

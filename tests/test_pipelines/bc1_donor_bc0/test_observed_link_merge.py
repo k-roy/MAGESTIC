@@ -33,12 +33,22 @@ def test_exact_link_counts_sum_but_pcr_identities_union():
 
 
 def test_scope_and_sps_are_not_reconstructed_from_barcode():
+    """Revised 2026-09-23 (218 patch 41; Kevin, ledger section 7 item 4: separate PCRs count
+    toward one BDB link because the concern is PCR recombination).
+
+    This asserted two rows, {trafo_3, trafo_4}, with one PCR each. One linkage seen in two
+    transformations of one construct library is now one link carrying both PCRs. The
+    transformation scope is kept, as each population's reads in population_counts, and SPS
+    is kept exactly as given rather than reconstructed.
+    """
     merged = merge_data_sources(df_2x300=pd.DataFrame([
         full("A" * 129, 10, trafo_ID="trafo_3", SPS=SPS),
         full("A" * 129, 20, "p2", trafo_ID="trafo_4", SPS=SPS)]))
-    assert sorted(merged["total_counts"]) == [10, 20]
-    assert set(merged["trafo_ID"]) == {"trafo_3", "trafo_4"}
-    assert merged["total_pcr_replicates"].tolist() == [1, 1]
+    assert merged["total_counts"].tolist() == [30]
+    assert merged["total_pcr_replicates"].tolist() == [2]
+    assert merged["SPS"].tolist() == [SPS] and pd.isna(merged.iloc[0]["trafo_ID"])
+    assert {(p["trafo_ID"], p["counts"]) for p in json.loads(merged.iloc[0]["population_counts"])} == {
+        ("trafo_3", 10), ("trafo_4", 20)}
 
 
 @pytest.mark.parametrize("same_pcr", [False, True])
