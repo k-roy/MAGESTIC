@@ -82,14 +82,24 @@ def count_data_rows(path: str | Path, *, comment_prefix: str = "#") -> int:
     a header-only file and returns normally when every sample's VCF is missing. Both are
     clean-looking zero-row successes, so every step counts its own output rows against the
     manifest denominator.
+
+    The header is found by CONTENT, never by line position: TRACE comments it out
+    (`#sample_name\\t...`), magestic's own tables write it plain, and a `# key=value` stamp
+    may precede either. A comment line carrying a tab is a commented header; without one,
+    the first non-comment line is the header. Counting line 0 as the header miscounted a
+    stamped table by one (audit W14b). `qc.require_nonempty_output` counts with this rule.
     """
     n = 0
+    commented_header = False
     with Path(path).open() as fh:
-        for i, line in enumerate(fh):
-            if i == 0 or line.startswith(comment_prefix) or not line.strip():
+        for line in fh:
+            if not line.strip():
+                continue
+            if line.startswith(comment_prefix):
+                commented_header = commented_header or "\t" in line
                 continue
             n += 1
-    return n
+    return n if commented_header else max(n - 1, 0)
 
 
 def write_bc1_calls(calls: Iterable[Bc1Call], path: str | Path) -> Path:
