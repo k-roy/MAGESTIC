@@ -76,3 +76,22 @@ def test_declared_empty_control_cannot_become_a_physical_clone(tmp_path):
     assert pd.read_csv(out,sep='\t').empty
     provenance=json.loads(Path(str(out)+'.provenance.json').read_text())
     assert provenance['counts']['input_reads']==7 and provenance['counts']['unassigned_reads']==7
+
+def test_all_bc1_only_sample_publishes_empty_and_accounts_every_read(tmp_path):
+    # Audit REDI-C003: at 9d654b8 an all-bc1-only input crashed on the empty REDI extraction.
+    c,k,meta,key,p,rows=setup(tmp_path)
+    bc1_only=rows.copy();bc1_only.R2_seq='T'*40
+    extra=bc1_only.copy();extra.counts=3
+    pd.concat([bc1_only,extra]).to_csv(p,sep='\t',index=False)
+    out,_=run_step_c(c,k);result=pd.read_csv(out,sep='\t')
+    assert len(result)==0
+    counts=json.loads(Path(str(out)+'.provenance.json').read_text())['counts']
+    assert (counts['input_reads'],counts['assigned_redi_reads'],counts['unassigned_reads'])==(10,0,10)
+
+def test_zero_read_sample_publishes_empty_with_zero_accounting(tmp_path):
+    c,k,meta,key,p,rows=setup(tmp_path)
+    rows.iloc[0:0].to_csv(p,sep='\t',index=False)
+    out,_=run_step_c(c,k);result=pd.read_csv(out,sep='\t')
+    assert len(result)==0
+    counts=json.loads(Path(str(out)+'.provenance.json').read_text())['counts']
+    assert (counts['input_reads'],counts['assigned_redi_reads'],counts['unassigned_reads'])==(0,0,0)
