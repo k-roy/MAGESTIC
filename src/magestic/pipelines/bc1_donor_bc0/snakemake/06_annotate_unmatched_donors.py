@@ -447,6 +447,7 @@ class AnnotationResult:
     closest_delta_to_designed: int = -1
     incorporation_probability: float = 0.0
     confidence_tier: Optional[str] = None
+    designed_variants_missing: int = 0
 
     # Design table the closest design came from, and how it was chosen (BDB-H12)
     design_table: Optional[str] = None
@@ -993,22 +994,39 @@ def parse_individual_variants_string(indiv_vars_str: str) -> List[Tuple[str, int
     return variants
 
 
+def _same_variant(observed: Tuple[str, int, str, str], designed: Tuple[str, int, str, str]) -> bool:
+    """One variant: the same position and alleles, and the same chromosome when both name one.
+
+    The harmonized key's designed variants carry no chromosome ("25340_A_C_SNP"), and its indels
+    are VCF-anchored like extract_variants_from_alignment's (BDB-H13).
+    """
+    ochrom, opos, oref, oalt = observed
+    dchrom, dpos, dref, dalt = designed
+    return (opos == dpos and oref.upper() == dref.upper() and oalt.upper() == dalt.upper()
+            and (not ochrom or not dchrom or ochrom == dchrom))
+
+
+def required_designed_variants(
+    designed_variants: List[Tuple[str, int, str, str]],
+) -> List[Tuple[str, int, str, str]]:
+    """The designed variants a donor must carry; a no-op key entry (ref equal to alt) is none."""
+    return [variant for variant in designed_variants if variant[2].upper() != variant[3].upper()]
+
+
 def compute_delta_variants(
     observed_variants: List[Tuple[str, int, str, str]],
     designed_variants: List[Tuple[str, int, str, str]],
 ) -> List[Tuple[str, int, str, str]]:
-    """Compute delta variants (observed but not designed)."""
+    """Observed variants that are not a designed variant.
+
+    A variant at a designed position with a different allele is a delta: position alone erased a
+    designed A>C observed as A>G (BDB-H13).
+    """
     if not observed_variants:
         return []
-
-    designed_positions = {pos for _, pos, _, _ in designed_variants}
-    delta = [
-        (chrom, pos, ref, alt)
-        for chrom, pos, ref, alt in observed_variants
-        if pos not in designed_positions
-    ]
-
-    return delta
+    designed = required_designed_variants(designed_variants)
+    return [variant for variant in observed_variants
+            if not any(_same_variant(variant, other) for other in designed)]
 
 
 # =============================================================================
@@ -1078,24 +1096,38 @@ def classify_rescue_status(
     designed_variants: List[Tuple[str, int, str, str]],
     oligo_info: OligoInfo
 ) -> Dict:
-    """Classify whether this donor can be rescued for hit calling."""
+    """Classify whether this donor can be rescued for hit calling.
+
+    A donor is attributed to its closest design only when it carries every designed allele.
+    DESIGN_UNKNOWN: the design has no variant to attribute to (an empty or no-op key entry; this
+    was CAN_ATTRIBUTE, BDB-H14). DESIGNED_VARIANT_ABSENT: a designed allele is not observed, which
+    includes a donor with no variants at all (was NO_VARIANTS), a different allele at a designed
+    site (was NO_DELTA, BDB-H13) and a donor carrying only part of the design (was NO_DELTA). None
+    of these is in assign_confidence_tier's attributable set.
+    """
     result = {
         "rescue_status": None,
         "closest_delta_to_designed": -1,
         "incorporation_probability": 0.0,
         "delta_variant_count": 0,
+        "designed_variants_missing": 0,
     }
 
-    if not observed_variants:
-        result["rescue_status"] = "NO_VARIANTS"
+    designed = required_designed_variants(designed_variants)
+    if not designed:
+        result["rescue_status"] = "DESIGN_UNKNOWN"
+        result["delta_variant_count"] = len(observed_variants)
         return result
 
-    designed_positions = {pos for _, pos, _, _ in designed_variants}
-    delta_variants = [
-        (chrom, pos, ref, alt) for chrom, pos, ref, alt in observed_variants
-        if pos not in designed_positions
-    ]
+    missing = [variant for variant in designed
+               if not any(_same_variant(other, variant) for other in observed_variants)]
+    delta_variants = compute_delta_variants(observed_variants, designed)
     result["delta_variant_count"] = len(delta_variants)
+    result["designed_variants_missing"] = len(missing)
+
+    if missing:
+        result["rescue_status"] = "DESIGNED_VARIANT_ABSENT"
+        return result
 
     if not delta_variants:
         result["rescue_status"] = "NO_DELTA"
@@ -1104,7 +1136,7 @@ def classify_rescue_status(
 
     min_distance = float('inf')
     for _, delta_pos, _, _ in delta_variants:
-        for _, designed_pos, _, _ in designed_variants:
+        for _, designed_pos, _, _ in designed:
             dist = abs(delta_pos - designed_pos)
             if dist < min_distance:
                 min_distance = dist
@@ -1304,6 +1336,7 @@ RESULT_COLUMNS = (
     "design_table",
     "design_choice",
     "closest_candidates",
+    "designed_variants_missing",
 )
 
 
@@ -1482,6 +1515,7 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
                     result.closest_delta_to_designed = rescue_result["closest_delta_to_designed"]
                     result.incorporation_probability = rescue_result["incorporation_probability"]
                     result.delta_variant_count = rescue_result["delta_variant_count"]
+                    result.designed_variants_missing = rescue_result["designed_variants_missing"]
 
             result.confidence_tier = assign_confidence_tier(result)
 
@@ -1532,6 +1566,7 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
             "design_table": result.design_table,
             "design_choice": result.design_choice,
             "closest_candidates": result.closest_candidates,
+            "designed_variants_missing": result.designed_variants_missing,
         }
         result_records.append(record)
 
