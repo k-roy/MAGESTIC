@@ -141,27 +141,85 @@ YEAST_SUBLIBRARY_TO_DESIGN = {
     "impLbCas12a": "spcas9",  # 2021 pool — spcas9_lookup contains impLbCas12a oligos
 }
 
-# V_library to oligo design — fallback when yeast_sublibrary is NaN
-# HANDOFF_20260527 forward-port: used for 2021 QTL screens where step05
-# trafo_key was not provided, so yeast_sublibrary cannot be derived.
+# Construct pool (V library, with its harmonized ID) to oligo design. The unmatched donors of each
+# pool's SPS matched this table at a median edit distance of 1, against 2-14 in the other
+# (planning 218 probes/step06_ground_truth.py on the 20250912 and yL406 references).
 V_LIBRARY_TO_DESIGN = {
-    "V634": "spcas9",  # SpCas9/SpG NGG, 2021 pool
+    "V634": "spcas9", "V429": "spcas9",  # SpCas9/SpG NGG, 2021 pool
     "V450": "spcas9",  # LbCas12a CRISPEY, 2021 pool
     "V454": "spcas9",  # LbCas12a non-editing controls, 2021 pool
+    "V629": "spg", "V545": "spg",  # SpG NGNG, 2024 pool
+    "V631": "spg", "V546": "spg",  # SpG NGNH, 2024 pool
+    "V547": "spg",  # SpG NGNG and NGNH SV-prone subset, 2024 pool
 }
+# sps_library_mapping.tsv oligo_pool to oligo design.
+POOL_TO_DESIGN = {"2024_twist": "spg", "2021_twist": "spcas9"}
 
 
-def _resolve_design(yeast_sublibrary: str) -> str:
-    """Resolve oligo design from yeast_sublibrary or V_library key.
+def _declared_text(value) -> Optional[str]:
+    """A table cell as stripped text, or None when missing or blank."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return text or None
 
-    HANDOFF_20260527 forward-port: NaN guard + V_library fallback. Without this,
-    all bc1s routed to default 'spg' k-mer index → 100% tier_5_no_match for
-    SpCas9/LbCas12a donors during rescue (V450/V454/V634).
+
+def _resolve_design(label) -> Optional[str]:
+    """The design a yeast_sublibrary, nuclease_PAM or V library label names, or None.
+
+    An unrecognized label names nothing: it no longer defaults to 'spg', which sent trafo_3 and
+    trafo_4 (both V634, the 2021 pool) to the 2024 design (BDB-H12).
     """
-    design = YEAST_SUBLIBRARY_TO_DESIGN.get(yeast_sublibrary)
-    if design is None:
-        design = V_LIBRARY_TO_DESIGN.get(yeast_sublibrary, "spg")
-    return design
+    label = _declared_text(label)
+    return YEAST_SUBLIBRARY_TO_DESIGN.get(label) or V_LIBRARY_TO_DESIGN.get(label)
+
+
+def load_sps_pools(path: Path) -> Dict[str, str]:
+    """SPS -> design table from an sps_library_mapping.tsv (oligo_pool, else library_id)."""
+    table = pd.read_csv(path, sep="\t", dtype=str)
+    pools = {}
+    for row in table.to_dict("records"):
+        sps = _declared_text(row.get("sps"))
+        design = (POOL_TO_DESIGN.get(_declared_text(row.get("oligo_pool")))
+                  or V_LIBRARY_TO_DESIGN.get(_declared_text(row.get("library_id"))))
+        if sps and design:
+            pools[sps] = design
+    return pools
+
+
+def row_pool_design(row, sps_pools: Dict[str, str]) -> Optional[str]:
+    """The design table a row's own construct identity names: its SPS, else its V library, else a
+    recognized nuclease_PAM or yeast_sublibrary label; None when nothing names one."""
+    sps = _declared_text(row.get("SPS"))
+    if sps in sps_pools:
+        return sps_pools[sps]
+    for column in ("V_library", "library_ID", "nuclease_PAM", "yeast_sublibrary"):
+        design = _resolve_design(row.get(column))
+        if design:
+            return design
+    return None
+
+
+def choose_design(candidates: Dict[str, tuple], pool_design: Optional[str]) -> Tuple[Optional[str], str]:
+    """The design table whose closest design is nearer, and how it was chosen (BDB-H12).
+
+    `candidates` maps a table to its closest (name, full_ed, middle_ed, guide). Both tables are
+    searched because a pool is not always one table: a third of the matched V634 rows of 20250912
+    carry names found only in the 2024 table. The row's own pool breaks an exact tie; a tie it
+    cannot break is 'ambiguous' and chooses nothing.
+    """
+    if not candidates:
+        return None, "no_match"
+    if len(candidates) == 1:
+        table = next(iter(candidates))
+        return table, f"only_{table}"
+    best = min(full_ed for _, full_ed, _, _ in candidates.values())
+    nearest = sorted(table for table, (_, full_ed, _, _) in candidates.items() if full_ed == best)
+    if len(nearest) == 1:
+        return nearest[0], "lower_edit_distance"
+    if pool_design in nearest:
+        return pool_design, "tie_pool"
+    return None, "ambiguous"
 
 
 # =============================================================================
@@ -326,6 +384,7 @@ _WORKER_REFERENCE_FASTA: Path = None
 _WORKER_CDS_LOOKUP: Dict = {}
 _WORKER_OUTPUT_DIR: Path = None
 _WORKER_PROGRESS_DIR: Path = None
+_WORKER_SPS_POOLS: Dict = {}
 
 
 # =============================================================================
@@ -388,6 +447,11 @@ class AnnotationResult:
     closest_delta_to_designed: int = -1
     incorporation_probability: float = 0.0
     confidence_tier: Optional[str] = None
+
+    # Design table the closest design came from, and how it was chosen (BDB-H12)
+    design_table: Optional[str] = None
+    design_choice: Optional[str] = None
+    closest_candidates: Optional[str] = None
 
 
 @dataclass
@@ -520,12 +584,9 @@ def get_oligo_lookup_for_yeast_sublibrary(
     spg_lookup: Dict[str, OligoInfo],
     spcas9_lookup: Dict[str, OligoInfo]
 ) -> Dict[str, OligoInfo]:
-    """Get the appropriate oligo lookup dict for a given yeast_sublibrary."""
+    """The oligo lookup a label names, or an empty lookup when it names none."""
     design = _resolve_design(yeast_sublibrary)
-    if design == "spg":
-        return spg_lookup
-    else:
-        return spcas9_lookup
+    return {"spg": spg_lookup, "spcas9": spcas9_lookup}.get(design, {})
 
 
 def get_kmer_index_for_yeast_sublibrary(
@@ -533,12 +594,9 @@ def get_kmer_index_for_yeast_sublibrary(
     spg_kmer_index: Dict[str, set],
     spcas9_kmer_index: Dict[str, set]
 ) -> Dict[str, set]:
-    """Get the appropriate kmer index for a given yeast_sublibrary."""
+    """The k-mer index a label names, or an empty index when it names none."""
     design = _resolve_design(yeast_sublibrary)
-    if design == "spg":
-        return spg_kmer_index
-    else:
-        return spcas9_kmer_index
+    return {"spg": spg_kmer_index, "spcas9": spcas9_kmer_index}.get(design, {})
 
 
 # =============================================================================
@@ -1168,13 +1226,14 @@ def init_worker(
     cds_lookup: Dict[str, List[CdsInfo]],
     output_dir: Path,
     progress_dir: Path,
+    sps_pools: Optional[Dict[str, str]] = None,
 ):
     """Initialize worker process with shared data."""
     global _WORKER_OLIGO_LOOKUP_SPG, _WORKER_OLIGO_LOOKUP_SPCAS9
     global _WORKER_KMER_INDEX_SPG, _WORKER_KMER_INDEX_SPCAS9
     global _WORKER_INDIVIDUAL_VARIANTS_LOOKUP
     global _WORKER_REFERENCE_FASTA, _WORKER_CDS_LOOKUP
-    global _WORKER_OUTPUT_DIR, _WORKER_PROGRESS_DIR
+    global _WORKER_OUTPUT_DIR, _WORKER_PROGRESS_DIR, _WORKER_SPS_POOLS
 
     _WORKER_OLIGO_LOOKUP_SPG = spg_lookup
     _WORKER_OLIGO_LOOKUP_SPCAS9 = spcas9_lookup
@@ -1185,6 +1244,7 @@ def init_worker(
     _WORKER_CDS_LOOKUP = cds_lookup
     _WORKER_OUTPUT_DIR = output_dir
     _WORKER_PROGRESS_DIR = progress_dir
+    _WORKER_SPS_POOLS = sps_pools or {}
 
 
 def log_progress(chunk_idx: int, message: str, progress_dir: Path = None):
@@ -1241,6 +1301,9 @@ RESULT_COLUMNS = (
     "closest_delta_to_designed",
     "incorporation_probability",
     "confidence_tier",
+    "design_table",
+    "design_choice",
+    "closest_candidates",
 )
 
 
@@ -1250,6 +1313,8 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
     spcas9_lookup = _WORKER_OLIGO_LOOKUP_SPCAS9
     spg_kmer_index = _WORKER_KMER_INDEX_SPG
     spcas9_kmer_index = _WORKER_KMER_INDEX_SPCAS9
+    tables = {"spg": (spg_lookup, spg_kmer_index), "spcas9": (spcas9_lookup, spcas9_kmer_index)}
+    sps_pools = _WORKER_SPS_POOLS
     individual_variants_lookup = _WORKER_INDIVIDUAL_VARIANTS_LOOKUP
     reference_fasta = _WORKER_REFERENCE_FASTA
     cds_lookup = _WORKER_CDS_LOOKUP
@@ -1283,12 +1348,6 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
         yeast_sublibrary_col = "yeast_sublibrary"
     elif "sublibrary" in chunk_df.columns:
         yeast_sublibrary_col = "sublibrary"
-    # V_library / library_ID column: HANDOFF_20260527 fallback when yeast_sublibrary is NaN
-    v_library_col = None
-    for _col in ("V_library", "library_ID"):
-        if _col in chunk_df.columns:
-            v_library_col = _col
-            break
 
     log_progress(chunk_idx, "Step 1: Reading existing gdb columns and finding closest donors...", progress_dir)
 
@@ -1296,17 +1355,8 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
         bc1 = row["bc1"]
         donor = row.get(donor_col, "")
         yeast_sublibrary = row.get(yeast_sublibrary_col, None) if yeast_sublibrary_col else None
-        # Fall back to V_library when yeast_sublibrary is NaN/empty (HANDOFF_20260527)
-        if not yeast_sublibrary or pd.isna(yeast_sublibrary):
-            v_lib = row.get(v_library_col, None) if v_library_col else None
-            if v_lib and not pd.isna(v_lib) and v_lib in V_LIBRARY_TO_DESIGN:
-                yeast_sublibrary = v_lib  # resolved via V_LIBRARY_TO_DESIGN in _resolve_design
-            else:
-                yeast_sublibrary = "SpG_NGNG"
-
-        result = AnnotationResult(bc1=bc1, yeast_sublibrary=yeast_sublibrary)
-        oligo_lookup = get_oligo_lookup_for_yeast_sublibrary(yeast_sublibrary, spg_lookup, spcas9_lookup)
-        kmer_index = get_kmer_index_for_yeast_sublibrary(yeast_sublibrary, spg_kmer_index, spcas9_kmer_index)
+        # The row's own label is reported as it is; no SpG_NGNG is filled in (BDB-H12).
+        result = AnnotationResult(bc1=bc1, yeast_sublibrary=_declared_text(yeast_sublibrary))
 
         # Use existing gdb columns
         guide_val = row.get("guide", "")
@@ -1322,16 +1372,30 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
         closest_designed_seq = None
         compared_donor = variable_donor(donor)
         if compared_donor and len(compared_donor) >= MIDDLE_DONOR_END:
-            closest_name, full_ed, middle_ed, inferred_guide = find_closest_designed_donor(
-                compared_donor, oligo_lookup, kmer_index=kmer_index
-            )
-            result.closest_oligo_name = closest_name
-            result.closest_donor_edit_distance = full_ed
-            result.closest_middle_donor_edit_distance = middle_ed
-            result.inferred_guide = inferred_guide
-
-            if closest_name and closest_name in oligo_lookup:
-                closest_designed_seq = oligo_lookup[closest_name].donor
+            # Both design tables are searched and the nearer design wins; the row's own pool
+            # (SPS, else V library) breaks an exact tie (BDB-H12).
+            candidates = {}
+            for table, (lookup, index) in tables.items():
+                closest_name, full_ed, middle_ed, inferred_guide = find_closest_designed_donor(
+                    compared_donor, lookup, kmer_index=index
+                )
+                if closest_name is not None and full_ed >= 0:
+                    candidates[table] = (closest_name, full_ed, middle_ed, inferred_guide)
+            table, choice = choose_design(candidates, row_pool_design(row, sps_pools))
+            result.design_table, result.design_choice = table, choice
+            result.closest_candidates = ";".join(
+                f"{name}:{closest}:{full_ed}" for name, (closest, full_ed, _, _) in sorted(candidates.items())) or None
+            if table is not None:
+                closest_name, full_ed, middle_ed, inferred_guide = candidates[table]
+                result.closest_oligo_name = closest_name
+                result.closest_donor_edit_distance = full_ed
+                result.closest_middle_donor_edit_distance = middle_ed
+                result.inferred_guide = inferred_guide
+                oligo_lookup = tables[table][0]
+                if closest_name in oligo_lookup:
+                    closest_designed_seq = oligo_lookup[closest_name].donor
+        else:
+            result.design_choice = "no_donor"
 
         # Extended donor detection
         if donor:
@@ -1374,9 +1438,7 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
                 continue
 
             result = bc1_to_result[bc1]
-            oligo_lookup = get_oligo_lookup_for_yeast_sublibrary(
-                result.yeast_sublibrary, spg_lookup, spcas9_lookup
-            )
+            oligo_lookup = tables[result.design_table][0] if result.design_table else {}
 
             if not alignment.is_unmapped:
                 result.alignment_chrom = alignment.reference_name
@@ -1467,6 +1529,9 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
             "closest_delta_to_designed": result.closest_delta_to_designed,
             "incorporation_probability": result.incorporation_probability,
             "confidence_tier": result.confidence_tier,
+            "design_table": result.design_table,
+            "design_choice": result.design_choice,
+            "closest_candidates": result.closest_candidates,
         }
         result_records.append(record)
 
@@ -1555,6 +1620,9 @@ def main():
     # Optional files
     parser.add_argument("--harmonized-oligo-key", type=Path, default=None,
                         help="Harmonized oligo key file for delta variant computation")
+    parser.add_argument("--sps-mapping", type=Path, default=None,
+                        help="sps_library_mapping.tsv; its oligo_pool breaks a tie between the two "
+                             "design tables (otherwise the row's V library does)")
 
     # Processing options
     parser.add_argument("--n-workers", type=int, default=DEFAULT_N_WORKERS,
@@ -1620,6 +1688,9 @@ def main():
     if args.harmonized_oligo_key:
         individual_variants_lookup = load_individual_variants_lookup(args.harmonized_oligo_key)
 
+    sps_pools = load_sps_pools(args.sps_mapping) if args.sps_mapping else {}
+    print(f"  SPS pools for tie-breaking: {len(sps_pools)}")
+
     # GFF annotation
     print("\n3. Loading GFF annotation...")
     cds_lookup = load_gff_cds_info(args.annotation_gff)
@@ -1664,7 +1735,7 @@ def main():
         initializer=init_worker,
         initargs=(spg_lookup, spcas9_lookup, spg_kmer_index, spcas9_kmer_index,
                   individual_variants_lookup, args.reference_genome, cds_lookup,
-                  args.output_dir, progress_dir)
+                  args.output_dir, progress_dir, sps_pools)
     ) as pool:
         results = list(tqdm(
             pool.imap(process_chunk_wrapper, chunk_args),
