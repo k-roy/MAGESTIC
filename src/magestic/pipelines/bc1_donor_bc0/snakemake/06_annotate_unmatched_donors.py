@@ -567,6 +567,20 @@ def build_kmer_index(oligo_lookup: Dict[str, OligoInfo]) -> Dict[str, set]:
     return kmer_to_oligos
 
 
+def variable_donor(donor):
+    """The designed-length variable donor of a BDB donor read (BDB-H11-R1).
+
+    Unmatched donors keep the raw read representation: a 5' plasmid prefix and cloning motif ahead
+    of the variable donor, whose 3' end abuts the SPS (median 238 nt on the 20250912 and yL406
+    references, against 129-nt designs). Compared whole, no raw donor was within MAX_EDIT_DISTANCE of
+    any design, so every unmatched donor was tier_5_no_match. The last DONOR_LENGTH bases are the
+    comparable donor; a donor no longer than that, or a missing one, is returned unchanged.
+    """
+    if isinstance(donor, str) and len(donor) > DONOR_LENGTH:
+        return donor[-DONOR_LENGTH:]
+    return donor
+
+
 def find_closest_designed_donor(
     observed_donor: str,
     oligo_lookup: Dict[str, OligoInfo],
@@ -1303,11 +1317,13 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
         result.gdb_lookup_perfect_donor = bool(row.get("gdb_perfect_donor", False))
         result.gdb_lookup_perfect_middle = bool(row.get("gdb_perfect_middle_donor_region", False))
 
-        # Closest designed donor (using k-mer index for ~10,000x speedup)
+        # Closest designed donor (using k-mer index for ~10,000x speedup), compared on the
+        # variable donor rather than the raw read representation (BDB-H11-R1).
         closest_designed_seq = None
-        if donor and len(donor) >= MIDDLE_DONOR_END:
+        compared_donor = variable_donor(donor)
+        if compared_donor and len(compared_donor) >= MIDDLE_DONOR_END:
             closest_name, full_ed, middle_ed, inferred_guide = find_closest_designed_donor(
-                donor, oligo_lookup, kmer_index=kmer_index
+                compared_donor, oligo_lookup, kmer_index=kmer_index
             )
             result.closest_oligo_name = closest_name
             result.closest_donor_edit_distance = full_ed
@@ -1327,7 +1343,9 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
 
         results.append(result)
 
-        donor_to_align = result.gdb_lookup_donor if result.gdb_lookup_donor else donor
+        # The genome alignment reads the same variable donor: the raw prefix is plasmid sequence
+        # and aligned as long insertions near the site.
+        donor_to_align = result.gdb_lookup_donor if result.gdb_lookup_donor else compared_donor
         if donor_to_align and len(donor_to_align) >= 50:
             donors_for_alignment[bc1] = donor_to_align
 
