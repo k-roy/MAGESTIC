@@ -1187,6 +1187,49 @@ def log_progress(chunk_idx: int, message: str, progress_dir: Path = None):
         f.write(f"[{timestamp}] {message}\n")
 
 
+# One results.tsv column per annotation field, written even for an empty chunk (BDB-H24).
+RESULT_COLUMNS = (
+    "bc1",
+    "yeast_sublibrary",
+    "gdb_lookup_found",
+    "gdb_lookup_guide",
+    "gdb_lookup_oligo_name",
+    "gdb_lookup_perfect_donor",
+    "gdb_lookup_perfect_middle",
+    "closest_oligo_name",
+    "closest_donor_edit_distance",
+    "closest_middle_donor_edit_distance",
+    "inferred_guide",
+    "alignment_chrom",
+    "alignment_start",
+    "alignment_end",
+    "alignment_mapq",
+    "alignment_score",
+    "aligner_used",
+    "observed_individual_variants",
+    "designed_individual_variants",
+    "delta_variants",
+    "delta_variant_count",
+    "systematic_ORF_name",
+    "gene_name",
+    "aa_change",
+    "codon_variant_type",
+    "is_chimera",
+    "chimera_left_parent",
+    "chimera_right_parent",
+    "chimera_junction_pos",
+    "chimera_gap_bp",
+    "is_extended",
+    "extension_non_bc0_side_bp",
+    "extension_bc0_side_bp",
+    "observed_donor_length",
+    "rescue_status",
+    "closest_delta_to_designed",
+    "incorporation_probability",
+    "confidence_tier",
+)
+
+
 def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
     """Process a single chunk of unmatched donors."""
     spg_lookup = _WORKER_OLIGO_LOOKUP_SPG
@@ -1210,7 +1253,8 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
 
     if n_rows == 0:
         result_path = chunk_output_dir / "results.tsv"
-        pd.DataFrame().to_csv(result_path, sep="\t", index=False)
+        # A header-only table, so the merge reads zero rows instead of failing on a blank file.
+        pd.DataFrame(columns=list(RESULT_COLUMNS)).to_csv(result_path, sep="\t", index=False)
         log_progress(chunk_idx, "Empty chunk, skipping", progress_dir)
         return chunk_idx, result_path
 
@@ -1408,7 +1452,7 @@ def process_chunk(chunk_path: Path, chunk_idx: int) -> Tuple[int, Path]:
         }
         result_records.append(record)
 
-    result_df = pd.DataFrame(result_records)
+    result_df = pd.DataFrame(result_records, columns=list(RESULT_COLUMNS))
     result_path = chunk_output_dir / "results.tsv"
     result_df.to_csv(result_path, sep="\t", index=False)
 
