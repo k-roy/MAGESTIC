@@ -212,7 +212,8 @@ def _run_one_sample(config: WGSConfig, sample: str, *, record: WGSSample | None 
     )
     use_plasmid = config.bc1.use_plasmid and config.locus.has_plasmid_track
     tracks = [genome_track, plasmid_track] if use_plasmid else [genome_track]
-    validate_tracks(tracks, record.reference)
+    validate_tracks(tracks, record.reference, amplicon_window_sequences=(
+        config.locus.amplicon_left_window_sequence, config.locus.amplicon_right_window_sequence))
 
     context = context if context is not None else {}
     if 'bridge' not in context:

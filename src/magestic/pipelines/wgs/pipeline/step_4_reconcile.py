@@ -147,7 +147,9 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
     )
     use_plasmid = config.bc1.use_plasmid and config.locus.has_plasmid_track
     validate_tracks([genome_track, plasmid_track] if use_plasmid else [genome_track],
-                    record.reference)
+                    record.reference, amplicon_window_sequences=(
+                        config.locus.amplicon_left_window_sequence,
+                        config.locus.amplicon_right_window_sequence))
 
     with ExitStack() as handles:
         bam = handles.enter_context(pysam.AlignmentFile(str(bam_path), "rb"))

@@ -308,6 +308,12 @@ class WGSLocusConfig:
     plasmid_bc_right_sequence: str | None = None
     amplicon_left_window: str | None = None  # "start-end", 1-based inclusive
     amplicon_right_window: str | None = None  # "start-end", 1-based inclusive
+    # The reference sequence each window covers. Required with its window: a window is a
+    # raw coordinate pair, and `validate_tracks` compares this sequence with the FASTA
+    # every run, as it does the junction flanks, so a re-pointed locus cannot leave the
+    # windows silently at the old primer sites.
+    amplicon_left_window_sequence: str | None = None
+    amplicon_right_window_sequence: str | None = None
 
     @property
     def has_plasmid_track(self) -> bool:
