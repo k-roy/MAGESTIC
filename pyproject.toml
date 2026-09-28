@@ -110,6 +110,8 @@ magestic-redi-annotate     = "magestic.pipelines.redi._cli:annotate_main"
 magestic-redi-cross-array  = "magestic.pipelines.redi._cli:cross_array_main"
 magestic-redi-wgs-check    = "magestic.pipelines.redi._cli:wgs_check_main"
 magestic-redi-rearray      = "magestic.pipelines.redi._cli:rearray_main"
+magestic-redi-worklist     = "magestic.pipelines.redi._cli:worklist_main"
+magestic-redi-worklist-validate = "magestic.pipelines.redi._cli:worklist_validate_main"
 # WGS submodule (ARCHITECTURE_POLICY §11) — umbrella + per-step CLIs
 magestic-wgs               = "magestic.pipelines.wgs._cli:umbrella_main"
 magestic-wgs-bc1           = "magestic.pipelines.wgs._cli:bc1_main"
