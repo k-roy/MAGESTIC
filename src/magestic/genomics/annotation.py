@@ -218,17 +218,26 @@ def load_ORF_coordinates(
         of (chrom, start_1based, end_1based, strand) tuples.
     """
     orf_dict: Dict[str, List[Tuple[str, int, int, str]]] = {}
+    malformed_lines = 0
     with open(gff_filename) as fh:
         for line in fh:
             if line.startswith('#'):
                 continue
             parts = line.strip().split('\t')
             if len(parts) < 9:
+                # Not a GFF record -- most often a line of an embedded ##FASTA
+                # block, which does not start with '#'. Skipped AND counted: a
+                # silent skip hides a truncated or mis-delimited annotation file.
+                malformed_lines += 1
                 continue
             chrom, _, feature_type, start, end, _, strand, _, annotation = parts
             if feature_type != 'CDS' or chrom == 'chrmt':
                 continue
-            start_i, end_i = int(start), int(end)
+            try:
+                start_i, end_i = int(start), int(end)
+            except ValueError:
+                malformed_lines += 1
+                continue
             gene_name_raw = get_gene_name_from_gff_annotation(annotation)
             if gene_name_raw is None:
                 continue
@@ -237,6 +246,11 @@ def load_ORF_coordinates(
             if gene_name not in orf_dict:
                 orf_dict[gene_name] = []
             orf_dict[gene_name].append((chrom, start_i, end_i, strand))
+    if malformed_lines:
+        logger.warning(
+            "load_ORF_coordinates: skipped %d malformed lines in %s",
+            malformed_lines, gff_filename,
+        )
     return orf_dict
 
 

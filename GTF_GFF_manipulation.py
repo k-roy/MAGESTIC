@@ -3,7 +3,10 @@ set of tools to extract information from annotation files in GTF or GFF format
 '''
 import operator, bedgraph_computation
 import imp
+import logging
 bedgraph_computation = imp.reload(bedgraph_computation)
+
+logger = logging.getLogger(__name__)
 
 HARD_DRIVE =  '/path/to/Dropbox/' # '/Volumes/SANDISK128/'
 INPUT_DIR = HARD_DRIVE + 'datasets/'
@@ -251,20 +254,37 @@ def load_ORF_coordinates(gff_filename):
     additional exons get appended as separate tuples
     '''
     ORF_dict = {}
+    malformed_lines = 0
     with open(gff_filename, 'r') as gff:
         for line in gff:
             if line[0] != '#':
                 try:
                     chrom, source, region, start, end, period, strand, frame, annotation =  line.split('\t')
                     start, end = int(start), int(end)
-                except:
-                    print(line)
+                except ValueError:
+                    ## Any line that is not 9 tab-separated fields with integer
+                    ## coordinates -- most often every line of an embedded ##FASTA
+                    ## block, which does not start with '#'. It MUST be skipped:
+                    ## falling through here left chrom/region/start/end/strand/
+                    ## annotation holding the PREVIOUS feature's values and
+                    ## re-emitted that feature once per malformed line, which is how
+                    ## a 17-feature GFF became ~152,000 duplicate lines.
+                    malformed_lines += 1
+                    continue
                 if region == 'CDS' and chrom != 'chrmt':
                     gene_name = get_gene_name_from_gff_annotation(annotation)[:-4]
                     if gene_name not in ORF_dict:
                         ORF_dict[gene_name] = [ (chrom, start, end, strand) ]
                     else:
                         ORF_dict[gene_name] += [ (chrom, start, end, strand) ]
+    if malformed_lines:
+        ## Report the COUNT, not the lines: an embedded FASTA block would otherwise
+        ## print tens of thousands of sequence lines into stdout and bury the signal.
+        logger.warning(
+            'load_ORF_coordinates: skipped %d malformed lines in %s (not 9 '
+            'tab-separated GFF fields with integer coordinates)',
+            malformed_lines, gff_filename,
+        )
     return ORF_dict
 
 def get_ORF_seq_and_CDS_coords(ORF, ORF_dict, genome_seq):
