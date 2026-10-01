@@ -32,15 +32,57 @@ from pathlib import Path
 try:
     from magestic.pipelines.bc1_donor_bc0.core.matching import (
         load_and_build_lookup, match_dataframe, match_dataframe_scoped, repair_gdb01_shifted_guides,
-        assign_sps_scope, load_sps_mapping)
+        assign_sps_scope, load_sps_mapping,
+        DEFAULT_WINDOW_SIZE, DEFAULT_ANCHOR_POS, DEFAULT_ANCHOR_POS_SLACK,
+        DEFAULT_ANCHOR_MAX_MISMATCH)
     from magestic.utils import path_utils
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[4]))  # .../src
     from magestic.pipelines.bc1_donor_bc0.core.matching import (
         load_and_build_lookup, match_dataframe, match_dataframe_scoped, repair_gdb01_shifted_guides,
-        assign_sps_scope, load_sps_mapping)
+        assign_sps_scope, load_sps_mapping,
+        DEFAULT_WINDOW_SIZE, DEFAULT_ANCHOR_POS, DEFAULT_ANCHOR_POS_SLACK,
+        DEFAULT_ANCHOR_MAX_MISMATCH)
     from magestic.utils import path_utils
 from magestic.utils.provenance import StepProvenance
+
+
+def resolve_oligo_attr(h, key, attr_cols):
+    """``({attr: {key -> value}}, stats)`` -- dedupe BENIGN duplicates, REFUSE conflicting ones.
+
+    🔴 NN 250 / C20. This replaced ``drop_duplicates(subset=["oligo_name"])``, which is
+    FIRST-WINS BY FILE ORDER and uncounted: if one oligo_name ever carried two different guides
+    (or two different libraries -- this table merges the 2021 and 2024 pools), one was picked
+    silently and every downstream `oligo_guide` / `oligo_pool` attribution inherited the guess.
+
+    MEASURED on the real shipped harmonized table (146,250 rows): 145,637 distinct oligo_name,
+    **613 duplicated, of which 0 conflict** on guide, and 0 span multiple guide_nuclease_PAM. So
+    refusing outright would break today's run on 613 harmless rows, and first-wins is the defect.
+    Benign duplicates are therefore deduped and COUNTED; a conflict on ANY requested attribute
+    raises and names the offenders.
+    """
+    stats = {"rows": int(len(h)), "distinct_names": int(h[key].nunique()),
+             "duplicated_names": 0, "benign_duplicates": 0, "conflicting_names": 0}
+    nun = h.groupby(key, dropna=False, observed=True)[list(attr_cols)].nunique(dropna=False)
+    dup_mask = h[key].duplicated(keep=False)
+    stats["duplicated_names"] = int(h.loc[dup_mask, key].nunique())
+    conflicting = nun[(nun > 1).any(axis=1)]
+    stats["conflicting_names"] = int(len(conflicting))
+    stats["benign_duplicates"] = stats["duplicated_names"] - stats["conflicting_names"]
+    if stats["conflicting_names"]:
+        bad = conflicting.head(10).to_dict(orient="index")
+        raise ValueError(
+            f"{stats['conflicting_names']} {key} values conflict on "
+            f"{list(attr_cols)} -- one name carries more than one value, so any single "
+            f"attribution is a guess by file order. First offenders: {bad}. Measured on the real "
+            f"harmonized table this count is 0 of 613 duplicates, so a conflict means the table "
+            f"changed and must be reconciled, not resolved by row order (NN 250 / C20)."
+        )
+    if stats["benign_duplicates"]:
+        print(f"NOTE: {stats['benign_duplicates']} {key} values are duplicated with IDENTICAL "
+              f"{list(attr_cols)}; deduped (NN 250 / C20).")
+    d = h.drop_duplicates(subset=[key])
+    return {c: dict(zip(d[key], d[c])) for c in attr_cols}, stats
 
 
 def _build_oligo_attr_maps():
@@ -50,10 +92,12 @@ def _build_oligo_attr_maps():
     cols = pd.read_csv(hp, sep="\t", nrows=0).columns
     guide_col = "guide" if "guide" in cols else None
     lib_col = next((c for c in ("guide_donor_bc0_plasmid_library", "V_library", "twist_pool") if c in cols), None)
-    use = ["oligo_name"] + [c for c in (guide_col, lib_col) if c]
-    h = pd.read_csv(hp, sep="\t", usecols=use).drop_duplicates(subset=["oligo_name"])
-    o2g = dict(zip(h["oligo_name"], h[guide_col])) if guide_col else {}
-    o2l = dict(zip(h["oligo_name"], h[lib_col])) if lib_col else {}
+    attrs = [c for c in (guide_col, lib_col) if c]
+    use = ["oligo_name"] + attrs
+    h = pd.read_csv(hp, sep="\t", usecols=use)
+    maps, _stats = resolve_oligo_attr(h, "oligo_name", attrs)   # NN 250 / C20
+    o2g = maps.get(guide_col, {}) if guide_col else {}
+    o2l = maps.get(lib_col, {}) if lib_col else {}
     return o2g, o2l
 
 
@@ -68,6 +112,23 @@ def build_parser():
     parser.add_argument("--v-libraries", nargs="*", default=None, help="Restrict harmonized lookup to these V libraries")
     parser.add_argument("--nuclease", nargs="*", default=None, help="Restrict harmonized lookup to these nuclease/PAM types")
     parser.add_argument("--no-pre-trim", action="store_true", help="Disable anchor pre-trim (already-trimmed donors)")
+    # 🔴 NN 250 / D10: the matching thresholds, exposed with the CURRENT values as defaults so
+    # nothing changes unless asked. Each is a specificity/sensitivity trade recorded in
+    # core/matching.py; they were magic numbers with no way to change or inspect them.
+    parser.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE,
+                        help=f"Sliding-window size for the donor fallback (default "
+                             f"{DEFAULT_WINDOW_SIZE}). Smaller admits more truncated donors and "
+                             f"costs specificity; larger refuses them.")
+    parser.add_argument("--anchor-pos-slack", type=int, default=DEFAULT_ANCHOR_POS_SLACK,
+                        help=f"How far either side of the canonical anchor position (%d) the "
+                             f"tolerant trim pass scans (default {DEFAULT_ANCHOR_POS_SLACK}). "
+                             f"88%% of well-formed reads place the anchor exactly; widening this "
+                             f"rescues displaced reads and widens the chance-match window."
+                             % DEFAULT_ANCHOR_POS)
+    parser.add_argument("--anchor-max-mismatch", type=int, default=DEFAULT_ANCHOR_MAX_MISMATCH,
+                        help=f"Substitutions tolerated in the 11-bp anchor (default "
+                             f"{DEFAULT_ANCHOR_MAX_MISMATCH}). ~89%% of anchor-losing reads "
+                             f"rescue at Hamming 1 at the canonical position.")
     # GDB-01 bridge. The root fix landed in gdb Step 02 on 2026-09-11 (sequence_anchors.find_re_site),
     # so this consumer-side repair is now OFF by default and exists only so tables built BEFORE that fix
     # stay readable. See PIPELINE_CORRECTNESS_POLICY.md §1: a downstream repair is a bridge, never the fix.
@@ -83,6 +144,12 @@ def build_parser():
                              "unchanged: every row is matched against the whole --v-libraries scope.")
     # Back-compat (accepted + IGNORED): the old exact-merge args, so existing rule
     # shells keep working without a rule edit. The harmonized table is used instead.
+    # NN 250 / D7: --sps-mapping defaults to None, i.e. UNSCOPED, which silently exposes the run
+    # to 7.0% cross-subpool mis-naming. This makes "I meant to scope" expressible.
+    parser.add_argument("--require-sps-mapping", action="store_true",
+                        help="Refuse to run unscoped. Exits non-zero if --sps-mapping is absent, "
+                             "instead of matching every row against the whole scope and warning "
+                             "(NN 250 / D7).")
     parser.add_argument("--oligo-pools", nargs="*", default=None, help="(ignored; harmonized table used)")
     parser.add_argument("--guide-start", type=int, default=None, help="(ignored)")
     parser.add_argument("--guide-end", type=int, default=None, help="(ignored)")
@@ -92,8 +159,60 @@ def build_parser():
     return parser
 
 
+#: The measured cost of matching every row against every subpool at once, from the 2026-09-10
+#: rebuild: 313,570 of 4,458,480 named rows with a readable SPS (7.0%) carried a name from a
+#: subpool their own read did not come from, and the transformation independently agreed with the
+#: SPS on 99.3% of them. Quoted in the warning so the number travels with the choice.
+UNSCOPED_CROSS_SUBPOOL_RATE_PCT = 7.0
+
+
+def unscoped_matching_report(n_rows, has_sps_column, scoped=False):
+    """``(message, stats)`` describing whether this run scoped its search by SPS.
+
+    🔴 NN 250 / D7. The unscoped path is the DEFAULT and used to announce itself only as
+    "Matching donors ...". The run-level state is recorded in the provenance sidecar
+    (``sps_scoping``), so the fix here is NOT a new per-row column -- an ``sps_scoped=False`` on
+    every row of an unscoped run is a constant column, and a constant column names nothing. What
+    was missing is a loud, quantified warning, and the distinct, worse case where the input
+    CARRIES an SPS column and the mapping was simply not supplied: there the information needed
+    to scope was present and thrown away.
+    """
+    stats = {
+        "sps_scoped": bool(scoped),
+        "rows_matched_unscoped": 0 if scoped else int(n_rows),
+        "sps_column_present_but_unused": bool(has_sps_column) and not scoped,
+    }
+    if scoped:
+        return "", stats
+    lines = [
+        "=" * 100,
+        "WARNING: matching UNSCOPED -- every row is matched against the whole --v-libraries scope.",
+        f"         Measured exposure: {UNSCOPED_CROSS_SUBPOOL_RATE_PCT}% of named rows with a "
+        f"readable SPS took a name from a subpool their own read did not come from",
+        "         (313,570 of 4,458,480 on the 2026-09-10 rebuild). A post-hoc candidate filter",
+        "         CANNOT repair this: an unambiguous row carries no candidate list, because the",
+        "         right design was never a candidate. Only scoping the SEARCH fixes it.",
+    ]
+    if stats["sps_column_present_but_unused"]:
+        lines += [
+            "🔴       THIS INPUT HAS AN 'SPS' COLUMN AND NO --sps-mapping WAS GIVEN. The information",
+            "         needed to scope this run is present in the data and is being discarded.",
+            "         Pass --sps-mapping /oak/.../common/keyfiles/sps_library_mapping.tsv",
+        ]
+    lines += [f"         Rows affected: {int(n_rows):,}", "=" * 100]
+    return "\n".join(lines), stats
+
+
+def enforce_sps_mapping_requirement(require, sps_mapping):
+    """Exit non-zero when --require-sps-mapping was given and no mapping was (NN 250 / D7)."""
+    if require and not sps_mapping:
+        sys.exit("--require-sps-mapping was given but --sps-mapping was not: refusing to match "
+                 "unscoped (NN 250 / D7).")
+
+
 def main():
     args = build_parser().parse_args()
+    enforce_sps_mapping_requirement(args.require_sps_mapping, args.sps_mapping)
 
     print("Loading bc1-donor-bc0 data...")
     bc1_data = pd.concat([pd.read_csv(f, sep="\t") for f in args.input], ignore_index=True)
@@ -113,6 +232,9 @@ def main():
         use_harmonized_table=True,
         v_libraries=args.v_libraries,
         nuclease_types=args.nuclease,
+        window_size=args.window_size,                  # NN 250 / D10
+        anchor_pos_slack=args.anchor_pos_slack,
+        anchor_max_mismatch=args.anchor_max_mismatch,
     )
 
     # GDB-01 BRIDGE (off unless --gdb01-repair). gdb Step 02 used to shift every G-ending Cas12a guide 1 nt
@@ -145,6 +267,7 @@ def main():
     # alphabetically across subpools instead: 313,570 of 4,458,480 named rows with a readable SPS (7.0%)
     # took a name from a subpool their own read did not come from. A post-hoc candidate filter cannot fix
     # an unambiguous row -- the right design was never a candidate -- so the SEARCH is scoped.
+    _unscoped_stats = None
     if args.sps_mapping:
         sps2v = load_sps_mapping(args.sps_mapping, args.v_libraries)
         print(f"SPS scoping: {len(sps2v)} SPS -> subpool ({sorted(set(sps2v.values()))})")
@@ -161,12 +284,28 @@ def main():
                 print(f"  matching unscoped rows against the full scope...")
                 return tables
             print(f"  building lookup for {v}...")
+            # 🔴 NN 250 / D10: the thresholds MUST be passed here too. Without them a flag
+            # worked unscoped and was silently reverted the moment --sps-mapping was given,
+            # because each per-subpool lookup was rebuilt from the module defaults.
             return load_and_build_lookup(use_harmonized_table=True, v_libraries=[v],
-                                         nuclease_types=args.nuclease)
+                                         nuclease_types=args.nuclease,
+                                         window_size=args.window_size,
+                                         anchor_pos_slack=args.anchor_pos_slack,
+                                         anchor_max_mismatch=args.anchor_max_mismatch)
 
         out = match_dataframe_scoped(bc1_data, scope, _build, donor_col=donor_col,
                                      guide_col=args.guide_col, pre_trim=not args.no_pre_trim)
+        # NN 250 / D7: the SCOPED branch still falls back to the full scope for rows whose own
+        # SPS is absent or unrecognised, so the unscoped row count is reported either way.
+        _, _unscoped_stats = unscoped_matching_report(
+            len(bc1_data) - n_scoped, has_sps_column=True, scoped=True)
+        _unscoped_stats["rows_matched_unscoped"] = int(len(bc1_data) - n_scoped)
     else:
+        # NN 250 / D7: say out loud that this run is unscoped, and how much that costs.
+        _msg, _unscoped_stats = unscoped_matching_report(
+            len(bc1_data), has_sps_column="SPS" in bc1_data.columns)
+        if _msg:
+            print(_msg)
         print(f"Matching donors (col '{donor_col}') via core.matching.match_dataframe...")
         out = match_dataframe(bc1_data, tables, donor_col=donor_col, guide_col=args.guide_col,
                               pre_trim=not args.no_pre_trim)
@@ -209,6 +348,11 @@ def main():
         counts["gdb01_bridge_repaired_rows"] = int(out["guide_repaired_gdb01"].sum())
     if "guide_match" in out.columns:
         counts["guide_match"] = {str(k): int(v) for k, v in out["guide_match"].value_counts(dropna=False).items()}
+    # NN 250 / D7: the unscoped exposure, recorded at RUN level (not as a per-row constant column)
+    # so a reader of the sidecar can tell a scoped run from an unscoped one, and how many rows of
+    # an otherwise-scoped run still fell back to the full scope.
+    if _unscoped_stats is not None:
+        counts.update(_unscoped_stats)
     prov.set_counts(**counts)
     prov.add_output(args.output, rows=int(n))
     print(f"sidecar: {prov.write()}")

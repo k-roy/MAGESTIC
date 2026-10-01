@@ -16,9 +16,56 @@ logger = logging.getLogger(__name__)
 # Sequence constants
 BC1_LENGTH = 20
 BC0_LENGTH = 10
-DONOR_BC0_FRAGMENT_LENGTH = 60  # ~30bp donor + ~30bp common sequence
+SPS_LENGTH = 20
+DONOR_FRAGMENT_LENGTH = 30  # how much of the donor's 3' end enters the fragment key
+DONOR_BC0_FRAGMENT_LENGTH = 60  # 30bp donor 3' end + 20bp SPS + 10bp bc0
 TYPICAL_DONOR_LENGTH = 129
 MIDDLE_DONOR_LENGTH = 60  # Window size for sliding match
+
+
+class FragmentKeyNotBuildable(ValueError):
+    """Raised when a joinable ``donor_bc0_fragment`` cannot be built from the parts on hand."""
+
+
+def build_donor_bc0_fragment(donor, sps, bc0):
+    """The ONE builder for the ``donor_bc0_fragment`` join key: ``donor[-30:] + SPS + bc0``.
+
+    🔴 NN 250 / C17. This key is the bridge between the bc1-donor-bc0 tables and the
+    guide-donor-bc0 tables, and it existed in three hand-written copies that had DRIFTED.
+    Stage 01 built the 60-nt key correctly (``01_parse_bc1_donor_bc0.py:568``), but two
+    fallbacks in ``readers/data_loader.py`` that rebuild it when the column is absent left the
+    SPS out and produced a **40-nt** key: the else-branch at :585 and the gdb path at :1019,
+    which had no SPS branch at all. A 40-nt key cannot join a 60-nt key, so a gdb table lacking
+    the column bridged **zero** bc1s -- and the bridge logged ``0/N (0.0%)`` at INFO and
+    returned normally, so a pipeline failure read as a measured biological zero.
+
+    REFUSES rather than pads. Without the SPS there is no joinable key, and emitting a short
+    one that silently joins nothing is strictly worse than failing: the short key is
+    indistinguishable from a real absence of overlap. Same for a donor too short to supply its
+    30-nt tail.
+
+    Raises:
+        FragmentKeyNotBuildable: if the SPS or bc0 is missing/empty, or the donor is shorter
+            than ``DONOR_FRAGMENT_LENGTH``.
+    """
+    if not isinstance(donor, str) or len(donor) < DONOR_FRAGMENT_LENGTH:
+        raise FragmentKeyNotBuildable(
+            f"donor must be a string of >= {DONOR_FRAGMENT_LENGTH} nt to build a "
+            f"donor_bc0_fragment; got {type(donor).__name__} "
+            f"len={len(donor) if isinstance(donor, str) else 'n/a'}"
+        )
+    if not isinstance(sps, str) or not sps:
+        raise FragmentKeyNotBuildable(
+            "cannot build a joinable donor_bc0_fragment without the SPS: stage 01's key is "
+            f"donor[-{DONOR_FRAGMENT_LENGTH}:] + SPS + bc0 = {DONOR_BC0_FRAGMENT_LENGTH} nt, and "
+            "an SPS-less key is 40 nt, which joins nothing while looking like a clean zero "
+            "(NN 250 / C17)"
+        )
+    if not isinstance(bc0, str) or not bc0:
+        raise FragmentKeyNotBuildable(
+            "cannot build a joinable donor_bc0_fragment without bc0 (NN 250 / C17)"
+        )
+    return donor[-DONOR_FRAGMENT_LENGTH:] + sps + bc0
 
 # Oligo structure constants (200mer design)
 GUIDE_START = 20

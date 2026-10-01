@@ -17,7 +17,78 @@ import pandas as pd
 import logging
 from tqdm import tqdm
 
+from magestic.pipelines.bc1_donor_bc0.config import (
+    FragmentKeyNotBuildable,
+    build_donor_bc0_fragment,
+)
+
 logger = logging.getLogger(__name__)
+
+
+class BridgeRecoveredNothing(RuntimeError):
+    """A bridge join between two NON-EMPTY tables recovered zero rows.
+
+    🔴 NN 250 / C17. This has to be an exception, not a log line. The gdb bridge used to log
+    ``Recovered full donor for 0/N (0.0%)`` at INFO and return normally when its fragment key
+    disagreed with stage 01's, so a total pipeline failure was indistinguishable from a measured
+    biological zero -- the defect shape that produced wrong conclusions repeatedly in the
+    2026-10-01 audits. An EMPTY lookup is a different condition and stays quiet: NN 240's
+    non-vacuity control deliberately runs with no bridge.
+    """
+
+
+def ensure_donor_bc0_fragment(df, *, source: str, require: bool = True):
+    """Add ``donor_bc0_fragment`` to ``df`` if absent, using the ONE canonical builder.
+
+    Replaces two hand-written fallbacks that had drifted to a 40-nt SPS-less key (NN 250 / C17).
+    Every row that cannot produce a joinable key is counted and logged -- never silently
+    dropped or silently shortened.
+
+    Args:
+        df: a bc1-donor-bc0 or guide-donor-bc0 frame.
+        source: 'bdb' / 'gdb' / a filename, for the log line.
+        require: if True (default), raise when no row can produce a key at all. A frame that
+            cannot be keyed bridges nothing, which must not look like an absence of overlap.
+    """
+    if "donor_bc0_fragment" in df.columns or df.empty:
+        return df
+    if "donor" not in df.columns or "bc0" not in df.columns:
+        return df
+    if "SPS" not in df.columns:
+        msg = (
+            f"{source}: cannot rebuild donor_bc0_fragment -- the table has donor and bc0 but no "
+            f"SPS column, and stage 01's key is donor[-30:] + SPS + bc0 (60 nt). The SPS-less "
+            f"key is 40 nt and joins NOTHING while reading as a clean zero (NN 250 / C17). "
+            f"Re-run the step that produces donor_bc0_fragment, or supply the SPS."
+        )
+        if require:
+            raise FragmentKeyNotBuildable(msg)
+        logger.warning(msg)
+        return df
+
+    df = df.copy()
+    n_bad = 0
+
+    def _build(r):
+        nonlocal n_bad
+        try:
+            return build_donor_bc0_fragment(r["donor"], r["SPS"], r["bc0"])
+        except FragmentKeyNotBuildable:
+            n_bad += 1
+            return None
+
+    df["donor_bc0_fragment"] = df.apply(_build, axis=1)
+    n_ok = int(df["donor_bc0_fragment"].notna().sum())
+    logger.info(
+        f"{source}: rebuilt donor_bc0_fragment for {n_ok:,}/{len(df):,} rows "
+        f"({n_bad:,} lacked a buildable donor/SPS/bc0 and are NaN, not dropped)"
+    )
+    if n_ok == 0 and require:
+        raise FragmentKeyNotBuildable(
+            f"{source}: not one of {len(df):,} rows could produce a donor_bc0_fragment; this "
+            f"bridges nothing. Refusing to continue and report it as a zero (NN 250 / C17)."
+        )
+    return df
 
 
 # Fields composing the PCR-replicate identity, in order.
@@ -572,20 +643,9 @@ def load_2x300_data(
             df['data_source'] = '2x300'
 
             # Ensure donor_bc0_fragment exists
-            if 'donor_bc0_fragment' not in df.columns and 'donor' in df.columns and 'bc0' in df.columns:
-                sps = df.get('SPS', '')
-                if 'SPS' in df.columns:
-                    df['donor_bc0_fragment'] = df.apply(
-                        lambda r: r['donor'][-30:] + r['SPS'] + r['bc0']
-                        if pd.notna(r['donor']) and len(str(r['donor'])) >= 30 else None,
-                        axis=1
-                    )
-                else:
-                    df['donor_bc0_fragment'] = df.apply(
-                        lambda r: r['donor'][-30:] + r['bc0']
-                        if pd.notna(r['donor']) and len(str(r['donor'])) >= 30 else None,
-                        axis=1
-                    )
+            # ONE canonical builder (NN 250 / C17). The old else-branch here built an SPS-less
+            # 40-nt key that cannot join stage 01's 60-nt key.
+            df = ensure_donor_bc0_fragment(df, source=str(filepath.name))
 
             # Select standard columns
             std_cols = ['counts', 'bc1', 'donor', 'bc0', 'donor_bc0_fragment',
@@ -844,19 +904,140 @@ def load_donor_bc0_lookup(
 
     combined = pd.concat(dfs, ignore_index=True)
 
-    # Aggregate to create lookup table
+    # Aggregate to create lookup table (NN 250 / D5: support-based and counted, see below)
     logger.info("Aggregating donor-bc0 data into lookup table...")
-    agg_df = combined.groupby('donor_bc0_fragment').agg({
-        'donor': 'first',
-        'bc0': 'first',
-        'counts': 'sum',
-        'sample_number': lambda x: len(set(x))
-    }).reset_index()
-    agg_df.rename(columns={'sample_number': 'num_samples_donor_bc0'}, inplace=True)
+    agg_df, _stats = collapse_donor_bc0_lookup(combined)
 
     logger.info(f"  Created lookup table with {len(agg_df)} unique donor_bc0_fragments")
 
     return agg_df
+
+
+#: Columns searched, in order, for per-row read support when collapsing the donor-bc0 lookup.
+#: Same real-names-first rule as _GDB_SUPPORT_COLUMNS: the donor-bc0 tables the loader selects
+#: carry `counts`, the gdb-shaped ones carry `total_counts` / `grouped_guide_bc0_counts`.
+_DONOR_BC0_SUPPORT_COLUMNS = (
+    "counts",
+    "total_counts",
+    "grouped_guide_bc0_counts",
+    "total_fwd_counts",
+)
+
+
+def collapse_donor_bc0_lookup(
+    combined: pd.DataFrame,
+    *,
+    key: str = "donor_bc0_fragment",
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Collapse the donor-bc0 table to one row per ``key``, BY SUPPORT, counting the ambiguity.
+
+    🔴 NN 250 / D5. This replaces
+    ``groupby(key).agg({'donor':'first','bc0':'first','counts':'sum', ...})``, which had three
+    measured failure modes:
+
+    1. **Support-blind.** ``'first'`` takes whichever row came first in the file. Reproduced: a
+       fragment whose ``donor_WRONG`` had 1 read and whose ``donor_RIGHT`` had 180 returned
+       ``donor_WRONG``. ``merge.py`` already picked its best gdb match by ``max(counts)``, so a
+       support-blind collapse here DEMOTED a correct tie-break to an arbitrary one -- the same
+       defect class already fixed in :func:`collapse_gdb_bridge`.
+    2. **Uncounted.** Nothing in the output said the fragment had been ambiguous, so the rate
+       could not be audited. A fragment with two plausible donors is exactly the condition that
+       shows up downstream as a bc1 assigned to the wrong edit.
+    3. **Chimeric pair.** ``groupby.agg('first')`` skips NaN *independently per column*, so
+       ``donor`` could come from one row and ``bc0`` from another. Reproduced exactly: rows
+       ``(NaN, BC0_A)`` and ``(donor_B, NaN)`` emitted ``('donor_B','BC0_A')`` -- a pair present
+       in no read. Taking the WHOLE winning row makes that impossible.
+
+    Support is summed per ``(key, donor, bc0)`` across samples first, so a donor supported by
+    many small samples beats one supported by a single large read pile-up only if it really has
+    more reads. Ties resolve on ``(donor, bc0)`` ascending as terminal keys, so the result is
+    independent of input order (tested by permutation invariance, not by inspecting the sort).
+
+    Returns ``(collapsed, stats)``. Added columns: ``donor_support`` (reads behind the winner),
+    ``n_distinct_donors`` (how many donors the fragment was seen with),
+    ``num_samples_donor_bc0`` (unchanged meaning).
+    """
+    stats: Dict[str, object] = {
+        "rows_in": int(len(combined)),
+        "rows_out": 0,
+        "dropped_null_key": 0,
+        "unique_fragments": 0,
+        "ambiguous_fragments": 0,
+        "support_column": None,
+    }
+    if combined.empty or key not in combined.columns:
+        return combined, stats
+
+    has_key = combined[key].notna() & (combined[key].astype(str).str.len() > 0)
+    stats["dropped_null_key"] = int((~has_key).sum())
+    if stats["dropped_null_key"]:
+        logger.warning(
+            f"  donor-bc0 collapse: {stats['dropped_null_key']:,} of {len(combined):,} rows have "
+            f"no {key} and cannot be bridged (counted, not silently dropped)"
+        )
+    work = combined.loc[has_key].copy()
+    if work.empty:
+        return work.reset_index(drop=True), stats
+
+    stats["unique_fragments"] = int(work[key].nunique())
+
+    support = next((c for c in _DONOR_BC0_SUPPORT_COLUMNS if c in work.columns), None)
+    stats["support_column"] = support
+    if support is None:
+        logger.warning(
+            "  donor-bc0 collapse: no support column found among "
+            f"{_DONOR_BC0_SUPPORT_COLUMNS}; falling back to a deterministic (donor, bc0) order. "
+            "The winner is reproducible but NOT support-based -- record this in the run's notes."
+        )
+        work["_support"] = 0
+    else:
+        work["_support"] = pd.to_numeric(work[support], errors="coerce").fillna(0)
+
+    group_cols = [key] + [c for c in ("donor", "bc0") if c in work.columns]
+    # Support per distinct observation, summed across samples.
+    obs = work.groupby(group_cols, dropna=False, observed=True)["_support"].sum().reset_index()
+    obs = obs.rename(columns={"_support": "donor_support"})
+
+    # Rank observations: most-supported first, then the terminal keys so the order is TOTAL.
+    terminal = [c for c in ("donor", "bc0") if c in obs.columns]
+    obs = obs.sort_values(
+        ["donor_support"] + terminal,
+        ascending=[False] + [True] * len(terminal),
+        kind="mergesort",
+    )
+    winners = obs.drop_duplicates(subset=[key], keep="first").set_index(key)
+
+    # Per-fragment ambiguity and totals, from the full table rather than the winner's row.
+    per_frag = work.groupby(key, dropna=False, observed=True)
+    n_donors = (
+        per_frag["donor"].nunique(dropna=True)
+        if "donor" in work.columns
+        else pd.Series(dtype="int64")
+    )
+    total_support = per_frag["_support"].sum()
+    n_samples = (
+        per_frag["sample_number"].nunique(dropna=True)
+        if "sample_number" in work.columns
+        else pd.Series(1, index=total_support.index)
+    )
+
+    out = winners.copy()
+    out["n_distinct_donors"] = n_donors.reindex(out.index).fillna(0).astype("int64")
+    out["num_samples_donor_bc0"] = n_samples.reindex(out.index).fillna(0).astype("int64")
+    if support is not None:
+        # Keep the ORIGINAL support column name carrying the fragment's TOTAL, as before.
+        out[support] = total_support.reindex(out.index).fillna(0)
+    out = out.reset_index()
+
+    stats["rows_out"] = int(len(out))
+    stats["ambiguous_fragments"] = int((out["n_distinct_donors"] > 1).sum())
+    if stats["ambiguous_fragments"]:
+        logger.warning(
+            f"  donor-bc0 collapse: {stats['ambiguous_fragments']:,} of {stats['rows_out']:,} "
+            f"fragments map to >1 distinct donor; the best-supported one wins and the count is "
+            f"carried in n_distinct_donors / donor_support (NN 250 / D5)"
+        )
+    return out, stats
 
 
 def recover_full_donors(
@@ -890,13 +1071,103 @@ def recover_full_donors(
     total = len(merged)
     logger.info(f"  Recovered full donor for {recovered}/{total} ({100*recovered/total:.1f}%) entries")
 
+    # 🔴 NN 250 / C17: zero recovery from two NON-EMPTY tables is a FAILURE, never a result.
+    # Both tables having rows while the join produces nothing means the two sides' fragment keys
+    # do not agree -- which is exactly how the drifted 40-nt key presented: as "0.0%" at INFO.
+    # An empty lookup returns early above, so NN 240's no-bridge non-vacuity control is unaffected.
+    if recovered == 0 and total > 0:
+        raise BridgeRecoveredNothing(
+            f"the gdb bridge recovered 0 of {total:,} donors while the lookup held "
+            f"{len(donor_lookup):,} fragments. Both sides are non-empty, so their "
+            f"donor_bc0_fragment keys disagree -- check that both were built by "
+            f"config.build_donor_bc0_fragment (donor[-30:] + SPS + bc0, 60 nt). Refusing to "
+            f"report this as a zero recovery rate (NN 250 / C17)."
+        )
+
     return merged
+
+
+#: Columns searched, in order, for per-row read support when collapsing the gdb bridge.
+#:
+#: 🔴 The first three are the names the real gdb tables actually use. An earlier version of
+#: this tuple guessed at generic names ("count", "n", "reads", …), none of which exist in a
+#: gdb table, so no sort ran and the collapse fell back to first-in-order. That was a
+#: regression: ``merge.py`` already picked the best gdb match by ``max(counts)`` (using
+#: ``grouped_guide_bc0_counts`` when present), so a support-blind collapse DEMOTED a
+#: correct tie-break to an arbitrary one. Caught by the NN 239 pipeline audit, 2026-10-01.
+#: Keep the real column names first; the generic ones are a harmless fallback.
+_GDB_SUPPORT_COLUMNS = (
+    "grouped_guide_bc0_counts",
+    "total_counts",
+    "counts",
+    "count",
+    "n_reads",
+    "num_reads",
+    "read_count",
+    "reads",
+    "n",
+)
+
+
+def collapse_gdb_bridge(
+    combined: pd.DataFrame,
+    *,
+    key: str = "donor_bc0_fragment",
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Collapse a read-level gdb table to one row per ``key`` for use as a bridge.
+
+    The gdb table is read-level, so a library contributes on the order of tens of
+    millions of rows while the thing the bridge actually needs is the mapping
+    ``donor_bc0_fragment -> (oligo_name, guide)``, which is at most design size. Merging
+    the read-level frame is what made the full-scale bridge run exhaust 128 GB
+    (HANDOFF_20260608_gdb_bdb_pipeline.md §3).
+
+    Collapsing is not merely a size optimization, because a fragment can map to more than
+    one ``oligo_name`` across reads. The most-supported row wins, and **the ambiguity is
+    counted and returned rather than silently resolved** — a fragment with two plausible
+    oligos is exactly the condition that shows up downstream as a bc1 assigned to the
+    wrong edit, so the rate belongs in the run's statistics.
+
+    Returns ``(collapsed, stats)``.
+    """
+    stats: Dict[str, int] = {
+        "rows_in": int(len(combined)),
+        "rows_out": 0,
+        "dropped_null_key": 0,
+        "unique_keys": 0,
+        "ambiguous_keys": 0,
+    }
+    if combined.empty or key not in combined.columns:
+        return combined, stats
+
+    has_key = combined[key].notna() & (combined[key].astype(str).str.len() > 0)
+    stats["dropped_null_key"] = int((~has_key).sum())
+    work = combined.loc[has_key]
+    if work.empty:
+        return work.reset_index(drop=True), stats
+
+    stats["unique_keys"] = int(work[key].nunique())
+
+    if "oligo_name" in work.columns:
+        n_oligos = work.groupby(key, observed=True)["oligo_name"].nunique(dropna=True)
+        stats["ambiguous_keys"] = int((n_oligos > 1).sum())
+
+    support = next((c for c in _GDB_SUPPORT_COLUMNS if c in work.columns), None)
+    if support is not None:
+        # mergesort is stable, so ties collapse deterministically run to run.
+        work = work.sort_values(support, ascending=False, kind="mergesort")
+
+    collapsed = work.drop_duplicates(subset=[key], keep="first").reset_index(drop=True)
+    stats["rows_out"] = int(len(collapsed))
+    return collapsed, stats
 
 
 def load_gdb_data(
     gdb_dir: Path,
     debug_mode: bool = False,
     debug_n_rows: int = 100000,
+    *,
+    collapse_bridge: bool = True,
 ) -> Tuple[pd.DataFrame, DataSourceInfo]:
     """
     Load guide-donor-bc0 (gdb) data.
@@ -908,6 +1179,9 @@ def load_gdb_data(
         gdb_dir: Directory containing gdb TSV files
         debug_mode: If True, only load subset of rows
         debug_n_rows: Number of rows to load in debug mode
+        collapse_bridge: Collapse to one row per ``donor_bc0_fragment`` before
+            returning. Default True; the read-level frame is what OOMs the full-scale
+            bridge. Pass False only to inspect the raw read-level table.
 
     Returns:
         Tuple of (DataFrame, DataSourceInfo)
@@ -933,23 +1207,48 @@ def load_gdb_data(
 
     combined = pd.concat(dfs, ignore_index=True)
 
-    # Ensure donor_bc0_fragment exists
-    if 'donor_bc0_fragment' not in combined.columns and 'donor' in combined.columns and 'bc0' in combined.columns:
-        combined['donor_bc0_fragment'] = combined.apply(
-            lambda r: r['donor'][-30:] + r['bc0']
-            if pd.notna(r['donor']) and len(str(r['donor'])) >= 30 else None,
-            axis=1
+    # Ensure donor_bc0_fragment exists, via the ONE canonical builder (NN 250 / C17). This site
+    # had no SPS branch at all and built a 40-nt key, so a gdb table lacking the column bridged
+    # zero bc1s and the run read as a biological null.
+    combined = ensure_donor_bc0_fragment(combined, source='gdb')
+
+    n_samples = (
+        combined['sample_number'].nunique() if 'sample_number' in combined.columns else 0
+    )
+    n_read_level = len(combined)
+
+    if collapse_bridge:
+        combined, stats = collapse_gdb_bridge(combined)
+        logger.info(
+            "  gdb bridge collapsed: %s read-level rows -> %s unique donor_bc0_fragment",
+            f"{stats['rows_in']:,}", f"{stats['rows_out']:,}",
         )
+        if stats["dropped_null_key"]:
+            logger.warning(
+                "  %s gdb rows had no donor_bc0_fragment and cannot bridge to a bc1",
+                f"{stats['dropped_null_key']:,}",
+            )
+        if stats["ambiguous_keys"]:
+            pct = 100.0 * stats["ambiguous_keys"] / max(stats["unique_keys"], 1)
+            logger.warning(
+                "  %s of %s donor_bc0_fragments (%.2f%%) map to MORE THAN ONE oligo_name; "
+                "the most-supported was kept. This is an upper bound on bc1->oligo "
+                "mis-assignment from the bridge.",
+                f"{stats['ambiguous_keys']:,}", f"{stats['unique_keys']:,}", pct,
+            )
 
     info = DataSourceInfo(
         source_type="gdb",
         num_rows=len(combined),
         num_unique_bc1s=0,  # gdb doesn't have bc1
-        num_samples=combined['sample_number'].nunique() if 'sample_number' in combined.columns else 0,
+        num_samples=n_samples,
         file_paths=gdb_files
     )
 
-    logger.info(f"  Loaded {info.num_rows} rows from {len(gdb_files)} files")
+    logger.info(
+        f"  Loaded {n_read_level:,} rows from {len(gdb_files)} files"
+        + (f"; returning {info.num_rows:,} bridge rows" if collapse_bridge else "")
+    )
 
     return combined, info
 

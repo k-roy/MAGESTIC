@@ -32,6 +32,82 @@ import pandas as pd
 from rapidfuzz.distance import Levenshtein as _lev
 
 # ---------------------------------------------------------------------------
+# TOTAL ordering keys -- the reason this section exists
+# ---------------------------------------------------------------------------
+#
+# 🔴 EVERY ordering in this module must be TOTAL. A *stable* sort on a key that is not total
+# preserves the input row order among ties, so the tie-winner is "whichever row arrived first" --
+# and in stage 02 the arrival order is the MANIFEST row order. Measured (NN 253 S8): the same 18
+# samples with a shuffled manifest moved ~14,000 of 1,630,592 links (0.43%; 7,087 only in run a,
+# 6,994 only in run b) while the net row count moved by only 93, so a row-count check hides it.
+# Fixed in NN 256; the three-order acceptance test is
+# planning/222_triumph_embl_library_design/256_bc1_stage02_determinism.md.
+
+REP_RANK_COL = "_reprank"   # hidden: per-key max of the INDIVIDUAL row ranks (see aggregate_links)
+_RESERVED_COLS = (REP_RANK_COL,)
+
+
+def _order_key(v) -> str:
+    """Type-tagged string form of ``v``, for use as part of a TOTAL ordering key.
+
+    ``str(v)`` alone is NOT injective -- ``None``, ``float('nan')`` and ``""`` all render as
+    ``""``, and ``0`` and ``"0"`` both render as ``"0"`` -- so a sort keyed on it still inherits the
+    input row order between values that merely render alike. The tag makes distinct values compare
+    distinctly, which is what makes the sort total.
+
+    Two properties are deliberate: among ``str`` values the order is IDENTICAL to ``str``-keyed
+    ordering (every one gets the same one-character prefix), so no non-tie behaviour changes; and a
+    missing value sorts LAST, so it can never win a tie against a present one (the old key mapped
+    null to ``""``, which made a missing SPS beat a real one -- unobservable in stage 02 only
+    because ``process_sample`` calls ``fillna("")`` first).
+
+    🔴 NO NUL BYTE MAY APPEAR IN THIS KEY. Measured on pandas 2.2.2 / numpy 1.26.4: a MULTI-column
+    ``DataFrame.sort_values`` over object strings containing ``"\\x00"`` silently does not order
+    them -- it goes through ``lexsort_indexer`` -> ``Categorical`` -> ``factorize``, whose hash
+    table treats the value as a C string and truncates at the NUL, so every key collapses into one
+    category and the sort becomes a no-op that returns the INPUT ROW ORDER. A single-column
+    ``sort_values`` on the same data orders correctly, which is what makes it so easy to miss. The
+    first NN 256 patch used ``"\\x01s\\x00" + v`` and thereby reintroduced, inside its own fix, the
+    exact order dependence it was written to remove. Guarded by
+    ``test_order_key_survives_a_pandas_multicolumn_sort``; the orderings below no longer use a
+    pandas multi-column sort at all.
+    """
+    if v is None or (isinstance(v, float) and v != v):
+        return "￿"
+    if isinstance(v, str):
+        return "\x01" + v
+    return "\x02" + type(v).__name__ + "\x1f" + str(v)
+
+
+def _rank_codes(values: np.ndarray) -> np.ndarray:
+    """Value-determined integer codes for an object array, ordered by Python comparison.
+
+    ``np.unique`` sorts an object array with Python's own ``<``, so this is correct for strings
+    holding any byte, unlike ``pd.factorize``'s hash table (see ``_order_key``). The codes are what
+    the ``np.lexsort`` orderings below actually sort on, so no ordering in this module depends on
+    pandas' object-sorting path.
+    """
+    _uniq, codes = np.unique(values, return_inverse=True)
+    return np.asarray(codes, dtype=np.int64).ravel()
+
+
+def _key_codes(df: pd.DataFrame, cols: Sequence[str], rows: np.ndarray) -> List[np.ndarray]:
+    """``_rank_codes`` of ``_order_key`` for each of ``cols``, restricted to ``rows``."""
+    out = []
+    for c in cols:
+        vals = df[c].to_numpy(dtype=object)[rows]
+        out.append(_rank_codes(np.array([_order_key(v) for v in vals], dtype=object)))
+    return out
+
+
+def _reject_reserved(*col_groups) -> None:
+    for g in col_groups:
+        for c in g:
+            if c in _RESERVED_COLS:
+                raise ValueError(f"{c!r} is reserved by link_collapse; rename the column")
+
+
+# ---------------------------------------------------------------------------
 # Replicate bitmasks
 # ---------------------------------------------------------------------------
 
@@ -89,22 +165,44 @@ def aggregate_links(df: pd.DataFrame, key_cols: Sequence[str], rank_col: str,
                     preserve_cols: Sequence[str] = ()) -> pd.DataFrame:
     """Group rows by ``key_cols``: SUM ``sum_cols`` (``rank_col`` must be among them),
     bitwise-OR ``or_cols``, and take ``preserve_cols`` from the row with the highest
-    ``rank_col`` in each group (ties -> the lexicographically smallest preserve tuple,
-    so the answer does not depend on how rows were batched).
+    INDIVIDUAL ``rank_col`` in each group (ties -> the smallest type-tagged preserve
+    tuple, so the answer depends on neither the input row order nor the batching).
 
-    Associative and commutative in the aggregated columns, so it can be applied to
-    batches and then to the concatenation of batch results with the same answer.
+    Associative and commutative in **every** column, so it can be applied to batches and
+    then to the concatenation of batch results with the same answer. That is why the
+    representative is ranked on the *individual* row rank, carried through the fold in the
+    hidden ``_reprank`` column: an accumulated row's ``rank_col`` is a SUM, so ranking on it
+    makes the pick depend on where the batch boundaries fell. Counterexample on one key --
+    rows ``(3,"Y") (3,"Y") (5,"X")`` pick ``"X"`` in one pass but ``"Y"`` when the two 3s are
+    folded first, because 3+3 > 5. Stage 02's batch boundaries follow the manifest row
+    order (``--accumulate-every``), so that was an order dependence of ``SPS``,
+    ``donor_bc0_fragment``, ``trafo_ID`` and ``V_library`` on every manifest longer than one
+    batch; it is invisible in a row-count check and in a link-key diff (NN 256).
+
     Rows with a NaN in any key column are NOT accepted -- callers must set them
     aside explicitly (pandas would otherwise drop them silently in the groupby).
+
+    ⚠️ PRECONDITION on ``key_cols``: the emitted key value is read from one row of each group,
+    so two values that are ``==`` and hash alike but are not interchangeable (``0`` vs ``0.0``,
+    ``True`` vs ``1``) would make that one value order-dependent. Unobservable for ``str`` keys,
+    which is all this pipeline uses: two equal ``str`` are byte-identical.
     """
     if len(df) == 0:
         return df.copy()
     key_cols = list(key_cols)
+    _reject_reserved(key_cols, sum_cols, or_cols, preserve_cols)
     if df[key_cols].isna().any().any():
         raise ValueError("aggregate_links: NaN in key columns; set those rows aside first")
     if len(sum_cols) and df[list(sum_cols)].isna().any().any():
         # NaN cast to int64 is INT64_MIN -- a silent wrong number (review F4/F5, 2026-09-10)
         raise ValueError(f"aggregate_links: NaN in count columns {[c for c in sum_cols if df[c].isna().any()]}")
+    # sort=False is DELIBERATE and is the one ordering in this module that is not total: the groups
+    # come out in first-appearance order, so the OUTPUT ROW ORDER still depends on the input row
+    # order. That is harmless and is not the NN 253 defect, because every tie-break downstream
+    # (_peel, attach_short_donors, merge_orphan_bc1) is now total, so each stage's RESULT is a
+    # function of its input row MULTISET, and 02 writes the table under a total final sort.
+    # Making it total would mean sorting ~1.6M 238-nt donor strings on every one of 7 calls.
+    # The behavioural guard that this stays true is tests/.../test_nn256_stage02_determinism.py.
     codes, _ = pd.factorize(pd.MultiIndex.from_frame(df[key_cols]), sort=False)
     order = np.argsort(codes, kind="stable")
     codes_s = codes[order]
@@ -123,33 +221,63 @@ def aggregate_links(df: pd.DataFrame, key_cols: Sequence[str], rank_col: str,
         vals = df[c].to_numpy(dtype=np.uint64)[order]
         out[c] = np.bitwise_or.reduceat(vals, starts)
     if preserve_cols:
-        # representative row = max rank within group (deterministic tie-break below)
-        rank = df[rank_col].to_numpy()[order]
+        # Representative row = the row with the highest INDIVIDUAL rank in the group. Carried
+        # through a fold in REP_RANK_COL; absent (a frame straight from a reader) -> each row's
+        # own rank_col. See the docstring for why the accumulated SUM must not be used.
+        own = df[rank_col].to_numpy(dtype=np.int64)
+        if REP_RANK_COL in df.columns:
+            # int64 throughout: a float64 round-trip would silently lose low bits above 2**53,
+            # which is the same class of bug as the mask-column promotion noted in collapse_links.
+            prev = pd.to_numeric(df[REP_RANK_COL], errors="coerce")
+            rank = np.where(prev.isna().to_numpy(), own,
+                            prev.fillna(0).to_numpy(dtype=np.int64))[order]
+        else:
+            rank = own[order]
         # position (within sorted order) of the max-rank row in each group
         seg_max = np.maximum.reduceat(rank, starts)
         seg_id = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(order)]))
         idx = np.flatnonzero(rank == seg_max[seg_id])
-        # Among max-rank rows, take the lexicographically smallest preserve tuple --
-        # NOT "first in input order", which depends on how rows were batched and would
-        # make batch folding non-associative for these columns (review F4, 2026-09-10).
-        cand = pd.DataFrame({"_seg": seg_id[idx], "_row": order[idx]})
-        for c in preserve_cols:
-            cand[c] = df[c].to_numpy(dtype=object)[order[idx]]
-            cand[c] = cand[c].map(lambda v: "" if v is None or (isinstance(v, float) and v != v) else str(v))
-        cand = cand.sort_values(["_seg", *preserve_cols], kind="mergesort").drop_duplicates("_seg")
-        src = cand["_row"].to_numpy()
+        # Among max-rank rows, take the smallest TYPE-TAGGED preserve tuple -- NOT "first in input
+        # order", which depends on how rows were batched (review F4, 2026-09-10) AND on the manifest
+        # order (NN 253 S8). The tag is what makes the key total: a plain str() key let two distinct
+        # raw values tie and handed the decision back to the input order (NN 256).
+        #
+        # np.lexsort over _rank_codes, NOT a pandas multi-column sort_values: the latter silently
+        # does not order object strings that contain a NUL byte, and the first version of this fix
+        # was a no-op because of it (see _order_key).
+        cseg, crow = seg_id[idx], order[idx]
+        kc = _key_codes(df, preserve_cols, crow)
+        pick = np.lexsort((*kc[::-1], cseg))          # primary key last: _seg, then k0, k1, ...
+        seg_sorted = cseg[pick]
+        first = np.flatnonzero(np.r_[True, seg_sorted[1:] != seg_sorted[:-1]])
+        src = crow[pick][first]
+        if len(src) != len(starts):                  # explicit: survives python -O
+            raise AssertionError(f"preserve pick covered {len(src)} of {len(starts)} groups")
         for c in preserve_cols:
             out[c] = df[c].to_numpy(dtype=object)[src]
-    return out[[*key_cols, *sum_cols, *or_cols, *preserve_cols]]
+        out[REP_RANK_COL] = seg_max
+    return out[[*key_cols, *sum_cols, *or_cols, *preserve_cols,
+                *([REP_RANK_COL] if preserve_cols else [])]]
 
 
 # ---------------------------------------------------------------------------
 # Greedy edit-distance collapse (behavior of the 2026-06-02 _peel_off, made exact)
 # ---------------------------------------------------------------------------
 
-def _peel(seqs, ranks, sums, ors, threshold):
-    """Greedy top-by-RANK peel-off. Returns [(rep_idx, summed_vec, or_vec), ...]."""
+def _peel(seqs, ranks, sums, ors, threshold, tkeys=None):
+    """Greedy top-by-RANK peel-off. Returns [(rep_idx, summed_vec, or_vec), ...].
+
+    🔴 The top is chosen by the TOTAL key ``(-rank, tkeys[i])``, never by "the first row whose rank
+    equals the maximum". The latter inherits the input row order among equal-rank rows, so shuffling
+    the caller's rows changed which sequence became the group representative -- and the
+    representative's ``seq_col`` and ``preserve_cols`` are what the function emits (NN 253 S8 / NN
+    256). ``tkeys`` must be unique within the group; ``collapse_links`` passes the type-tagged
+    ``(seq, *preserve)`` tuple, and since ``group_cols + seq_col`` is the full link key in every
+    caller, ``seq`` alone is already unique there.
+    """
     n = len(seqs)
+    if tkeys is None:
+        tkeys = [""] * n
     alive = [True] * n
     out = []
     remaining = n
@@ -157,8 +285,11 @@ def _peel(seqs, ranks, sums, ors, threshold):
     while remaining:
         top, best = -1, None
         for i in range(n):
-            if alive[i] and (best is None or ranks[i] > best):
-                best, top = ranks[i], i
+            if not alive[i]:
+                continue
+            k = (-ranks[i], tkeys[i])
+            if best is None or k < best:
+                best, top = k, i
         agg = list(sums[top])
         oagg = list(ors[top]) if no else []
         alive[top] = False
@@ -185,10 +316,10 @@ def _peel(seqs, ranks, sums, ors, threshold):
 
 
 def _collapse_payload(payload, group_cols, seq_col, sum_cols, or_cols, pcols, threshold):
-    gkey, seqs, ranks, sums, ors, pres = payload
+    gkey, seqs, ranks, sums, ors, pres, tkeys = payload
     base = {group_cols[k]: gkey[k] for k in range(len(group_cols))}
     rows = []
-    for rep, agg, oagg in _peel(seqs, ranks, sums, ors, threshold):
+    for rep, agg, oagg in _peel(seqs, ranks, sums, ors, threshold, tkeys):
         row = dict(base)
         row[seq_col] = seqs[rep]
         for k, c in enumerate(sum_cols):
@@ -211,8 +342,14 @@ def collapse_links(df: pd.DataFrame, group_cols: Sequence[str], seq_col: str,
     OR ``or_cols``, keep ``preserve_cols`` (and ``seq_col``) from the representative.
 
     Row cardinality only ever DECREASES by merging; nothing is filtered.
+
+    The greedy order is a TOTAL order (``_peel``), so the result is a function of the input row
+    MULTISET, not of its order (NN 256). ``REP_RANK_COL``, if the caller's frame carries one from a
+    fold, is dropped here: by the time a collapse runs the fold is over and every row's ``rank_col``
+    is its final total.
     """
     group_cols, sum_cols, or_cols = list(group_cols), list(sum_cols), list(or_cols)
+    _reject_reserved(group_cols, [seq_col], sum_cols, or_cols)
     pcols = [c for c in preserve_cols if c in df.columns]
     out_cols = [*group_cols, seq_col, *sum_cols, *or_cols, *pcols]
     if rank_col not in sum_cols:
@@ -223,6 +360,8 @@ def collapse_links(df: pd.DataFrame, group_cols: Sequence[str], seq_col: str,
         return pd.DataFrame(columns=out_cols)
     ri = sum_cols.index(rank_col)
 
+    # sort=False: group ORDER only, same reasoning as in aggregate_links above. The row order
+    # within a group is also input order, but _peel no longer reads it -- it selects on a total key.
     codes, _ = pd.factorize(pd.MultiIndex.from_frame(df[group_cols]), sort=False)
     order = np.argsort(codes, kind="stable")
     codes_s = codes[order]
@@ -243,12 +382,19 @@ def collapse_links(df: pd.DataFrame, group_cols: Sequence[str], seq_col: str,
         if b - a == 1:
             singles_idx.append(a)
         else:
+            # TOTAL tie-break key for _peel, built only for multi-row groups (singletons never
+            # peel, so the ~1.8M-row full-frame cost is not paid). seq is unique within a group in
+            # every caller; the preserve tuple is a backstop for a caller where it is not.
+            tkeys = [_order_key(sq[i]) if not pcols else
+                     _order_key(sq[i]) + "\x02" + "\x02".join(_order_key(x) for x in pv[i])
+                     for i in range(a, b)]
             payloads.append((
                 list(gv[a]), list(sq[a:b]),
                 [int(sv[i][ri]) for i in range(a, b)],
                 [[int(x) for x in sv[i]] for i in range(a, b)],
                 [[int(x) for x in ov[i]] for i in range(a, b)] if or_cols else [[] for _ in range(a, b)],
                 [list(pv[i]) for i in range(a, b)] if pcols else None,
+                tkeys,
             ))
 
     # singletons: vectorized passthrough
@@ -343,7 +489,10 @@ def attach_short_donors(df: pd.DataFrame, seq_col: str, rank_col: str,
     if len(df) == 0:
         return df, stats
 
-    codes, _ = pd.factorize(df["bc1"], sort=False)
+    # sort=True: the bc1 groups are visited in VALUE order rather than first-appearance order, so
+    # the iteration itself carries no input-order information (NN 256; the groups are disjoint and
+    # the stats are sums, so this is semantically inert -- it is a guard, not the fix).
+    codes, _ = pd.factorize(df["bc1"], sort=True)
     order = np.argsort(codes, kind="stable")
     cs = codes[order]
     bounds = np.flatnonzero(np.diff(cs)) + 1
@@ -364,8 +513,12 @@ def attach_short_donors(df: pd.DataFrame, seq_col: str, rank_col: str,
         if glens.max() == glens.min():
             continue
         stats["groups_examined"] += 1
-        # longest first, then most reads
-        idx = sorted(idx, key=lambda i: (-lens[i], -ranks[i]))
+        # longest first, then most reads, then TOTAL terminal keys (donor, bc0): (bc1, donor, bc0)
+        # is the link key, so within one bc1 group (donor, bc0) is unique and this order is total.
+        # Without the terminals, two donors of the same length and read count were processed in
+        # input row order, and whichever came first became the parent survivor (NN 253 S8 / NN 256).
+        idx = sorted(idx, key=lambda i: (-lens[i], -ranks[i],
+                                         _order_key(seqs[i]), _order_key(bc0s[i])))
         survivors = []
         for i in idx:
             s = seqs[i]
@@ -381,7 +534,12 @@ def attach_short_donors(df: pd.DataFrame, seq_col: str, rank_col: str,
             if len(cands) == 1:
                 chosen = cands[0]
             elif len(cands) > 1:
-                top2 = sorted(cands, key=lambda c: -ranks[c])[:2]
+                # TOTAL: equal-rank candidates were previously ordered by their position in
+                # `survivors`, i.e. by input row order, which decided `top2[0]` and so the
+                # attach target. (The dominance test itself is unaffected -- ranks[top2[1]] is
+                # the same number either way.)
+                top2 = sorted(cands, key=lambda c: (-ranks[c], _order_key(seqs[c]),
+                                                    _order_key(bc0s[c])))[:2]
                 if ranks[top2[0]] >= dominance * max(ranks[top2[1]], 1):
                     chosen = top2[0]
                     stats["attached_by_dominance"] += 1
@@ -457,7 +615,10 @@ def _bc1_hamming1_pairs(bc1: np.ndarray) -> np.ndarray:
         code |= A[:, j] << np.uint64(2 * j)
     keys = np.concatenate([(code & ~np.uint64(3 << (2 * j))) | np.uint64(j << 42) for j in range(20)])
     idx = np.tile(np.arange(n, dtype=np.int64), 20)
-    order = np.argsort(keys, kind="stable")
+    # lexsort on (keys, then idx) rather than a stable argsort on keys alone: the pair list is
+    # canonicalized by np.unique below, so this was already order-independent, but a total key
+    # means that no longer has to be argued (NN 256).
+    order = np.lexsort((idx, keys))
     keys, idx = keys[order], idx[order]
     brk = np.flatnonzero(np.diff(keys)) + 1
     out = []
@@ -568,9 +729,19 @@ def merge_orphan_bc1(df: pd.DataFrame, rank_col: str, sum_cols: Sequence[str],
     pos = {b: i for i, b in enumerate(bc1v)}
     # per-bc1 list of (donor, bc0, counts), most abundant first
     links: List[List[Tuple[object, object, int]]] = [[] for _ in bc1v]
-    srt = sub.sort_values(rank_col, ascending=False)
-    for b, d, c0, ct in zip(srt[bc1_col].to_numpy(), srt[donor_col].to_numpy(),
-                            srt[bc0_col].to_numpy(), srt[rank_col].to_numpy()):
+    # TOTAL: rank DESC then (donor, bc0) ASC. (bc1, donor, bc0) is the link key, so within one bc1
+    # the terminals are unique. Without them, links TIED on rank_col kept their input row order and
+    # the pair-acceptance loop below `break`s on the FIRST compatible pair it finds, so a different
+    # manifest order could record a different accepted root link (NN 250 D9 / NN 256). The keys are
+    # type-tagged rather than the raw object columns so a NaN or a mixed-type donor cannot raise.
+    all_rows = np.arange(len(sub), dtype=np.int64)
+    kd, kb = _key_codes(sub, [donor_col, bc0_col], all_rows)
+    srt_order = np.lexsort((kb, kd, -sub[rank_col].to_numpy(dtype=np.int64)))
+    bv = sub[bc1_col].to_numpy(dtype=object)[srt_order]
+    dv = sub[donor_col].to_numpy(dtype=object)[srt_order]
+    c0v = sub[bc0_col].to_numpy(dtype=object)[srt_order]
+    ctv = sub[rank_col].to_numpy(dtype=np.int64)[srt_order]
+    for b, d, c0, ct in zip(bv, dv, c0v, ctv):
         links[pos[b]].append((d, c0, int(ct)))
     totv = np.array([sum(x[2] for x in L) for L in links], dtype=np.int64)
 

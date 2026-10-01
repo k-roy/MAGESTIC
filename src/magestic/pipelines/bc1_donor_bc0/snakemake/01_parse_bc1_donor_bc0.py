@@ -39,6 +39,11 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+from magestic.utils.collapsed_fastq import (
+    CollapsedHeaderError,
+    UNKNOWN_FORMAT as COLLAPSED_UNKNOWN_FORMAT,
+    parse_collapsed_header_count,
+)
 from magestic.utils.bc1_extraction import (
     extract_bc1 as _canonical_extract_bc1, UPSTREAM_ANCHOR,
     ANCHOR_TIERS, EMITTING_TIERS, NON_EMITTING_TIERS, TIER_COUNT_COLUMNS,
@@ -580,8 +585,14 @@ def process_files(
     output_path: str,
     config: ReadConfig = None,
     overwrite: bool = True,
+    collapsed_counts: bool = False,
 ):
-    """Process paired FASTQ files and write results."""
+    """Process paired FASTQ files and write results.
+
+    ``collapsed_counts`` (NN 250 / C19): weight each record by the collapsed read count in its
+    read name. OFF by default, so the default path is byte-identical to the previous behaviour;
+    collapsed-looking read names are detected and WARNED about either way.
+    """
     if not overwrite and os.path.exists(output_path):
         logger.info(f"Output file {output_path} exists. Skipping.")
         return
@@ -658,6 +669,12 @@ def process_files(
     reads_processed = 0
     reads_successful = 0
     reads_msd_unparsed = 0
+    # NN 250 / C19: RECORDS vs READS. reads_processed counts records; reads_weighted counts the
+    # reads they represent. The two differ exactly when the input is a collapsed FASTQ, and the
+    # ratio is the collapse factor this stage used to discard.
+    reads_weighted = 0
+    collapse_fmts = Counter()      # header format -> records
+    _bare_int_seen = []            # first @N values, for the rename guard (NN 250 / C19)
 
     start_time = timeit.default_timer()
 
@@ -669,8 +686,15 @@ def process_files(
                     reads_processed -= 1   # this read is not tallied
                     break
 
+                # NN 250 / C19: a collapsed record is worth N reads, named in the read name.
+                _wdet, _fmt = read_weight_from_header(r1_read.name)
+                collapse_fmts[_fmt] += 1
+                if _fmt == "bare_int":
+                    _bare_int_seen.append(_wdet)
+                _w = _wdet if collapsed_counts else 1
+                reads_weighted += _w
                 parsed = process_read_pair(r1_read.sequence, r2_read.sequence, config)
-                if _tally(parsed, results, tier_acct, length_stats):
+                if _tally(parsed, results, tier_acct, length_stats, weight=_w):
                     reads_successful += 1
                     if not parsed.get('bc0'):
                         reads_msd_unparsed += 1
@@ -678,14 +702,21 @@ def process_files(
         r1_iter = read_fastq_entries(r1_path)
         r2_iter = read_fastq_entries(r2_path)
 
-        for (_, r1_seq, _, _), (_, r2_seq, _, _) in tqdm(zip(r1_iter, r2_iter), desc="Processing reads"):
+        for (r1_hdr, r1_seq, _, _), (_, r2_seq, _, _) in tqdm(zip(r1_iter, r2_iter), desc="Processing reads"):
             reads_processed += 1
             if reads_processed > MAX_READS:
                 reads_processed -= 1   # this read is not tallied
                 break
 
+            # NN 250 / C19
+            _wdet, _fmt = read_weight_from_header(r1_hdr)
+            collapse_fmts[_fmt] += 1
+            if _fmt == "bare_int":
+                _bare_int_seen.append(_wdet)
+            _w = _wdet if collapsed_counts else 1
+            reads_weighted += _w
             parsed = process_read_pair(r1_seq, r2_seq, config)
-            if _tally(parsed, results, tier_acct, length_stats):
+            if _tally(parsed, results, tier_acct, length_stats, weight=_w):
                 reads_successful += 1
                 if not parsed.get('bc0'):
                     reads_msd_unparsed += 1
@@ -701,6 +732,41 @@ def process_files(
     # Log statistics
     logger.info(f"Processing complete: {elapsed:.2f}s")
     logger.info(f"  Reads processed: {reads_processed:,}")
+    # NN 250 / C19: say the collapse factor out loud. A run whose input is collapsed and whose
+    # factor reads 1.00 means the read names were not understood, and every count is then an
+    # undercount -- which is exactly how this defect hid.
+    _collapsed_records = reads_processed - collapse_fmts.get(COLLAPSED_UNKNOWN_FORMAT, 0)
+    if reads_processed:
+        # 🔴 The bare_int RENAME guard. `@N` matches any all-digit read name, so an
+        # integer-renamed FASTQ would be weighted by its record index -- a silent, enormous
+        # inflation. Refuse rather than reinterpret.
+        if collapsed_counts and looks_like_an_integer_renamed_fastq(_bare_int_seen[:1000]):
+            raise RuntimeError(
+                f"--collapsed-counts was given, but the '@N' read names in {r1_path} are strictly "
+                f"increasing and all distinct over the first {len(_bare_int_seen[:1000])} records "
+                f"({_bare_int_seen[:5]} ...). That is an INTEGER-RENAMED FASTQ, not a collapsed "
+                f"one: weighting it would multiply every count by the record index. Re-run without "
+                f"--collapsed-counts (NN 250 / C19)."
+            )
+        _factor = reads_weighted / reads_processed
+        logger.info(f"  Reads represented: {reads_weighted:,} (factor {_factor:.3f}; "
+                    f"collapsed_counts={'ON' if collapsed_counts else 'OFF'}); "
+                    f"read-name formats: {dict(collapse_fmts)}")
+        if _collapsed_records and not collapsed_counts:
+            logger.warning(
+                f"  🔴 {_collapsed_records:,} of {reads_processed:,} records carry a COLLAPSED read "
+                f"count in the read name ({dict(collapse_fmts)}), and --collapsed-counts was NOT "
+                f"given, so every one of them is counted as a single read. If this input really is "
+                f"collapsed, every count below is an UNDERCOUNT by the collapse factor, and the "
+                f"distortion saturates on the abundant lineages rather than scaling (NN 250 / C19)."
+            )
+        if _collapsed_records and collapsed_counts and _collapsed_records != reads_processed:
+            logger.warning(
+                f"  MIXED read-name formats: {_collapsed_records:,} of {reads_processed:,} records "
+                f"carry a collapsed count and the rest do not. Both collapsed producers coexist "
+                f"inside single directories, so this can be legitimate -- but verify the input is "
+                f"what you think it is before using these counts (NN 250 / C19)."
+            )
     logger.info(f"  Successful extractions: {reads_successful:,} ({100*reads_successful/reads_processed:.1f}%)")
     logger.info(f"  Unique bc1-donor-bc0 combinations: {len(results):,}")
 
@@ -720,7 +786,8 @@ def process_files(
     # Write output
     _write_parsed(output_path, results)
     _write_sidecars(output_path, r1_path, r2_path, config, tier_acct,
-                    reads_processed, reads_successful, reads_msd_unparsed)
+                    reads_processed, reads_successful, reads_msd_unparsed,
+                    reads_weighted=reads_weighted, collapse_fmts=collapse_fmts)
     logger.info(f"Wrote {len(results)} unique sequences to {output_path}")
 
 
@@ -732,10 +799,54 @@ PARSED_COLUMNS = ['counts', 'bc1', 'donor', 'bc0', 'SPS', 'donor_bc0_fragment', 
 _TIER_INDEX = {t: i for i, t in enumerate(EMITTING_TIERS)}
 
 
-def _tally(parsed, results, tier_acct, length_stats) -> bool:
-    """Account one read. Returns True iff it emitted a bc1 row."""
+def read_weight_from_header(header) -> tuple:
+    """How many READS one FASTQ record is worth: ``(count, format_name)``.
+
+    🔴 NN 250 / C19. This stage used to count every record as exactly one read, never looking at
+    the read name. A COLLAPSED FASTQ carries the number of identical merged reads IN the read
+    name, in one of two producer formats, so a collapsed input was undercounted by exactly its
+    collapse factor (measured 1.4-18.9x elsewhere). The distortion SATURATES rather than scaling,
+    so it is worst on the abundant lineages -- on one measured file the top barcode's abundance
+    read 4 instead of 12 and the top-10 lists shared no members.
+    ``bc1_from_screen/02_parse_bc1_reads.py`` was fixed to use the canonical reader; this stage
+    was not.
+
+    Auto-detection is SAFE and does not rescale ordinary runs: both recognized patterns are
+    whole-name anchored (``^@?(\\d+)\\s*$`` and ``count=(\\d+)\\s*$``), so a plain Illumina read
+    name matches neither and keeps weight 1 -- exactly the previous behaviour. An unrecognized
+    name is reported as ``UNKNOWN_FORMAT`` rather than raising, because this stage legitimately
+    consumes non-collapsed FASTQ; the format tally is what makes the choice auditable.
+    """
+    try:
+        return parse_collapsed_header_count(header)
+    except CollapsedHeaderError:
+        return 1, COLLAPSED_UNKNOWN_FORMAT
+
+
+def looks_like_an_integer_renamed_fastq(bare_int_counts) -> bool:
+    """Is this ``@N`` series a RENAME (1,2,3,...) rather than collapse counts?
+
+    🔴 NN 250 / C19. ``bare_int`` matches any all-digit read name, so an integer-renamed FASTQ
+    would be weighted by its record index. A collapse-count series is abundance-distributed and
+    repeats values heavily; a rename is strictly increasing and almost all-distinct. Checked on a
+    prefix of the file, and only ever used to REFUSE, never to reinterpret.
+    """
+    vals = list(bare_int_counts)
+    if len(vals) < 20:
+        return False
+    strictly_increasing = all(b > a for a, b in zip(vals, vals[1:]))
+    return strictly_increasing and len(set(vals)) == len(vals)
+
+
+def _tally(parsed, results, tier_acct, length_stats, weight: int = 1) -> bool:
+    """Account one read. Returns True iff it emitted a bc1 row.
+
+    ``weight`` is the number of reads the record represents (NN 250 / C19); it is applied to the
+    counts vector, the tier accounting AND the length histogram, so ``counts == sum(n_<tier>)``
+    and the length stats cannot disagree with one another.
+    """
     tier = parsed.get('anchor_tier', 'none')
-    tier_acct[(tier, parsed.get('read_orientation', 'NA'))] += 1
+    tier_acct[(tier, parsed.get('read_orientation', 'NA'))] += weight
     if not parsed.get('bc1'):
         return False
     key = (
@@ -748,9 +859,9 @@ def _tally(parsed, results, tier_acct, length_stats) -> bool:
     vec = results.get(key)
     if vec is None:
         vec = results[key] = [0] * len(EMITTING_TIERS)
-    vec[_TIER_INDEX[tier]] += 1
+    vec[_TIER_INDEX[tier]] += weight
     if 'bc1_length' in parsed:
-        length_stats[parsed['bc1_length']] += 1
+        length_stats[parsed['bc1_length']] += weight
     return True
 
 
@@ -768,7 +879,8 @@ def _write_parsed(output_path, results) -> None:
 
 
 def _write_sidecars(output_path, r1_path, r2_path, config, tier_acct,
-                    reads_processed, reads_emitting, reads_msd_unparsed, note="") -> None:
+                    reads_processed, reads_emitting, reads_msd_unparsed, note="",
+                    reads_weighted=None, collapse_fmts=None) -> None:
     """``<parsed>.tier_accounting.tsv``: every read accounted for, all 9 tiers x
     {fwd, rev, NA}, so nothing is silently set aside (the 23_ mandatory
     companion). ``<parsed>.parse_meta.json``: the per-sample facts PROVENANCE needs."""
@@ -786,13 +898,26 @@ def _write_sidecars(output_path, r1_path, r2_path, config, tier_acct,
         f.write(f"{sample_id}\t_reads_processed\tNA\t{reads_processed}\tNA\n")
         f.write(f"{sample_id}\t_reads_emitting_bc1\tNA\t{reads_emitting}\tNA\n")
         f.write(f"{sample_id}\t_reads_msd_unparsed\tNA\t{reads_msd_unparsed}\tNA\n")
-    if sum(tier_acct.values()) != reads_processed:   # explicit: survives python -O
-        raise RuntimeError(f"tier accounting {sum(tier_acct.values())} != reads_processed {reads_processed}")
+        f.write(f"{sample_id}\t_reads_weighted\tNA\t{reads_weighted if reads_weighted is not None else reads_processed}\tNA\n")
+    # 🔴 NN 250 / C19: the tier accounting is in READS, so it must balance against the
+    # collapse-WEIGHTED read total, not the RECORD count. They are equal on non-collapsed input
+    # (every weight is 1) and differ by exactly the collapse factor on collapsed input. Comparing
+    # against reads_processed would make this invariant fire on every collapsed run.
+    _expected = reads_processed if reads_weighted is None else reads_weighted
+    if sum(tier_acct.values()) != _expected:   # explicit: survives python -O
+        raise RuntimeError(f"tier accounting {sum(tier_acct.values())} != reads represented {_expected} "
+                           f"(records={reads_processed})")
     meta = {
         "sample_id": sample_id, "r1": str(r1_path), "r2": str(r2_path),
         "output": str(output_path), "note": note,
         "reads_processed": reads_processed, "reads_emitting_bc1": reads_emitting,
         "reads_msd_unparsed": reads_msd_unparsed,
+        # NN 250 / C19: records vs reads, and which read-name formats were seen. A collapsed
+        # input whose factor reads 1.0 means the read names were not understood.
+        "reads_weighted": reads_weighted if reads_weighted is not None else reads_processed,
+        "collapse_factor": (round(reads_weighted / reads_processed, 6)
+                            if reads_weighted is not None and reads_processed else 1.0),
+        "collapsed_header_formats": dict(collapse_fmts or {}),
         "bc1_orientation": BC1_ORIENTATION,
         "tier_columns": list(TIER_COUNT_COLUMNS),
     }
@@ -835,6 +960,16 @@ Examples:
     parser.add_argument("--r1-length", type=int, help="R1 read length (auto-detected if not specified)")
     parser.add_argument("--r2-length", type=int, help="R2 read length (auto-detected if not specified)")
     parser.add_argument("--bc1-prefix", type=str, help=f"BC1 prefix (default: auto-detect or {DEFAULT_BC1_PREFIX})")
+    # NN 250 / C19. OPT-IN, deliberately. This stage reads PAIRED R1/R2, which a collapsed FASTQ
+    # is not, and the `bare_int` read-name family (`@12`) matches ANY all-digit read name -- an
+    # integer-renamed FASTQ (`@1, @2, @3, ...`, as seqtk rename and some SRA dumps produce) would
+    # otherwise be weighted by its RECORD INDEX, which is a silent and enormous inflation. So the
+    # default stays weight-1 (byte-identical to the previous behaviour) and collapsed-looking
+    # headers are only REPORTED; passing this flag acts on them.
+    parser.add_argument("--collapsed-counts", action="store_true",
+                        help="Treat the read name as a collapsed read COUNT (formats: @N and "
+                             "@seq_i_count=N). Off by default; without it such headers are "
+                             "detected and warned about but every record counts as one read.")
     parser.add_argument("--overwrite", action="store_true", default=True, help="Overwrite existing output")
     parser.add_argument("--no-overwrite", action="store_true", help="Skip if output exists")
 
@@ -861,6 +996,7 @@ def main():
         args.output_tsv,
         config=config,
         overwrite=overwrite,
+        collapsed_counts=args.collapsed_counts,
     )
 
 

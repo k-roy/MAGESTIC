@@ -96,6 +96,9 @@ V_LIBRARY_TO_PAM = {
 }
 
 
+from magestic.utils.bc1_extraction import exact_n20_mask   # NN 250 / NN 249-1
+
+
 def load_sps_mapping(mapping_file):
     """
     Load SPS-to-V_library mapping from TSV or YAML file.
@@ -115,18 +118,16 @@ def load_sps_mapping(mapping_file):
         libraries = config.get("libraries", config)
         return {v["sps"].upper(): k for k, v in libraries.items()}
     else:
-        # TSV format (preferred)
-        df = pd.read_csv(mapping_path, sep="\t")
-
-        # Validate columns
-        if "sps" not in df.columns or "library_id" not in df.columns:
-            raise ValueError(
-                f"SPS mapping file must have 'sps' and 'library_id' columns. "
-                f"Found: {df.columns.tolist()}"
-            )
-
-        # Normalize SPS to uppercase
-        return dict(zip(df["sps"].str.upper(), df["library_id"]))
+        # TSV format (preferred). 🔴 NN 250 / D11: this was a SECOND, independent implementation
+        # and it carried both original defects -- it demanded `library_id` (so the SHIPPED
+        # `V_library` file raised outright) and it collapsed a duplicate SPS LAST-WINS via
+        # `dict(zip(...))`. This is the ASSIGNMENT path (assign_v_library_by_sps), so a fix to
+        # core.matching's copy alone was not a fix. Delegated rather than patched in parallel:
+        # one definition, so the two cannot drift again.
+        from magestic.pipelines.bc1_donor_bc0.core.matching import (
+            load_sps_mapping as _canonical_load_sps_mapping,
+        )
+        return _canonical_load_sps_mapping(str(mapping_path))
 
 
 def load_trafo_key(trafo_key_file):
@@ -461,6 +462,55 @@ def extract_yeast_sublibrary(trafo_id):
     return parts[0] if parts else None
 
 
+# ---------------------------------------------------------------------------
+# THE ONE ordering that decides which of a bc1's links is "the top link".
+#
+# 🔴 NN 250 / D6. There used to be TWO. `top_oligo_read_share` named the top link with a
+# counts-ONLY sort while `bc1_reference` reduced to one row per bc1 under the full four-key
+# ordering below. Whenever two of a bc1's links tie on counts and differ on
+# num_PCR_replicates the two orderings pick DIFFERENT links, so the share shipped on the
+# reference row described an oligo that row does not report (measured on the NN 250 fixture:
+# the row reports design_HIGH_rep and carries 0.5, which is design_LOW_rep's share).
+#
+# The keys, in order, and why: read support first; then how many independent PCR replicates
+# saw the link, which is the support axis counts alone cannot express; then donor and bc0
+# ascending as TERMINAL keys, so a tie on both support axes still resolves to exactly one
+# answer. `kind="mergesort"` is necessary but NOT sufficient -- a stable sort inherits input
+# order, so without the terminal keys the same bc1 arriving in a different row order would get
+# a different top link. Tested by permutation invariance, not by inspecting the sort call.
+# ---------------------------------------------------------------------------
+BC1_LINK_TIE_DESCENDING = ("num_PCR_replicates",)   # support keys, highest first
+BC1_LINK_TIE_TERMINAL = ("donor", "bc0")            # terminal keys, ascending, make it total
+
+
+def canonical_bc1_link_order(df, count_col):
+    """``(cols, ascending)`` for sorting a bc1's links best-first. Columns absent are skipped."""
+    tie_order = {count_col: False}
+    for c in BC1_LINK_TIE_DESCENDING:
+        tie_order[c] = False
+    for c in BC1_LINK_TIE_TERMINAL:
+        tie_order[c] = True
+    cols = [c for c in tie_order if c in df.columns]
+    return cols, [tie_order[c] for c in cols]
+
+
+def sort_bc1_links(df, count_col):
+    """``df`` sorted best-link-first under :func:`canonical_bc1_link_order`."""
+    cols, asc = canonical_bc1_link_order(df, count_col)
+    if not cols:
+        return df
+    return df.sort_values(cols, ascending=asc, kind="mergesort")
+
+
+def top_link_oligo(df, count_col):
+    """``bc1 -> oligo_name`` of its top link, under the one canonical ordering."""
+    return (
+        sort_bc1_links(df, count_col)
+        .drop_duplicates("bc1")
+        .set_index("bc1")["oligo_name"]
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Assign bc1 to yeast sublibraries using multiple data sources",
@@ -525,6 +575,25 @@ Examples:
     logger.info("Loading mapped bc1-donor-bc0 data...")
     df = pd.read_csv(args.input, sep="\t", low_memory=False)
     logger.info(f"Loaded {len(df)} rows with {df['bc1'].nunique()} unique bc1s")
+
+    # 🔴 NN 250 / NN 249-1: report the non-N20 bc1 rate on the ASSIGNMENT input. NN 249 measured
+    # 94 of 649 calls non-N20 with 39.4% of those carrying NO supporting read, against 0.4% for
+    # N20 calls (OR 144, p = 4e-32); the real SpG input carries 159 of 768 wells non-N20, 152 of
+    # them length 2. Reported and LABELLED here rather than filtered, so the denominator is
+    # visible; the rejection itself belongs at the point of call.
+    _n20_mask, _n20_stats = exact_n20_mask(df["bc1"])
+    logger.info(f"bc1 length audit (NN 250 / NN 249-1): {_n20_stats}")
+    if _n20_stats["exceeds_threshold"]:
+        logger.warning(
+            f"  🔴 {_n20_stats['non_n20']:,} of {_n20_stats['n_rows']:,} rows "
+            f"({100*_n20_stats['non_n20_fraction']:.1f}%) have a bc1 that is NOT an exact "
+            f"20-mer of ACGT (threshold {100*_n20_stats['threshold']:.0f}%). A barcode whose "
+            f"boundary is wrong is not a shorter barcode: NN 249 measured 39.4% of such calls "
+            f"with NO supporting read vs 0.4% for N20 (OR 144, p=4e-32). Breakdown -- "
+            f"wrong_length={_n20_stats['n_wrong_length']:,}, missing={_n20_stats['n_missing']:,}, "
+            f"non_ACGT={_n20_stats['n_non_acgt']:,}, whitespace={_n20_stats['n_whitespace']:,}."
+        )
+    df["bc1_is_exact_n20"] = _n20_mask.to_numpy()
     n_input_rows, n_input_bc1 = len(df), df["bc1"].nunique()
     link_key = [c for c in ("bc1", "donor", "bc0") if c in df.columns]
     if len(link_key) == 3 and df.duplicated(subset=link_key).any():
@@ -672,7 +741,9 @@ Examples:
         #   top_oligo_read_share: share of the bc1's reads on links naming the same oligo as its top link;
         #   maps_to_n_variants_confident: distinct oligos among links with >= 2 distinct PCR replicates.
         _cnt = "counts" if "counts" in df.columns else "total_counts"
-        _top = df.sort_values([_cnt], ascending=False, kind="mergesort").drop_duplicates("bc1").set_index("bc1")["oligo_name"]
+        # ONE ordering, shared with the bc1_reference reduction below (NN 250 / D6). Computing
+        # this with a counts-only sort made the share describe a different oligo than the row.
+        _top = top_link_oligo(df, _cnt)
         _on_top = df["oligo_name"].notna() & (df["oligo_name"] == df["bc1"].map(_top))
         _tot = df.groupby("bc1")[_cnt].transform("sum")
         df["top_oligo_read_share"] = (df[_cnt].where(_on_top, 0).groupby(df["bc1"]).transform("sum")
@@ -683,12 +754,13 @@ Examples:
             df["maps_to_n_variants_confident"] = _conf.groupby(df["bc1"]).transform("nunique").astype("int64")
     df["n_links"] = df.groupby("bc1")["bc1"].transform("size").astype("int64")
 
-    # Keep top donor per bc1 for reference table. Deterministic on ties (the old
-    # default quicksort was not stable, so a tie could pick a different link per run).
-    tie_order = {count_col: False, "num_PCR_replicates": False, "donor": True, "bc0": True}
-    tie_cols = [c for c in tie_order if c in df.columns]
-    bc1_reference = df.sort_values(tie_cols, ascending=[tie_order[c] for c in tie_cols],
-                                   kind="mergesort").drop_duplicates(subset=["bc1"], keep="first").copy()
+    # Keep top donor per bc1 for reference table, under the SAME canonical ordering that named
+    # the top link for top_oligo_read_share above (NN 250 / D6). Deterministic on ties: the old
+    # default quicksort was not stable, and mergesort alone is not enough -- donor/bc0 are
+    # terminal keys so the ordering is total.
+    bc1_reference = sort_bc1_links(df, count_col).drop_duplicates(
+        subset=["bc1"], keep="first"
+    ).copy()
 
     # Select columns for reference table
     ref_cols = ["bc1"]
