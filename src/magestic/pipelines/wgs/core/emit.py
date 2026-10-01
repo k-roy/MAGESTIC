@@ -38,15 +38,85 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from trace_crispr.wgs.sv_plasmid import CleanResult
 
 __all__ = [
+    "RECONCILE_COLUMNS",
     "count_data_rows",
     "plasmid_integration_columns",
+    "reconcile_row_audited",
     "write_bc1_calls",
     "write_plasmid_integration_summary",
     "write_reconciliations",
+    "write_reconciliations_audited",
     "write_refused_table",
     "write_sample_anno_table",
     "write_table",
 ]
+
+# --------------------------------------------------------------------------- #
+# Defect 15 — `confidence` does not mean what a reader assumes                  #
+# --------------------------------------------------------------------------- #
+#
+# `reconcile.reconcile_cell` sets `confidence = "high" if bc_confidence == "high"`,
+# downgrading only for `LOW_CONF` or a `NO_EDIT` resting on uncovered sites. It
+# therefore reflects the **bc1 barcode call** and never the edit evidence: a 4-read
+# site and a 400-read site both ship `confidence=high`. NN 243 measured this — every
+# `confidence=high` in its harness was inherited from `bc_confidence`, and in a
+# bridge-less cohort `_combine_confidence("high", BRIDGE_NONE)` makes the column
+# uniformly "low", carrying no information either way.
+#
+# Two changes, neither of which touches TRACE:
+#   * the bare name `confidence` is shipped as `bc_confidence`, so it cannot be read
+#     as edit confidence;
+#   * `edit_evidence` is shipped beside it, derived from the scored sites' depth by
+#     `core.edit_profile.edit_evidence`.
+#
+# `write_reconciliations` (TRACE's exact schema) is UNCHANGED, so the dual-path
+# parity contract and every existing consumer still hold. The audited schema is
+# additive and opt-in.
+
+#: The audited Stage-4 schema: TRACE's columns with `confidence` renamed to
+#: `bc_confidence`, plus `edit_evidence`. Built from TRACE's list rather than
+#: restated, so a TRACE column addition is picked up automatically.
+def _reconcile_columns() -> list[str]:
+    tr = _trace.reconcile()
+    cols = ["bc_confidence" if c == "confidence" else c for c in tr.EMIT_COLUMNS]
+    return cols + ["edit_evidence"]
+
+
+def __getattr__(name: str):
+    """Resolve `RECONCILE_COLUMNS` lazily.
+
+    This module deliberately never imports TRACE at module scope (every other TRACE
+    use here is inside a function), so that `core/` stays importable — and testable —
+    without it. A module-level constant would break that, so the schema is resolved
+    on first attribute access instead.
+    """
+    if name == "RECONCILE_COLUMNS":
+        return _reconcile_columns()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def reconcile_row_audited(cell: CellReconciliation) -> list[str]:
+    """One audited Stage-4 row: TRACE's own row, plus the edit-evidence tier.
+
+    The first fields are `reconciliation_to_row`'s verbatim — only the HEADER renames
+    `confidence` to `bc_confidence` — so a diff against the unaudited table shows the
+    added column and nothing else.
+    """
+    from .edit_profile import edit_evidence
+
+    tr = _trace.reconcile()
+    return list(tr.reconciliation_to_row(cell)) + [edit_evidence(cell.sites)]
+
+
+def write_reconciliations_audited(
+    cells: Iterable[CellReconciliation], path: str | Path
+) -> Path:
+    """Write the Stage-4 table under `RECONCILE_COLUMNS` (defect 15).
+
+    Use this wherever the table will be read by a person. `write_reconciliations`
+    remains the parity writer for TRACE's exact schema and is unchanged.
+    """
+    return write_table(path, _reconcile_columns(), (reconcile_row_audited(c) for c in cells))
 
 
 def write_table(

@@ -19,10 +19,10 @@ The one exception is documented in `bc_confidence()`, and it is a TRACE-side gap
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from . import _trace
+from . import _trace, edit_profile
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import pysam
@@ -104,23 +104,73 @@ def score_sites(
     tau_wt: float | None = None,
     min_cov: int | None = None,
     min_base_qual: int | None = None,
+    depth_gate: bool = True,
+    designed_positions: Mapping[str, Sequence[int]] | None = None,
 ) -> list[SiteCall]:
     """Measure and classify the edit VAF at each designed window this cell's oligos predict.
 
-    Thin composition of `build_edit_sites` -> `window_edit_vaf` -> `classify_site`. The
+    Composition of `build_edit_sites` -> the window measurement -> classification. The
     three threshold arguments default to `None`, meaning TRACE's defaults stand; pass a
     value only when the screen config deliberately overrides one.
 
     Coordinates are 1-based inclusive throughout (`EditSite.start`/`end` and
     `window_edit_vaf`), matching the samplesheet vocabulary — there is no conversion here.
+
+    🔴 **NN 251 defects 6 and 11 are closed HERE, on the path Stage 4 actually takes.**
+    With `depth_gate=True` (the default) the window is measured by
+    `core.edit_profile.window_edit_profile` and classified by `classify_window`, which:
+
+    * gates `min_cov` on the depth **at the designed position** when
+      `designed_positions` supplies it, and on the **window MINIMUM** otherwise —
+      rather than on the window MAXIMUM, which let a 6 bp hole at the edit ship as
+      `NO_EDIT cov=14 n_nocov=0 confidence=high`; and
+    * records `variant_class`, so a deletion can never be reported as a substitution.
+
+    `vaf` and `cov` on every returned site remain TRACE's `window_edit_vaf` values, and
+    `trace_status` records what `classify_site` would have said, so any reclassification
+    is explicit and auditable rather than a silent change of number.
+
+    ⚠️ **Consequence to expect, stated rather than discovered:** gating on the window
+    minimum marks a window whose EDGE dips below `min_cov` as `SITE_NOCOV`, which on a
+    10-15x cohort is common. That is the intended direction — "not measured" must not
+    read as "no edit" — but it moves cells from `NO_EDIT` to `LOW_CONF`, not from wrong
+    to right, so the cohort's NO_EDIT count will fall. Supply `designed_positions` (from
+    `core.window_table.designed_positions_by_oligo`, which needs `wt_seq` AND
+    `design_donor` in the window table) to gate at the base that actually matters
+    instead. `depth_gate=False` restores TRACE's exact behaviour for a parity run.
     """
     tr = _trace.reconcile()
     site_kwargs = _only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov)
     vaf_kwargs = _only_set(min_base_qual=min_base_qual)
     calls: list[SiteCall] = []
     for site in tr.build_edit_sites(list(oligos), oligo_windows):
-        vaf, cov = tr.window_edit_vaf(bam, fasta, site.chrom, site.start, site.end, **vaf_kwargs)
-        calls.append(tr.SiteCall(site, vaf, cov, tr.classify_site(vaf, cov, **site_kwargs)))
+        if not depth_gate:
+            vaf, cov = tr.window_edit_vaf(
+                bam, fasta, site.chrom, site.start, site.end, **vaf_kwargs
+            )
+            calls.append(tr.SiteCall(site, vaf, cov, tr.classify_site(vaf, cov, **site_kwargs)))
+            continue
+        profile = edit_profile.window_edit_profile(
+            bam, fasta, site.chrom, site.start, site.end, **vaf_kwargs
+        )
+        dpos = tuple((designed_positions or {}).get(site.oligo or "", ()) or ())
+        call = edit_profile.classify_window(profile, designed_positions=dpos, **site_kwargs)
+        trace_status = tr.classify_site(profile.max_vaf, profile.cov_at_max, **site_kwargs)
+        calls.append(
+            edit_profile.ScoredSite(
+                site=site,
+                vaf=profile.max_vaf,
+                cov=profile.cov_at_max,
+                status=call.status,
+                reason=call.reason,
+                variant_class=call.variant_class,
+                min_depth=profile.min_depth,
+                n_positions_uncovered=profile.n_positions_uncovered,
+                depth_at_designed=call.depth_at_designed,
+                trace_status=trace_status,
+                flags=call.flags,
+            )
+        )
     return calls
 
 
@@ -139,8 +189,14 @@ def reconcile_sample(
     tau_wt: float | None = None,
     min_cov: int | None = None,
     min_base_qual: int | None = None,
+    depth_gate: bool = True,
+    designed_positions: Mapping[str, Sequence[int]] | None = None,
 ) -> CellReconciliation:
     """Reconcile one cell: bc1 lineage set x per-site edit VAF -> a `CellReconciliation`.
+
+    `depth_gate` and `designed_positions` are passed straight to `score_sites`, where
+    NN 251 defects 6 and 11 are closed; see that function for what they change and for
+    the consequence of gating on the window minimum.
 
     Parameters
     ----------
@@ -194,6 +250,8 @@ def reconcile_sample(
         tau_wt=tau_wt,
         min_cov=min_cov,
         min_base_qual=min_base_qual,
+        depth_gate=depth_gate,
+        designed_positions=designed_positions,
     )
     return tr.reconcile_cell(
         sample,

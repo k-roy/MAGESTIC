@@ -113,6 +113,17 @@ class Bc1Call:
     prefix_start: Optional[int] = None      # its index in the strand actually used
     strand_seq: Optional[str] = None        # that strand (fwd read, or its rev-comp)
     reason: str = ""
+    #: Is the barcode's 3' boundary where this sample's layout puts it? ``anchor_offset >=
+    #: established_offset``. None when no offset was established or none was found.
+    #:
+    #: **False is the fabricated-barcode signal** (NN 250 / C18). The confirming anchor arriving
+    #: EARLY by n nt means either the barcode or the spacer is n nt short; if it is the barcode,
+    #: the fixed-width ``s[b0:b0+bc1_length]`` slice carries n nt of spacer and the emitted
+    #: 20-mer is part fabricated. The two cases are indistinguishable from one read, so this is
+    #: deliberately a trust flag and not a length claim. An anchor arriving LATE is an insertion
+    #: in the spacer, which leaves the slice wholly inside the true barcode, so it stays True.
+    #: Exposed here, and through ``as_row()``, because the verdict was computable but unreadable.
+    barcode_boundary_trusted: Optional[bool] = None
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -237,6 +248,36 @@ def _scan_downstream(tail: str, established_offset: Optional[int]) -> Tuple[Opti
     """
     j = tail.find(UNIVERSAL_DOWNSTREAM)
     if 0 <= j <= MAX_DOWNSTREAM_OFFSET:
+        # 🔴 NN 250 / C18. The barcode is taken as a FIXED-WIDTH slice s[b0:b0+bc1_length]. If
+        # the true barcode is shorter than bc1_length, that slice runs into the post-barcode
+        # spacer and the emitted 20-mer is part barcode, part spacer -- FABRICATED. The evidence
+        # is exactly this: the confirming anchor turns up EARLIER than the sample's established
+        # offset, by the number of nucleotides the barcode is missing. Measured on a layout-A
+        # read (established offset 18): an 18-nt barcode confirms at 16, a 17-nt at 15, and both
+        # reported tier `confirmed` with layout=None.
+        #
+        # Such a read is routed into the EXISTING `confirmed_indel` tier -- the vocabulary
+        # already means "the anchor is intact but at a shifted position" by it, and
+        # `n_confirmed_indel` is already in TIER_COUNT_COLUMNS, already written by stage 01 and
+        # already read by its consumers. So this adds no column, changes no schema, drops no
+        # read, and keeps `counts == sum(n_<tier>)`.
+        #
+        # 🔴 ONLY AN **EARLIER** OFFSET IS EVIDENCE, and the direction is the whole argument:
+        #   j > established -- extra bases sit between barcode and anchor (an insertion in the
+        #     spacer). The fixed-width slice still lies entirely inside the true barcode, so the
+        #     barcode is CORRECT and this is genuinely `confirmed`. A test added deliberately on
+        #     2026-09-09 asserts exactly that ("intact anchor at a shifted offset -> confirmed
+        #     (not a fallback)"), and demoting it would be a regression.
+        #   j < established -- the anchor arrives early by n nt. Either the barcode is n nt short
+        #     (so the slice eats n nt of spacer: FABRICATED) or the spacer is n nt short (slice
+        #     fine). Those two are indistinguishable from a single read, so the honest tier is
+        #     not plain `confirmed`.
+        #
+        # Scope limit, deliberate: with no established offset there is nothing to disagree with,
+        # so the tier is unchanged. Reclassifying reads from a sample whose layout was never
+        # established would be a verdict on no evidence.
+        if established_offset is not None and j < established_offset:
+            return j, "confirmed_indel"
         return j, "confirmed"
     if established_offset is None:
         return None, "prefix_only"
@@ -332,14 +373,19 @@ def extract_bc1(
         offset, tier = _scan_downstream(tail, established_offset)
 
         if offset is not None:
+            # NN 250 / C18: False here means the barcode's 3' boundary is NOT where this
+            # sample's layout puts it, so the fixed-width slice below is part spacer.
+            off_ok = None if established_offset is None else (offset >= established_offset)
             bc1 = s[b0:b0 + bc1_length]
             obs = s[start:start + len(UPSTREAM_ANCHOR)]
             if len(bc1) != bc1_length:
                 return Bc1Call(None, "length_mismatch", orient, offset,
                                LAYOUT_BY_OFFSET.get(offset), mism, len(bc1), obs, start, s,
-                               f"read ends {bc1_length - len(bc1)} nt short of a full barcode")
+                               f"read ends {bc1_length - len(bc1)} nt short of a full barcode",
+                               barcode_boundary_trusted=off_ok)
             return Bc1Call(bc1, tier, orient, offset,
-                           LAYOUT_BY_OFFSET.get(offset), mism, bc1_length, obs, start, s)
+                           LAYOUT_BY_OFFSET.get(offset), mism, bc1_length, obs, start, s,
+                           barcode_boundary_trusted=off_ok)
 
         # prefix found, no downstream confirmation -- keep it, but SAY SO
         bc1 = s[b0:b0 + bc1_length]
@@ -520,3 +566,70 @@ class PrefixCatalog:
                 "barcodes_with_multiple_contexts": n_multi,
                 "barcodes_with_noncanonical_consensus": len(self.variant_barcodes()),
                 "observations": sum(sum(c.values()) for c in self._ctx.values())}
+
+
+# ---------------------------------------------------------------------------
+# NON-N20 bc1 CALLS (NN 250, from NN 249's mate-pair result)
+# ---------------------------------------------------------------------------
+
+#: Fraction of non-N20 bc1 calls above which a table is reported as suspect.
+#:
+#: MEASURED, not assumed. NN 249 over 768 wells: **94 of 649 bc1 calls (14.5%) are not 20-mers,
+#: and 39.4% of those have NO supporting read against 0.4% for N20 calls -- OR 144, p = 4e-32.**
+#: A non-N20 call is therefore not a shorter barcode, it is predominantly not a barcode at all.
+#: The floor is set well below the measured 14.5% and above zero, because a handful of non-N20
+#: rows is an ordinary parse residue while a percent-level rate is a systematic boundary fault
+#: (the C18 fabrication defect, seen one layer later).
+NON_N20_WARN_FRACTION = 0.01
+
+
+def exact_n20_mask(bc1, *, length: int = BC1_LENGTH):
+    """``(mask, stats)`` -- which bc1 strings are exactly ``length`` nt of ACGT.
+
+    🔴 NN 250 / NN 249-1. **Reject non-N20 calls; never pad them.** A barcode whose 3' boundary is
+    wrong is not a shorter barcode, it is a different string: the fixed-width slice that produced
+    it ran into the neighbouring spacer (C18), and NN 249 measured that 39.4% of such calls have no
+    supporting read at all.
+
+    Every row lands in exactly ONE bucket -- ``n_exact_n20``, ``n_wrong_length``, ``n_missing``,
+    ``n_non_acgt`` -- and they sum to ``n_rows``, because the bc1 string is the join spine of this
+    whole pipeline and a silent length filter here changes a denominator with nothing to show for
+    it. ``n_whitespace`` additionally counts rows whose only problem is padding (the D16 defect),
+    which are reported as length failures rather than silently stripped: stripping them here would
+    hide a parse fault one layer up.
+    """
+    # Imported lazily: this module is deliberately pandas-free so the per-read extractor stays
+    # importable in light contexts. Only this table-level helper needs pandas.
+    import pandas as pd
+
+    s = pd.Series(bc1)
+    raw = s.where(s.notna()).astype(object)
+    present = raw.notna()
+    txt = raw.where(~present, raw.astype(str))
+
+    n_rows = int(len(s))
+    n_missing = int((~present).sum())
+    has_ws = present & txt.fillna("").str.contains(r"\s", regex=True)
+    stripped = txt.fillna("").str.strip().str.upper()
+    right_len = present & (stripped.str.len() == length)
+    acgt = stripped.str.fullmatch(f"[ACGT]{{{length}}}").fillna(False)
+
+    mask = (present & acgt & (txt.astype(str).str.len() == length)).fillna(False)
+    n_exact = int(mask.sum())
+    n_non_acgt = int((right_len & ~acgt).sum())
+    n_wrong_len = n_rows - n_missing - n_exact - n_non_acgt
+    non_n20 = n_rows - n_exact
+    frac = (non_n20 / n_rows) if n_rows else 0.0
+    stats = {
+        "n_rows": n_rows,
+        "n_exact_n20": n_exact,
+        "n_wrong_length": int(n_wrong_len),
+        "n_missing": n_missing,
+        "n_non_acgt": n_non_acgt,
+        "n_whitespace": int(has_ws.sum()),
+        "non_n20": int(non_n20),
+        "non_n20_fraction": frac,
+        "threshold": NON_N20_WARN_FRACTION,
+        "exceeds_threshold": bool(n_rows and frac > NON_N20_WARN_FRACTION),
+    }
+    return mask, stats

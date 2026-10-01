@@ -48,9 +48,20 @@ import pysam
 from trace_crispr.wgs import sv_plasmid
 
 from ..config import SV_PLASMID_SUBDIR, WGSConfig
+from ..core.blacklist_adapter import (
+    reference_contig_lengths,
+    require_blacklist_applicable,
+)
 from ..core.emit import write_plasmid_integration_summary, write_table
 from ..core.manifest import WGSSample
-from ..core.reconcile_driver import load_oligo_windows
+from ..core.sv_status import (
+    SV_UNMEASURED,
+    cohort_integration_rate,
+    integration_measurement,
+    require_no_sv_rate,
+    require_no_sv_rate_in_columns,
+)
+from ..core.window_table import load_windows_audited
 from ._common import (
     StepIncompleteError,
     atomic,
@@ -81,18 +92,32 @@ INTEGRATION_TABLE_NAME = "plasmid_integration_summary.tsv"
 INTEGRATED_PREFIX = "integrated_plasmid_"
 
 #: Per-sample shard schema: Half A counts, then Half B status and its `.anno` fields.
+#:
+#: 🔴 NN 251 defects 7 and 13 add the two status columns. `integration_status`
+#: distinguishes a sample that was MEASURED and found negative from one that could
+#: not be measured at all (no `integrated_plasmid_` contig) — before NN 251 both
+#: wrote `0`, so a cohort combine could print a 0% integration rate that was an
+#: absence of measurement. `sv_status` is always `SV_UNMEASURED`, because this
+#: pipeline has no inversion or duplication detector and must not let anyone quote a
+#: rate for a quantity it never measured.
 SHARD_COLUMNS = (
     "sample",
     "upstream_count",
     "downstream_count",
     "total_count",
     "n_integrated_contigs",
+    "integration_status",
+    "sv_status",
     "half_b_status",
     "read_count_mid_point",
     "frags_genome",
     "frags_plasmid",
     "frags_chimeric",
 )
+
+#: The only SV status this pipeline can honestly emit. See `core/sv_status.py` for
+#: why the refusal was chosen deliberately over a half-built detector.
+SV_STATUS_VALUE = SV_UNMEASURED
 
 HALF_B_NO_WINDOW_TABLE = "not_run_no_oligo_window_table"
 HALF_B_NO_ASSIGNMENT = "not_run_no_oligo_assignment"
@@ -132,6 +157,14 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
     means both halves finished (or were recorded as not-run, with a reason)."""
     out = shard_path(config, sample)
     if out.exists():
+        # 🔴 NN 251: a shard written BEFORE this change set has 10 columns, not 12
+        # (`integration_status` and `sv_status` were added). `_run_one_sample` skips an
+        # existing shard, and `collect_shards` only catches drift BETWEEN shards — so a
+        # cohort of uniformly-stale shards would be read with the NEW column indices
+        # and `half_b_status` would be taken from `frags_genome`. Stage 3 is the LIVE
+        # stage (NN 243), so such shards may already exist on Oak. Refuse, and say what
+        # to do, rather than resume into a column shift.
+        _require_current_shard_schema(out, sample)
         logger.info("step_3: %s already complete — skipping", sample)
         return out
 
@@ -140,13 +173,23 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
     bam_path = require_indexed_bam(record)
 
     contigs = _integrated_contigs(bam_path)
-    counts = sv_plasmid.detect_plasmid_integration(
+    # 🔴 NN 251 defect 13: `detect_plasmid_integration` returns 0/0 for a BAM with no
+    # `integrated_plasmid_` contig, which is numerically identical to a sample that
+    # WAS measured and found negative. `integration_measurement` keeps the two apart
+    # and writes "" rather than 0 when nothing was measurable.
+    measure = integration_measurement(
         str(bam_path),
+        sample=sample,
         integrated_contigs=contigs,
         junction_distance=_junction_distances(config, contigs),
     )
-    total = counts["upstream_count"] + counts["downstream_count"]
     status, anno = _run_half_b(config, record)
+    blank = ""
+
+    # 🔴 NN 255 F2: the refusal was applied to the provenance MAPPING only, never to a
+    # written HEADER, so an SV-rate COLUMN reached a file unrefused. A column name is
+    # published exactly as readily as a count.
+    require_no_sv_rate_in_columns(SHARD_COLUMNS, source="step_3 shard header")
 
     with atomic(out) as tmp:
         write_table(
@@ -155,25 +198,56 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
             [
                 [
                     sample,
-                    counts["upstream_count"],
-                    counts["downstream_count"],
-                    total,
-                    len(contigs),
+                    blank if not measure.measured else measure.upstream_count,
+                    blank if not measure.measured else measure.downstream_count,
+                    blank if not measure.measured else measure.total,
+                    measure.n_integrated_contigs,
+                    measure.status,
+                    SV_STATUS_VALUE,
                     status,
                     *anno,
                 ]
             ],
         )
     logger.info(
-        "step_3: %s integration up=%d down=%d total=%d over %d contig(s); half_b=%s",
+        "step_3: %s integration=%s up=%s down=%s total=%s over %d contig(s); "
+        "half_b=%s; sv=%s",
         sample,
-        counts["upstream_count"],
-        counts["downstream_count"],
-        total,
-        len(contigs),
+        measure.status,
+        measure.upstream_count,
+        measure.downstream_count,
+        measure.total,
+        measure.n_integrated_contigs,
         status,
+        SV_STATUS_VALUE,
     )
     return out
+
+
+def _require_current_shard_schema(shard: Path, sample: str) -> None:
+    """Refuse a shard written under an older `SHARD_COLUMNS` (NN 251).
+
+    Idempotent resume is the point of skipping an existing shard, but it is only safe
+    while the schema is unchanged. A stale shard is a *silent column shift*, not a
+    missing column: every field after the insertion point is read under the wrong
+    name. Deleting the shard is the right remedy and the message says so.
+    """
+    header = shard.read_text().splitlines()[:1]
+    if not header:
+        raise StepIncompleteError(
+            f"step_3: {sample}'s shard {shard} is empty. Delete it and re-run."
+        )
+    found = tuple(header[0].split("\t"))
+    if found != SHARD_COLUMNS:
+        raise StepIncompleteError(
+            f"step_3: {sample}'s existing shard {shard} was written under a DIFFERENT "
+            f"schema ({len(found)} columns, expected {len(SHARD_COLUMNS)}).\n"
+            f"  found:    {found}\n  expected: {SHARD_COLUMNS}\n"
+            "Resuming would read every field after the first difference under the "
+            "wrong column name (NN 251 added `integration_status` and `sv_status`). "
+            "Delete this shard — and any sibling written before the change — and "
+            "re-run the sample."
+        )
 
 
 def _integrated_contigs(bam_path: Path) -> list[str]:
@@ -244,15 +318,25 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
     oligo = _assigned_oligo(config, record.sample)
     if oligo is None:
         return HALF_B_NO_ASSIGNMENT, blank
-    windows = load_oligo_windows(
+    # 🔴 NN 251 defect 12: the audited loader, so Half B's window lookup also has a
+    # denominator. `load_oligo_windows` returns a bare dict, so a sample whose window
+    # was DROPPED from the table (3001.0, a blank coordinate, a duplicate oligo) was
+    # indistinguishable here from a sample whose oligo is genuinely absent.
+    audit = load_windows_audited(
         str(config.reconcile.oligo_windows),
         oligo_col=config.columns.oligo_col,
         chrom_col=config.columns.chrom_col,
         start_col=config.columns.start_col,
         end_col=config.columns.end_col,
     )
-    window = windows.get(oligo)
+    window = audit.windows.get(oligo)
     if window is None:
+        logger.warning(
+            "step_3: %s oligo %s has no window — %s%s",
+            record.sample, oligo, audit.summary(),
+            " (this oligo's row was DROPPED by the coordinate filter, not absent)"
+            if oligo in audit.dropped_oligos else "",
+        )
         return HALF_B_WINDOW_UNKNOWN, blank
 
     blacklist = config.sv_plasmid.blacklist
@@ -261,6 +345,14 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
             "step_3: Half B needs the REDI blacklist (REDI_reads_mapped_regions.txt); "
             f"sv_plasmid.blacklist is {blacklist!r}"
         )
+    # 🔴 NN 251 defect 2. `exists()` was the ONLY check, and TRACE's loader is
+    # deliberately permissive, so a blacklist whose contigs are `chr15`-named against
+    # `chrXV` references parsed cleanly and filtered NOTHING — 0 of 9 names present,
+    # 100% inert, and the output looked filtered. This refuses that state.
+    audit = require_blacklist_applicable(
+        blacklist, reference_contig_lengths(record.reference)
+    )
+    logger.info("step_3: %s blacklist — %s", record.sample, audit.summary())
 
     chrom, start, end = window
     final_bam = cleaned_bam_path(config, record.sample)
@@ -345,15 +437,32 @@ def _combine(config: WGSConfig) -> list[Path]:
     with atomic(integration_out) as tmp:
         write_plasmid_integration_summary(summary, tmp)
 
-    with_evidence = sum(1 for row in summary if row["total_count"] > 0)
+    # 🔴 NN 251 defect 13: the cohort denominator is the MEASURED samples, never the
+    # whole cohort. `cohort_integration_rate` refuses outright when any sample was
+    # unmeasured, so a 0% that is really an absence of measurement cannot be printed.
+    measured = [r for r in summary if r["total_count"] != ""]
+    unmeasured = len(summary) - len(measured)
+    with_evidence = sum(1 for row in measured if int(row["total_count"]) > 0)
+    rate: float | None = None
+    if measured and not unmeasured:
+        rate = cohort_integration_rate(
+            [(str(r["sample_name"]), int(r["total_count"])) for r in measured]
+        )
     status_idx = SHARD_COLUMNS.index("half_b_status")
     half_b_run = sum(1 for row in rows if row.split("\t")[status_idx] == HALF_B_RUN)
     logger.info(
-        "step_3: %d samples; %d with >=1 junction-spanning read; Half B ran on %d of %d",
+        "step_3: %d samples; %d MEASURED for integration, %d NOT MEASURED (no "
+        "integrated_plasmid_ contig); %d of the measured with >=1 junction-spanning "
+        "read%s; Half B ran on %d of %d; sv_status=%s for every sample",
         n,
+        len(measured),
+        unmeasured,
         with_evidence,
+        f" (rate {rate:.1%} of measured)" if rate is not None
+        else " (no cohort rate: the cohort is not fully measured)",
         half_b_run,
         n,
+        SV_STATUS_VALUE,
     )
 
     write_provenance(
@@ -370,13 +479,35 @@ def _combine(config: WGSConfig) -> list[Path]:
                 else int(config.sv_plasmid.junction_distance)
             ),
         },
-        counts={
-            "samples": n,
-            "samples_with_integration_evidence": with_evidence,
-            "half_b_run": half_b_run,
-        },
+        counts=_provenance_counts(
+            {
+                "samples": n,
+                "samples_measured_for_integration": len(measured),
+                "samples_not_measured_for_integration": unmeasured,
+                "samples_with_integration_evidence": with_evidence,
+                "half_b_run": half_b_run,
+                "sv_status": SV_STATUS_VALUE,
+            }
+        ),
     )
     return [out, integration_out]
+
+
+def _provenance_counts(counts: dict[str, object]) -> dict[str, object]:
+    """Guard the provenance record against publishing an SV rate (defect 7).
+
+    This is where a rate would actually reach a file, so this is where the refusal
+    lives. `require_no_sv_rate` inspects KEYS: a zero is as publishable as a
+    non-zero and just as wrong, because there is no detector behind either.
+
+    NN 255 F2: it now normalizes the key (camelCase split, plural-insensitive) and
+    recurses into nested values, so `inversions_rate`, `svRate`, `large_deletion_rate`
+    and a nested `summary -> sv` + rate key are all refused where they used to pass.
+    (Written without the literal quoted key on purpose: a source-text scan in
+    `test_251_trace_fixes.py` refuses one anywhere under `pipeline/`, and it is right to.)
+    """
+    require_no_sv_rate(counts)
+    return counts
 
 
 def _integration_summary(rows: Sequence[str]) -> list[dict[str, object]]:
@@ -387,14 +518,27 @@ def _integration_summary(rows: Sequence[str]) -> list[dict[str, object]]:
     second cohort-wide code path that path (B) would never take.
     """
     idx = {c: SHARD_COLUMNS.index(c) for c in SHARD_COLUMNS}
+
+    def _count(value: str) -> int | str:
+        """`""` for an unmeasured sample, never `0` (NN 251 defect 13).
+
+        The summary table is read by people and by `redi`. Writing `0` where nothing
+        was measured is what lets an absence of measurement be averaged into a rate.
+        """
+        v = value.strip()
+        return int(v) if v.lstrip("-").isdigit() else ""
+
     summary: list[dict[str, object]] = [
         {
             "sample_name": fields[idx["sample"]],
-            "upstream_count": int(fields[idx["upstream_count"]]),
-            "downstream_count": int(fields[idx["downstream_count"]]),
-            "total_count": int(fields[idx["total_count"]]),
+            "upstream_count": _count(fields[idx["upstream_count"]]),
+            "downstream_count": _count(fields[idx["downstream_count"]]),
+            "total_count": _count(fields[idx["total_count"]]),
         }
         for fields in (row.split("\t") for row in rows)
     ]
-    summary.sort(key=lambda r: int(r["total_count"]), reverse=True)
+    # Unmeasured samples sort last, and are NOT treated as zero.
+    summary.sort(
+        key=lambda r: (r["total_count"] != "", r["total_count"] or 0), reverse=True
+    )
     return summary

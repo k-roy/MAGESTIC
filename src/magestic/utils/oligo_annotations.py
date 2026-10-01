@@ -117,6 +117,25 @@ COLUMNS_BC1_DONOR_BC0 = [
     "individual_variants",
 ]
 
+# 🔴 NN 250 / D15. `individual_variants` ALONE is not a variant identity: measured on the real
+# harmonized table, 50 of its 22,252 positional ids appear on more than one CHROMOSOME (so two
+# different edits merge into one), and 26,101 rows carry a CLASS LABEL rather than an identity
+# (`PTC` alone covers 3,054 rows, which would collapse 3,054 different designs into one "variant"
+# and make an ambiguous match report is_unambiguous=True). These two columns let
+# matching.qualified_variant_id() build a chromosome-qualified POSITIONAL id.
+#
+# OPTIONAL, deliberately: they are requested only when the table on disk actually has them.
+# Putting them in the REQUIRED list broke every caller whose harmonized table predates them --
+# `usecols` raises on a missing column, which took out the whole NN 240 roundtrip harness (it
+# builds a synthetic harmonized table). The matcher degrades explicitly and loudly when they are
+# absent rather than depending on them.
+# `PAM`/`PAM_coord`/`PAM_strand` are the TUPLE NN 241's attack differed on (same gene, chromosome,
+# coordinate and ref->alt; different PAM site). Without them `tables.oligo_to_pam` is empty and
+# `candidates_agree_on_pam` is None on EVERY row -- a constant column, which names nothing. They
+# are optional for the same reason as chrom/variant_coord: required would make `usecols` raise on
+# any table predating them.
+OPTIONAL_COLUMNS_BC1_DONOR_BC0 = ["chrom", "variant_coord", "PAM", "PAM_coord", "PAM_strand"]
+
 
 def get_annotation_columns_for_bc1_from_screen(
     include_extras: bool = True,
@@ -151,7 +170,10 @@ def get_annotation_columns_for_bc1_donor_bc0() -> List[str]:
     Returns:
         List of column names to load from harmonized table
     """
-    return COLUMNS_BC1_DONOR_BC0.copy()
+    # The D15 columns are appended as OPTIONAL: load_oligo_annotations() drops any of them the
+    # table on disk does not have (requesting a missing column makes `usecols` raise). Resolved
+    # there and not here, because the caller may override the table path.
+    return COLUMNS_BC1_DONOR_BC0 + OPTIONAL_COLUMNS_BC1_DONOR_BC0
 
 
 @lru_cache(maxsize=4)
@@ -200,6 +222,24 @@ def load_oligo_annotations(
             f"Harmonized oligo table not found: {filepath}\n"
             "Run the harmonization script first."
         )
+
+    # 🔴 NN 250 / D15: drop requested OPTIONAL columns the table does not carry. `usecols` raises
+    # on a missing column, so a table predating `chrom`/`variant_coord` would fail to load at all
+    # (it took out the whole NN 240 roundtrip harness, which builds a synthetic harmonized table).
+    # Only names in OPTIONAL_COLUMNS_BC1_DONOR_BC0 are ever dropped -- a missing REQUIRED column
+    # must still raise, loudly, rather than silently yielding a table without it.
+    if columns:
+        _optional = set(OPTIONAL_COLUMNS_BC1_DONOR_BC0)
+        if _optional.intersection(columns):
+            _have = set(pd.read_csv(filepath, sep="\t", nrows=0).columns)
+            _absent = [c for c in columns if c in _optional and c not in _have]
+            if _absent:
+                logger.warning(
+                    f"{filepath.name} has no {_absent}; loading without them. Variant ids cannot "
+                    f"be chromosome-qualified, so two edits at one coordinate on different "
+                    f"chromosomes still merge (NN 250 / D15)."
+                )
+                columns = [c for c in columns if c not in _absent]
 
     # Convert columns to tuple for caching
     columns_tuple = tuple(columns) if columns else None

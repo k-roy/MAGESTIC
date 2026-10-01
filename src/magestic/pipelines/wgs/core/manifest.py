@@ -64,6 +64,18 @@ class ReferenceMismatchError(ManifestError):
     """A sample's declared reference disagrees with the reference its BAM was aligned to."""
 
 
+class ReferenceUnobservedError(ManifestError):
+    """A sample's BAM was never inventoried, so its reference could not be observed.
+
+    Its own class, distinct from `ReferenceMismatchError`, because the two have
+    different fixes and the distinction is load-bearing: a BAM aligned with a tool
+    that writes no `@PG ID:bwa` line, or one merged afterwards so the line is lost,
+    is UNOBSERVED, not mismatched. Collapsing them would make a legitimate pipeline
+    look like a wrong-reference alignment, and a reviewer who has been told "the
+    reference check raises on this cohort" would draw the wrong conclusion.
+    """
+
+
 class CrossReferenceError(ManifestError):
     """An operation that is only meaningful within one reference spans several."""
 
@@ -242,13 +254,101 @@ def require_reference_consistency(
     *,
     compare_basename: bool = True,
 ) -> None:
-    """`check_reference_consistency`, raising `ReferenceMismatchError` on any problem."""
+    """`check_reference_consistency`, raising on any problem.
+
+    Raises
+    ------
+    ReferenceUnobservedError
+        At least one sample has no observed reference. Checked FIRST and raised as
+        its own class: `observed` is built from the BAM's `@PG ID:bwa` line, which a
+        BAM aligned by another tool — or merged after alignment — legitimately lacks.
+        That is "could not check", not "checked and wrong", and conflating the two
+        would make a clean cohort look mis-aligned (NN 251, defect 14).
+    ReferenceMismatchError
+        Every sample was observed and at least one disagrees with the manifest.
+    """
     problems = check_reference_consistency(samples, observed, compare_basename=compare_basename)
-    if problems:
+    if not problems:
+        return
+    unobserved = [p for p in problems if "no observed reference" in p]
+    mismatched = [p for p in problems if p not in set(unobserved)]
+    # 🔴 A REAL MISMATCH IS REPORTED FIRST. In a mixed cohort — some BAMs with a `@PG`
+    # line, some without — raising Unobserved first would hide a genuine wrong-reference
+    # alignment behind a "could not check" message, which is the louder-but-wronger
+    # failure. Mismatch is the one that means data is wrong; unobserved only means the
+    # check could not run.
+    if mismatched:
         raise ReferenceMismatchError(
             "manifest/BAM reference mismatch for "
-            f"{len(problems)} sample(s):\n  " + "\n  ".join(problems)
+            f"{len(mismatched)} sample(s):\n  " + "\n  ".join(mismatched)
+            + (
+                f"\n  (plus {len(unobserved)} sample(s) whose reference could not be "
+                "observed at all; fix the mismatch first, then re-run to see those.)"
+                if unobserved else ""
+            )
         )
+    if unobserved:
+        raise ReferenceUnobservedError(
+            f"{len(unobserved)} sample(s) have no observed reference, so the "
+            "manifest/BAM reference check could not run:\n  "
+            + "\n  ".join(unobserved)
+            + "\n  (A BAM with no `@PG ID:bwa` line is UNOBSERVED, not mismatched — "
+            "inventory it with `readers.bam_inventory`, or compare `@SQ` lengths with "
+            "`incomparable_contigs` instead.)"
+        )
+    raise ReferenceMismatchError(  # pragma: no cover - unreachable; kept as a backstop
+        "manifest/BAM reference mismatch for "
+        f"{len(problems)} sample(s):\n  " + "\n  ".join(problems)
+    )
+
+
+def incomparable_contigs(
+    lengths_a: Mapping[str, int], lengths_b: Mapping[str, int]
+) -> list[str]:
+    """Contigs present in BOTH references whose LENGTHS disagree.
+
+    🔴 **NN 251 correction to NN 243.** NN 243 listed this function among the
+    "guards that are written, documented and called by nothing". It was in fact
+    **never written** — `grep` over the package finds only prose references to it.
+    So this is a new guard, not a wiring job, and the audit's "4 free wins" are
+    really 3 wirings plus 1 implementation. Recorded here rather than silently
+    fixed, because a reviewer told the guard already existed would not re-check it.
+
+    The comparison is deliberately restricted to the INTERSECTION of names: a
+    composite reference legitimately adds contigs (`native_2micron`,
+    `integrated_plasmid_<oligo>`) that a plain reference lacks, and treating those
+    as a problem would make every correctly-built composite fail. A shared name
+    whose LENGTH differs, though, is never benign — it is the chrVIII/CUP1 case,
+    where the same name denotes a contracted and an uncontracted contig and **no
+    single coordinate offset exists between them**, so every coordinate read in the
+    other frame is silently wrong.
+
+    Returns
+    -------
+    list of str
+        One message per disagreeing contig, empty when every shared name agrees.
+        Messages rather than a raise, matching `check_reference_consistency`, so a
+        caller can report them all at once.
+    """
+    shared = set(lengths_a) & set(lengths_b)
+    # 🔴 A FULLY DISJOINT PAIR IS A PROBLEM, NOT A PASS. Restricting the comparison to
+    # the intersection is right (a composite reference adds contigs), but with an EMPTY
+    # intersection the loop below finds nothing and the guard would return "all clear"
+    # for the worst case of all — a `chr15`-named BAM against `chrXV`-named references,
+    # which is the very naming mismatch defect 2 was about. Reported explicitly.
+    if not shared and (lengths_a or lengths_b):
+        return [
+            "no contig name is shared between the two references "
+            f"({len(lengths_a)} vs {len(lengths_b)} contigs; first names "
+            f"{sorted(lengths_a)[:3]} vs {sorted(lengths_b)[:3]}) — they are not the "
+            "same naming convention (chr15 vs chrXV), so no coordinate is comparable"
+        ]
+    problems: list[str] = []
+    for name in sorted(shared):
+        a, b = int(lengths_a[name]), int(lengths_b[name])
+        if a != b:
+            problems.append(f"{name}: length {a} vs {b}")
+    return problems
 
 
 def require_single_reference(samples: Sequence[WGSSample], *, operation: str) -> Path:

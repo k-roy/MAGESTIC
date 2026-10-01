@@ -397,6 +397,47 @@ class WGSDonorPrecallConfig:
     """Per-plate multi-sample VCFs to split into the per-sample layout. Empty means
     Stage 2 has no input and must fail loudly rather than emit an empty table."""
 
+    resolve_underscore_contigs: bool = True
+    """Resolve GATE 3 with `core/contig_alias.ContigAlias` instead of refusing.
+
+    NN 251 defect 3. TRACE's `precall_sample` re-parses its own variant id with a
+    positional `split("_")`, so **4 of the 5 contigs the WGS reference-mapping policy
+    mandates crash it**. `True` (the default) encodes every contig name TRACE sees to
+    an underscore-free alias and DECODES the variant ids before the shard is
+    published, so no aliased name reaches a shipped table; `False` restores the old
+    unconditional `GateError`.
+
+    The alias is a no-op on an already-safe reference, so an underscore-free cohort
+    runs byte-identically either way."""
+
+    min_allele_fraction: float | None = None
+    """Rescue a reference-GT record whose AD-derived allele fraction clears this.
+
+    NN 251 defect 1. `None` keeps the GT-only behaviour, which is what every existing
+    output was produced with. See `core/vcf_adapter.PLOIDY_CAVEAT` before setting it:
+    a rescued record reaches Stage 2 as a 100% call, so anything below
+    `vcf_adapter.DEFAULT_FULL_ALLELE_FRACTION` is flagged `MAG_MINOR` and listed in
+    `VcfSplitResult.minor_allele_variants`.
+
+    ⚠️ NN 255: this governs the RESCUE only. Annotating a minority allele is now
+    unconditional, so a 10% `GT 0/1` on a diploid-default plate VCF is flagged whatever
+    this is set to — that was NN 252's F11b, a guard that only fired on a non-default
+    branch. `None` is still required to reproduce a legacy run byte for byte, but a
+    `--ploidy 1` plate VCF with `min_allele_fraction=None` is REFUSED by `step_2`,
+    because at `--ploidy 1` every minority allele is `GT 0` and the rescue is the only
+    thing that can see it."""
+
+    min_alt_reads: int = 2
+    """Minimum ALT read count for a rescued record. NN 255.
+
+    A fraction threshold with no count floor selects for low coverage. Measured per-well
+    depth, named by dataset: `spg_20240702_POST` median 20.1x / q25 9.1x (n=480);
+    the 20231213 plate-2348/2349 cohort median 14.4x / q25 6.2x (n=768). At either,
+    `min_allele_fraction=0.05` rounds to a ONE-read minimum whose per-position
+    false-positive rate from sequencing error alone is ~1-2% (binomial, q=1e-3..5e-3).
+    At two reads that falls below 1e-3 at 40x while sensitivity to a true 10% allele is
+    still 0.92. Default matches `vcf_adapter.DEFAULT_MIN_ALT_READS`."""
+
     @property
     def synthetic_error_axis(self) -> str:
         """`"disabled"` while `synthetic_donor := design_donor`, else `"enabled"`.
@@ -455,6 +496,45 @@ class WGSReconcileConfig:
     rather than kwargs, so `core/reconcile_driver.py` composes the primitives directly
     instead of synthesizing a Namespace.
     """
+
+    require_frame_check: bool = True
+    """Refuse to score a window whose reference frame cannot be verified.
+
+    NN 251 defect 10 / NN 243 A11. Stage 4 compares reads to `fasta.fetch` and is
+    never given the design's `wt_seq`, so a reference that already carries the
+    design's ALT inverts every per-cell call **while the apparent aggregate rate
+    lands on exactly truth** (per-cell accuracy 0.0%). No rate-level check can
+    detect that, so the per-site check is the only defence.
+
+    `True` requires a `wt_seq` column in `reconcile.oligo_windows` and verifies every
+    window with `core.window_table.verify_window_frame`. `False` records an explicit
+    `frame_unverified_no_wt_seq` refusal instead — never a silent pass."""
+
+    depth_gate: bool = True
+    """Gate `min_cov` on the designed position (or the window minimum), not the maximum.
+
+    NN 251 defects 6 and 11 / NN 243 A10+A12. `classify_site` applies `min_cov` to the
+    depth at the window's MAXIMUM-VAF position, so a soft-clipped deletion leaving the
+    designed base at depth 0 shipped as `NO_EDIT cov=42 n_nocov=0 confidence=high`.
+
+    `True` routes scoring through `core.edit_profile`, which gates on the designed
+    position when `reconcile.oligo_windows` carries `wt_seq` + `design_donor`, and on
+    the window minimum otherwise — and records `variant_class`, so an SV cannot be
+    reported as a substitution. `False` restores TRACE's exact behaviour for a parity
+    run.
+
+    ⚠️ Expect the cohort's `NO_EDIT` count to FALL: a window whose edge dips below
+    `min_cov` now reads `SITE_NOCOV` (not measured) rather than `SITE_WT` (no edit).
+    That is the intended direction, not a free win — supply the design columns to gate
+    at the base that matters instead of at the whole window."""
+
+    strict_window_table: bool = False
+    """Refuse a window table that drops rows or collapses duplicate oligos.
+
+    NN 251 defect 12. Default `False` because the real design table is only **50.2%
+    filled** on `donor_start_coord`/`donor_end_coord`, so `True` would refuse every
+    existing cohort outright; the denominators are logged and reported either way,
+    which is what makes the undercount visible. Set `True` for a curated table."""
 
     oligo_windows: Path | None = None
     """Oligo-window table (`oligo_name`, `chrom`, `donor_start_coord`,
