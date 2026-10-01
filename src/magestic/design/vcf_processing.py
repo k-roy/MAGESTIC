@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -72,7 +72,12 @@ _CHROM_NUM_TO_NUMERAL: Dict[str, str] = {
 # 1. Load haplotype VCF
 # ---------------------------------------------------------------------------
 
-def load_haplotype_vcf(filename: str | Path) -> _VariantsBySample:
+def load_haplotype_vcf(
+    filename: str | Path,
+    *,
+    allowed_chroms: Optional[Sequence[str]] = None,
+    skip_counts: Optional[Dict[str, int]] = None,
+) -> _VariantsBySample:
     """
     Load the per-sample haplotype TSV produced by the haplotype-block extraction
     step (``get_haplotype_blocks_from_vcf_with_coord_offset.py``).
@@ -89,6 +94,15 @@ def load_haplotype_vcf(filename: str | Path) -> _VariantsBySample:
     ----------
     filename : str or Path
         Path to the haplotype block TSV.
+    allowed_chroms : sequence of str, optional
+        Contigs to retain.  Defaults to :data:`YEAST_CHROMS` (the 16 nuclear
+        chromosomes).  Pass ``list(YEAST_CHROMS) + ["chrM", "chrmt"]`` to design
+        against the mitochondrial genome — needed for respiration and central
+        carbon metabolism panels, where chrM is in scope.
+    skip_counts : dict, optional
+        If given, it is populated with per-reason counts of the rows that were
+        **not** loaded, so no row is lost silently.  Keys:
+        ``"short_line"``, ``"contig_not_allowed"``, ``"structural_variant"``.
 
     Returns
     -------
@@ -100,6 +114,18 @@ def load_haplotype_vcf(filename: str | Path) -> _VariantsBySample:
     filename = Path(filename)
     variants_by_sample: _VariantsBySample = {}
 
+    allowed: Set[str] = set(YEAST_CHROMS if allowed_chroms is None else allowed_chroms)
+
+    # Every row that is not loaded is counted under an explicit reason. A bare
+    # `continue` here silently discarded every non-nuclear contig — chrM, the
+    # 2-micron and any plasmid — with nothing in any output to show it happened.
+    skipped: Dict[str, int] = {
+        "short_line": 0,
+        "contig_not_allowed": 0,
+        "structural_variant": 0,
+    }
+    skipped_contigs: Dict[str, int] = {}
+
     with open(filename) as infile:
         _header = infile.readline()
         for line in infile:
@@ -108,6 +134,7 @@ def load_haplotype_vcf(filename: str | Path) -> _VariantsBySample:
             parts = line.strip().split("\t")
             if len(parts) < 11:
                 logger.debug("Skipping short line: %s", line.rstrip())
+                skipped["short_line"] += 1
                 continue
             chrom_raw, pos_str, ref, alt, sample, haplotype = parts[:6]
             orf, name = parts[9], parts[10]
@@ -115,12 +142,15 @@ def load_haplotype_vcf(filename: str | Path) -> _VariantsBySample:
             # Normalise chromosome name format
             chrom = _CHROM_NUM_TO_NUMERAL.get(chrom_raw, chrom_raw)
 
-            # Skip mitochondrial and non-autosomal entries
-            if "M" in chrom or chrom not in YEAST_CHROMS:
+            # Retain only the allowed contigs — counted, by contig, never silent.
+            if chrom not in allowed:
+                skipped["contig_not_allowed"] += 1
+                skipped_contigs[chrom] = skipped_contigs.get(chrom, 0) + 1
                 continue
 
             # Skip structural variants
             if alt in ("*", "DUP", "DEL"):
+                skipped["structural_variant"] += 1
                 continue
 
             pos = int(pos_str)
@@ -171,6 +201,26 @@ def load_haplotype_vcf(filename: str | Path) -> _VariantsBySample:
         "Loaded %d variants across %d samples from %s",
         n_variants, n_samples, filename,
     )
+
+    n_skipped = sum(skipped.values())
+    if n_skipped:
+        logger.warning(
+            "load_haplotype_vcf: skipped %d rows — %s%s",
+            n_skipped,
+            ", ".join(f"{k}={v}" for k, v in skipped.items() if v),
+            (
+                "; contigs dropped: "
+                + ", ".join(
+                    f"{c}={n}" for c, n in sorted(skipped_contigs.items())
+                )
+                if skipped_contigs
+                else ""
+            ),
+        )
+    if skip_counts is not None:
+        skip_counts.update(skipped)
+        skip_counts["contigs_dropped"] = dict(skipped_contigs)  # type: ignore[assignment]
+
     return variants_by_sample
 
 

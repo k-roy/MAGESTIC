@@ -23,6 +23,36 @@ logging.basicConfig(
 )
 
 
+def _load_rev_primers(path: str | Path) -> list[str]:
+    """Read subpool reverse-priming sequences and return them **reverse-complemented**.
+
+    🔴 The file stores each subpool's reverse primer in its own 5'->3' orientation, but an
+    oligo carries that primer's **reverse complement** at its 3' end, because the primer
+    anneals to the bottom strand. ``design_oligos_from_vcf`` and
+    ``design_saturation_oligos`` both simply concatenate what they are given, so the
+    orientation has to be fixed here, at the read.
+
+    Verified against the real ordered NRD1 pool
+    (``NRD1/NRD1_SpCas9_NGG_guide_donor_200bp_oligo_pool.tsv``): all **2,308** oligos end
+    in ``CGATAGACGACTGGACAGCA``, which is ``rev_comp`` of line 1 of
+    ``rev_subpool_priming_sequences.txt`` (``TGCTGTCCAGTCGTCTATCG``) and matches no line
+    as written. The original generator did this at load time
+    (``NRD1/generate_guide_donors_for_aa_substitutions_Cas9.py:161``); the port to this CLI
+    dropped it, so every emitted subpool would have been unamplifiable with its intended
+    primer. Caught by the EMBL/TRIUMPH design review, 2026-09-30, where a collaborator had
+    independently reverse-complemented the primers by hand.
+    """
+    from magestic.design.guide_donor_functions import rev_comp
+
+    primers: list[str] = []
+    with open(path) as fh:
+        for line in fh:
+            seq = line.strip()
+            if seq:
+                primers.append(rev_comp(seq.lower()))
+    return primers
+
+
 def pam_search_main() -> None:
     """CLI entry point: magestic-pam-search
 
@@ -145,10 +175,7 @@ def design_vcf_main() -> None:
     plus_bg = load_transcript_coverage(args.plus_bedgraph)
     minus_bg = load_transcript_coverage(args.minus_bedgraph)
 
-    rev_primers = []
-    with open(args.rev_primers) as fh:
-        for line in fh:
-            rev_primers.append(line.strip().lower())
+    rev_primers = _load_rev_primers(args.rev_primers)
 
     # Default PAM preference: NGNG (higher activity) before NGNH for SpG
     if args.nuclease == "SpG":
@@ -203,8 +230,13 @@ def design_vcf_preprocess_main() -> None:
     parser.add_argument("--max-fdr", type=float, default=None, metavar="FDR",
                         help="If --gene-list has a localFDR column, only include genes with "
                              "localFDR < MAX_FDR. Default: no FDR filter. Typical value: 0.10.")
-    parser.add_argument("--exclude-background", action="store_true", default=True,
-                        help="Exclude background_variant ORF entries. (default: True)")
+    parser.add_argument("--exclude-background", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Exclude background_variant ORF entries, i.e. variants that "
+                             "distinguish the background strain from S288c and are therefore not "
+                             "edits. Pass --no-exclude-background to keep them; the 2024-04-11 "
+                             "Twist order deliberately included 479 such oligos. "
+                             "(default: exclude)")
     parser.add_argument("--exclude-genes", nargs="*", metavar="GENE",
                         help="Gene names to exclude (e.g. HO).")
     parser.add_argument("--max-bp-between-snvs", type=int, default=3, metavar="N",
@@ -342,11 +374,8 @@ def design_saturation_main() -> None:
         "Loaded %d allowed guides.", len(allowed_guides)
     )
 
-    # --- Reverse primers ---
-    rev_primers: list = []
-    with open(args.rev_primers) as fh:
-        for line in fh:
-            rev_primers.append(line.strip().lower())
+    # --- Reverse primers (reverse-complemented at read; see _load_rev_primers) ---
+    rev_primers: list = _load_rev_primers(args.rev_primers)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -375,3 +404,186 @@ def design_saturation_main() -> None:
             mutate_initiating_methionine=args.mutate_initiating_methionine,
         )
         print(f"Wrote {out_file}")
+
+
+def strain_background_main() -> None:
+    """``magestic-strain-background`` — build a strain's design reference from a VCF.
+
+    Packages the step that was previously project-specific
+    (``get_haplotype_blocks_from_vcf_with_coord_offset.py``): substitute one strain's
+    variants into a reference, emit the coordinate-offset table, remap the annotation,
+    and optionally project other strains' alleles onto the new coordinates so they can
+    be designed as edits.
+    """
+    from .strain_background import (
+        annotate_variants_with_features,
+        build_strain_reference,
+        load_strain_variants,
+        project_variants,
+        read_fasta,
+        remap_gff,
+        write_fasta,
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Build a de novo background-strain reference and coordinate map.")
+    parser.add_argument("--vcf", required=True, metavar="VCF",
+                        help="Multi-sample VCF of strain variants (may be .gz).")
+    parser.add_argument("--recipient", required=True, metavar="SAMPLE",
+                        help="Sample whose variants define the new reference (the strain "
+                             "that will be transformed).")
+    parser.add_argument("--genome", required=True, metavar="FASTA",
+                        help="Starting reference FASTA, e.g. S288C R64 .chrnames.fsa. "
+                             "Every contig is retained, including chrM and the 2-micron.")
+    parser.add_argument("--gff", metavar="GFF",
+                        help="Annotation to remap onto the new coordinates.")
+    parser.add_argument("--donors", nargs="*", default=[], metavar="SAMPLE",
+                        help="Other samples whose alleles should be projected onto the "
+                             "recipient reference as candidate edits. For an all-by-all "
+                             "swap, pass the other N-1 strains.")
+    parser.add_argument("--output-dir", required=True, metavar="DIR")
+    parser.add_argument("--min-qual", type=float, default=None, metavar="Q",
+                        help="Drop records with QUAL below Q. Default: no QUAL filter.")
+    parser.add_argument("--keep-filtered", action="store_true",
+                        help="Keep records whose FILTER is not PASS. Default: drop them.")
+    parser.add_argument("--allow-heterozygous", action="store_true",
+                        help="Apply the non-reference allele of a heterozygous call. Default: "
+                             "skip het calls, because writing one allele of a het site into a "
+                             "design reference asserts more than the data supports.")
+    parser.add_argument("--flank", type=int, default=2000, metavar="N",
+                        help="Distance from a gene within which a non-coding variant is "
+                             "labeled upstream:/downstream: rather than intergenic. "
+                             "Default 2000.")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    reference = read_fasta(args.genome)
+    print(f"Reference: {len(reference)} contigs, "
+          f"{sum(len(s) for s in reference.values()):,} bp")
+
+    recipient_vars, rejected = load_strain_variants(
+        args.vcf, args.recipient,
+        require_pass=not args.keep_filtered,
+        min_qual=args.min_qual,
+        require_homozygous=not args.allow_heterozygous,
+        chroms=set(reference),
+    )
+    print(f"{args.recipient}: {len(recipient_vars):,} variants loaded, "
+          f"{len(rejected):,} rejected at load")
+
+    strain_seqs, cmap, build_rejected = build_strain_reference(reference, recipient_vars)
+    all_rejected = rejected + build_rejected
+    print(f"{args.recipient}: {len(build_rejected):,} rejected during application")
+
+    ref_path = out_dir / f"{args.recipient}_reference.fasta"
+    write_fasta(strain_seqs, ref_path)
+    print(f"Wrote {ref_path}")
+
+    offsets_path = out_dir / f"{args.recipient}_coordinate_offsets.tsv"
+    with open(offsets_path, "w") as fh:
+        fh.write("CHROM\tREF_LENGTH\tSTRAIN_LENGTH\tNET_LENGTH_CHANGE\n")
+        for chrom in reference:
+            fh.write(f"{chrom}\t{len(reference[chrom])}\t{len(strain_seqs[chrom])}"
+                     f"\t{cmap.total_length_change(chrom)}\n")
+    print(f"Wrote {offsets_path}")
+
+    # Rejections are written, never just counted: a silent drop is the failure mode
+    # this whole module exists to prevent.
+    rej_path = out_dir / f"{args.recipient}_rejected_variants.tsv"
+    with open(rej_path, "w") as fh:
+        fh.write("CHROM\tPOS\tREF\tALT\tGENOTYPE\tREASON\n")
+        for r in all_rejected:
+            v = r.variant
+            fh.write(f"{v.chrom}\t{v.pos}\t{v.ref}\t{v.alt}\t{v.genotype}\t{r.reason}\n")
+    print(f"Wrote {rej_path} ({len(all_rejected):,} rows)")
+
+    if args.gff:
+        gff_out = out_dir / f"{args.recipient}_annotation.gff"
+        counts = remap_gff(args.gff, cmap, gff_out)
+        print(f"Wrote {gff_out} — {counts['written']:,} features, "
+              f"{counts['spans_indel']:,} span an indel, {counts['dropped']:,} dropped")
+        if counts["spans_indel"]:
+            print(f"  NOTE: {counts['spans_indel']:,} features change length in this strain. "
+                  f"CDS-relative indexing for those genes must use the coordinate map, "
+                  f"not the remapped endpoints.")
+
+    for donor in args.donors:
+        donor_vars, donor_rej = load_strain_variants(
+            args.vcf, donor,
+            require_pass=not args.keep_filtered,
+            min_qual=args.min_qual,
+            require_homozygous=not args.allow_heterozygous,
+            chroms=set(reference),
+        )
+        projected, proj_rej = project_variants(donor_vars, cmap, strain_seqs)
+        if args.gff:
+            projected = annotate_variants_with_features(
+                projected, out_dir / f"{args.recipient}_annotation.gff", flank=args.flank)
+
+        edits_path = out_dir / f"edits_{donor}_into_{args.recipient}.tsv"
+        with open(edits_path, "w") as fh:
+            fh.write("CHROM\tPOS\tREF\tALT\tSAMPLE\tORF\tNAME\n")
+            for v in projected:
+                fh.write(f"{v.chrom}\t{v.pos}\t{v.ref}\t{v.alt}\t{v.sample}"
+                         f"\t{v.orf}\t{v.name}\n")
+        n_noop = sum(1 for r in proj_rej if "already carries" in r.reason)
+        print(f"Wrote {edits_path} — {len(projected):,} edits "
+              f"({n_noop:,} dropped as already present in {args.recipient}, "
+              f"{len(donor_rej):,} rejected at load)")
+
+
+def verify_designs_main() -> None:
+    """``magestic-verify-designs`` — check a design table against a de novo assembly.
+
+    The recommended guard whenever a design reference was built by substituting variants
+    into a distant reference: a guide or homology arm built on locally wrong sequence
+    fails at the bench in a way that looks exactly like a biological negative.
+    """
+    import csv
+
+    from .strain_background import read_fasta, verify_designs_against_assembly
+
+    parser = argparse.ArgumentParser(
+        description="Verify designed guides and homology arms occur verbatim in an assembly.")
+    parser.add_argument("--designs", required=True, metavar="TSV")
+    parser.add_argument("--assembly", required=True, metavar="FASTA",
+                        help="De novo assembly for the strain the designs target.")
+    parser.add_argument("--passed-out", required=True, metavar="TSV")
+    parser.add_argument("--failed-out", required=True, metavar="TSV")
+    parser.add_argument("--guide-column", default="guide", metavar="COL")
+    parser.add_argument("--left-arm-column", default="left_homology_arm", metavar="COL")
+    parser.add_argument("--right-arm-column", default="right_homology_arm", metavar="COL")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    with open(args.designs) as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+    if not rows:
+        print(f"No rows in {args.designs}", file=sys.stderr)
+        raise SystemExit(1)
+
+    assembly = read_fasta(args.assembly)
+    passed, failed = verify_designs_against_assembly(
+        rows, assembly,
+        guide_key=args.guide_column,
+        left_arm_key=args.left_arm_column,
+        right_arm_key=args.right_arm_column,
+    )
+
+    for path, recs in ((args.passed_out, passed), (args.failed_out, failed)):
+        if not recs:
+            Path(path).write_text("")
+            continue
+        with open(path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(recs[0].keys()), delimiter="\t")
+            writer.writeheader()
+            writer.writerows(recs)
+
+    total = len(passed) + len(failed)
+    pct = 100.0 * len(passed) / total if total else 0.0
+    print(f"{len(passed):,} / {total:,} designs verified against the assembly ({pct:.1f}%)")
+    print(f"Wrote {args.passed_out} and {args.failed_out}")

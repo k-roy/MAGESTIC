@@ -158,6 +158,7 @@ def load_ORF_coordinates(gff_filename: str) -> dict:
     Mitochondrial chromosome (chrmt) entries are skipped.
     """
     ORF_dict: dict = {}
+    malformed_lines = 0
     with open(gff_filename, "r") as gff:
         for line in gff:
             if line.startswith("#"):
@@ -168,6 +169,11 @@ def load_ORF_coordinates(gff_filename: str) -> dict:
                 )
                 start, end = int(start), int(end)
             except ValueError:
+                # Most often a line of an embedded ##FASTA block, which does not
+                # start with '#'. Skipped AND counted -- the `continue` is what
+                # stops the previous feature being re-emitted, and the count is
+                # what stops a truncated annotation file passing unnoticed.
+                malformed_lines += 1
                 logger.debug("Skipping malformed GFF line: %s", line.rstrip())
                 continue
             if region == "CDS" and chrom != "chrmt":
@@ -175,6 +181,11 @@ def load_ORF_coordinates(gff_filename: str) -> dict:
                 if gene_name:
                     gene_name = gene_name[:-4]
                     ORF_dict.setdefault(gene_name, []).append((chrom, start, end, strand))
+    if malformed_lines:
+        logger.warning(
+            "load_ORF_coordinates: skipped %d malformed lines in %s",
+            malformed_lines, gff_filename,
+        )
     return ORF_dict
 
 
@@ -635,6 +646,12 @@ def remove_BspQI_sites_from_donor_in_final_oligo(
         total_sites, oligo_sequence,
     )
 
+    # Keyed by donor index so that the records returned name EXACTLY the positions
+    # at which the donor was changed. Previously only the edit that reached a count
+    # of 1 was recorded, so an accepted edit at index 0 that merely lowered the
+    # count (e.g. 3 -> 2) was kept in the donor but left out of junction_changes --
+    # the design info table then under-reported the donor edits.
+    changes_by_idx: dict = {}
     for donor_idx in (0, -1):
         current_donor_base = donor[donor_idx]
         for other_base in "ATCG":
@@ -646,15 +663,15 @@ def remove_BspQI_sites_from_donor_in_final_oligo(
             if new_sites < total_sites:
                 total_sites = new_sites
                 donor = new_donor
-            if total_sites == 1:
-                junction_change = (
+                changes_by_idx[donor_idx] = (
                     "mutating donor index", donor_idx,
                     "from", current_donor_base, "to", other_base,
                     "removed junction restriction site",
                 )
-                junction_changes.append(junction_change)
-                logger.info("Junction BspQI site resolved: %s", junction_change)
-                return new_donor, junction_changes
+            if total_sites == 1:
+                junction_changes = list(changes_by_idx.values())
+                logger.info("Junction BspQI site resolved: %s", junction_changes)
+                return donor, junction_changes
 
     logger.warning("Could not resolve all BspQI junction sites; donor will be skipped.")
     return None, []

@@ -659,13 +659,21 @@ def design_saturation_oligos(
     # -------------------------------------------------------------------
     # Load ORF structure
     # -------------------------------------------------------------------
-    orf_chrom, orf_strand, orf_exon_coords, orf_seq_str = get_ORF_seq_and_CDS_coords(
-        orf_name, orf_dict, genome_seq,
+    # NOTE (2026-09-30, NN 229): two fixes here.
+    #  (1) Argument order — the signature is (ORF, genome_seq, ORF_dict).  This call
+    #      previously passed (orf_name, orf_dict, genome_seq), so ORF_dict[ORF] was
+    #      evaluated against the genome dict and every gene raised KeyError(<ORF>);
+    #      magestic-design-saturation could not run at all.  The working reference
+    #      NRD1/generate_guide_donors_for_aa_substitutions_Cas9.py:206 has it right.
+    #  (2) get_ORF_seq_and_CDS_coords already returns a LIST of codon strings, so the
+    #      former re-chunking into triplets produced a list of 3-codon sublists of
+    #      one third the true length.
+    orf_chrom, orf_strand, orf_exon_coords, orf_seq = get_ORF_seq_and_CDS_coords(
+        orf_name, genome_seq, orf_dict,
     )
-    orf_seq = [orf_seq_str[i: i + 3] for i in range(0, len(orf_seq_str), 3)]
 
     orf_info, aa_num_to_exon = get_aa_num_to_codon_coords_aa(
-        orf_chrom, orf_strand, orf_exon_coords, orf_seq_str, codon_to_aa,
+        orf_chrom, orf_strand, orf_exon_coords, orf_seq, codon_to_aa,
     )
 
     # Build highest-frequency codon list for subpool assignment

@@ -229,10 +229,18 @@ def construct_donor(
 
     Returns
     -------
-    tuple or None
+    tuple
         ``(donor_shift, donor_start_coord, donor_end_coord, donor_strand,
         left_side_donor, right_side_donor, ref, alt, donor, genomic_target)``
-        on success, or ``(None, donor_string)`` if no valid donor exists.
+        on success.
+
+        On rejection, the 3-tuple ``(None, donor_string, reason)``.  Both homology
+        arms of an accepted donor are guaranteed to be at least
+        ``minimum_homology`` bp; a design that cannot meet that floor — an
+        insertion too long for the donor, or a window clipped at a contig end — is
+        rejected with a reason rather than emitted, because a donor without
+        homology arms cannot recombine.  The reason is written to the
+        untargetable-variants output by :func:`design_oligos_from_vcf`.
     """
     ref_length = len(ref)
     start_of_variant = variant_coord - 1  # convert to 0-based
@@ -240,6 +248,20 @@ def construct_donor(
 
     left_arm = (donor_length - len(alt)) // 2
     right_arm = donor_length - len(alt) - left_arm
+
+    # Enforce the homology floor BEFORE any slicing. An ALT as long as the donor
+    # drives both arms to 0, and a longer ALT drives them negative (which makes the
+    # genome slices come back empty), so the "donor" emitted is the bare insertion:
+    # no homology on either side, and it cannot recombine. Reject with a recorded
+    # reason rather than emit a library member that silently cannot work.
+    if left_arm < minimum_homology or right_arm < minimum_homology:
+        return (
+            None,
+            alt,
+            f"insertion_{len(alt)}nt_in_{donor_length}nt_donor_leaves_arms_"
+            f"{max(left_arm, 0)}/{max(right_arm, 0)}nt_below_minimum_homology_"
+            f"{minimum_homology}",
+        )
 
     # Handle variants near chromosome boundaries
     donor_shift = 0
@@ -267,7 +289,7 @@ def construct_donor(
         or (at_right_end and re_in_left)
         or (at_left_end and re_in_right)
     ):
-        return None, donor
+        return None, donor, "donor_with_restriction_site_not_allowing_shifting"
 
     elif re_in_left:
         donor_shift += 1
@@ -280,7 +302,7 @@ def construct_donor(
             left_side_donor = genome_seq[chrom][start_of_variant - left_arm + donor_shift: start_of_variant]
             right_side_donor = genome_seq[chrom][end_of_variant: end_of_variant + right_arm + donor_shift]
         if _restriction_site_in_seq(right_side_donor, restriction_sites) or _restriction_site_in_seq(left_side_donor, restriction_sites):
-            return None, donor
+            return None, donor, "donor_with_restriction_site_not_allowing_shifting"
 
     elif re_in_right:
         donor_shift -= 1
@@ -293,7 +315,19 @@ def construct_donor(
             left_side_donor = genome_seq[chrom][start_of_variant - left_arm + donor_shift: start_of_variant]
             right_side_donor = genome_seq[chrom][end_of_variant: end_of_variant + right_arm + donor_shift]
         if _restriction_site_in_seq(left_side_donor, restriction_sites) or _restriction_site_in_seq(right_side_donor, restriction_sites):
-            return None, donor
+            return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+
+    # The arms that were actually BUILT can still fall short of the floor: near a
+    # contig end, donor_shift is set from the chromosome bounds without reference to
+    # minimum_homology, and the slice is clipped. Check what was built, not just what
+    # was planned -- this is the guarantee that no emitted member has a short arm.
+    if len(left_side_donor) < minimum_homology or len(right_side_donor) < minimum_homology:
+        return (
+            None,
+            left_side_donor + alt + right_side_donor,
+            f"realized_arms_{len(left_side_donor)}/{len(right_side_donor)}nt_"
+            f"below_minimum_homology_{minimum_homology}",
+        )
 
     donor = left_side_donor + alt + right_side_donor
     donor_start_coord = start_of_variant - left_arm + donor_shift
@@ -562,7 +596,13 @@ def remove_bspqi_sites_from_donor(
     if n_sites == 1:
         return donor, junction_changes
 
-    # Try single-base substitution at each end of the donor
+    # Try single-base substitution at each end of the donor.
+    # Records are keyed by donor index so that what is returned names EXACTLY the
+    # positions at which the donor was changed. Previously only the edit that
+    # reached a count of 1 was recorded, so an accepted edit at index 0 that merely
+    # lowered the count (e.g. 3 -> 2) was kept in the donor but omitted from
+    # junction_changes, and the design info table under-reported the donor edits.
+    changes_by_idx: dict = {}
     for end_idx in (0, -1):
         orig_base = donor[end_idx]
         for new_base in "ATCG":
@@ -577,14 +617,79 @@ def remove_bspqi_sites_from_donor(
             if n_new < n_sites:
                 n_sites = n_new
                 donor = candidate
-            if n_sites == 1:
-                junction_changes.append(
-                    ("mutating donor index", end_idx, "from", orig_base, "to", new_base)
+                changes_by_idx[end_idx] = (
+                    "mutating donor index", end_idx, "from", orig_base, "to", new_base
                 )
+            if n_sites == 1:
+                junction_changes = list(changes_by_idx.values())
                 return donor, junction_changes
 
     logger.warning("Could not remove all extra RE sites from donor junction.")
     return None, None
+
+
+def reconcile_donor_changes(
+    designed_donor: str,
+    final_donor: str,
+    junction_changes: list,
+) -> list:
+    """
+    Return the record of donor edits, derived from the donor itself.
+
+    :func:`remove_bspqi_sites_from_donor` can only report the edits that that call
+    made, and it is not the only route by which an emitted donor comes to differ
+    from the designed one.  :func:`design_oligos_from_vcf` reuses one donor across
+    all the guides of a variant, so a donor repaired for the first guide is handed
+    on, already repaired, to the second and later guides.  Those calls correctly
+    report no edit of their own, and the inherited change would otherwise go
+    unrecorded: measured at **149 of 203** terminal donor changes across the three
+    EMBL ORDER pools (60,662 oligos), with the first-emitted guide of a variant
+    recorded and the rest not in 54 of 54 affected variant groups.
+
+    Deriving the record from the observed difference rather than from the edit
+    history makes it complete whichever code path made the change, and correct even
+    when a position is edited more than once (it reports designed -> final, not the
+    intermediate).  Positions that end up unchanged are not reported.
+
+    Parameters
+    ----------
+    designed_donor : str
+        The donor as built by :func:`construct_donor`, before any junction repair.
+    final_donor : str
+        The donor actually placed in the oligo.
+    junction_changes : list
+        The per-call record from :func:`remove_bspqi_sites_from_donor`.  Used only
+        as a fallback when the two donors differ in length.
+
+    Returns
+    -------
+    list
+        One record per changed base, in the same shape the info table already
+        carries: ``("mutating donor index", idx, "from", old, "to", new)`` with
+        ``idx`` of ``0`` for the first base and ``-1`` for the last.
+    """
+    if len(designed_donor) != len(final_donor):
+        # Junction repair only substitutes bases, never changes length. If the
+        # lengths differ, something other than a substitution happened and
+        # position-by-position attribution would be invented rather than observed.
+        logger.warning(
+            "reconcile_donor_changes: donor length changed %d -> %d; keeping the "
+            "per-call record unreconciled",
+            len(designed_donor), len(final_donor),
+        )
+        return junction_changes
+
+    n = len(final_donor)
+    records = []
+    for i in range(n):
+        if designed_donor[i].upper() == final_donor[i].upper():
+            continue
+        records.append((
+            "mutating donor index",
+            0 if i == 0 else (-1 if i == n - 1 else i),
+            "from", designed_donor[i], "to", final_donor[i],
+        ))
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +856,9 @@ def design_oligos_from_vcf(
     variants_processed = 0
     guide_donors_created: Set[Tuple[str, str]] = set()
     pam_counts: dict = {}
+    #: Donors rejected before any guide was considered, counted by reason class.
+    #: Every one is also written to the untargetable output with its full reason.
+    donor_rejections: dict = {}
 
     with (
         open(output_oligo_pool_file, "w") as pool_fh,
@@ -796,12 +904,23 @@ def design_oligos_from_vcf(
                     )
 
                     if donor_result[0] is None:
-                        _, raw_donor = donor_result
+                        # construct_donor carries its own rejection reason, so a
+                        # homology-floor rejection is recorded as such instead of
+                        # being mislabelled a restriction-site failure.
+                        _, raw_donor, rejection_reason = donor_result
+                        reason_class = (
+                            "below_minimum_homology"
+                            if "below_minimum_homology" in rejection_reason
+                            else "restriction_site_not_removable"
+                        )
+                        donor_rejections[reason_class] = (
+                            donor_rejections.get(reason_class, 0) + 1
+                        )
                         untargetable_fh.write(
                             "\t".join([
                                 samples, orf, name, chrom, str(variant_coord),
                                 ref, alt, desc, variant_type, raw_donor,
-                                "donor_with_restriction_site_not_allowing_shifting",
+                                rejection_reason,
                             ]) + "\n"
                         )
                         continue
@@ -811,6 +930,12 @@ def design_oligos_from_vcf(
                         donor_strand, left_side_donor, right_side_donor,
                         ref, alt, donor, genomic_target,
                     ) = donor_result
+                    # The donor as DESIGNED, kept so that what is recorded for each
+                    # emitted oligo is measured against the design rather than
+                    # against whatever the previous guide left behind. `donor` below
+                    # is reassigned by junction repair and persists across the guides
+                    # of this variant.
+                    designed_donor = donor
 
                     # Find nearby PAM sites
                     disruption_guide_info = find_pams_near_variants(
@@ -909,6 +1034,14 @@ def design_oligos_from_vcf(
                                         ]
                                         continue
 
+                                    # Record what differs from the DESIGNED donor,
+                                    # not just what this call changed: guides after
+                                    # the first inherit an already-repaired donor,
+                                    # so this call legitimately reports nothing.
+                                    junction_changes = reconcile_donor_changes(
+                                        designed_donor, new_donor, junction_changes,
+                                    )
+
                                     donor = new_donor
                                     guide_donor_key = (guide, donor)
                                     if guide_donor_key in guide_donors_created:
@@ -969,3 +1102,9 @@ def design_oligos_from_vcf(
         variants_processed, len(guide_donors_created),
     )
     logger.info("PAM usage counts: %s", sorted(pam_counts.items(), key=lambda x: -x[1])[:10])
+    if donor_rejections:
+        logger.warning(
+            "Donors rejected before guide selection: %s (all listed with their "
+            "reason in %s)",
+            dict(sorted(donor_rejections.items())), output_untargetable_file,
+        )
