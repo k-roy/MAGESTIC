@@ -1061,10 +1061,13 @@ def test_c19_integer_renamed_fastq_is_detected_as_a_rename():
 @pytest.mark.parametrize(
     "chrom,iv,vcoord,expect",
     [
-        # positional AND chromosome-qualified
-        ("chrIV", "516707_T_C_SNP", "516707", "chrIV:516707:516707_T_C_SNP"),
-        # a class label WITH a coordinate is still a position on a chromosome
-        ("chrVII", "PTC", "392020", "chrVII:392020:PTC"),
+        # positional AND chromosome-qualified. 🔴 D15 (Kevin, 2026-10-02): `variant_coord` is NOT
+        # in the id. Keying on it split one real edit -- one donor, ~5 redundant guides whose
+        # coords span up to 2,383 bp -- into several ids and manufactured false ambiguity.
+        ("chrIV", "516707_T_C_SNP", "516707", "chrIV:516707_T_C_SNP"),
+        # a class label is NOT rescued by a coordinate; it goes to the donor fallback. A
+        # coordinate does not turn `PTC` into an identity.
+        ("chrVII", "PTC", "392020", None),
         # positional id, no variant_coord -> still qualify with the chromosome
         ("chrII", "559546_G_A_SNP", None, "chrII:559546_G_A_SNP"),
         # a class label with NO coordinate names nothing positional -> MISSING
@@ -1096,25 +1099,35 @@ def test_d15_a_class_label_no_longer_collapses_thousands_of_edits(tmp_path):
     Two designs that install DIFFERENT edits but share the class label `PTC` must not be reported
     as one unambiguous variant when a donor matches both.
     """
-    shared_donor = ("ACGT" * 33)[:129]
+    # 🔴 FIXTURE CORRECTED 2026-10-02 (NN 253 §S2). This previously gave both designs the SAME
+    # donor, which does not occur: in the real harmonized table ZERO shared donors span two
+    # chromosomes. With a shared donor the two designs are genuinely indistinguishable from the
+    # read alone, so the old fixture was demanding that the matcher separate what the data cannot.
+    # Under Kevin's D15 ruling a class label is routed to the DONOR fallback, so the donor is what
+    # must distinguish them -- and in real data it does.
+    donor_a = ("ACGT" * 33)[:129]
+    donor_b = ("TTGCA" * 27)[:129]
+    assert donor_a != donor_b
     oligo_df = pd.DataFrame(
         {
             "oligo_name": ["ptc_gene_A", "ptc_gene_B"],
             "guide": [GUIDE_A, GUIDE_B],
-            "donor": [shared_donor, shared_donor],
+            "donor": [donor_a, donor_b],
             "chrom": ["chrIV", "chrVII"],
             "variant_coord": ["1000", "2000"],
             M.VARIANT_COLUMN: ["PTC", "PTC"],
         }
     )
     tables = M.build_lookup_tables(oligo_df)
-    res = M.match_sequence(_read(shared_donor), None, tables)
-    assert res.num_candidate_oligos == 2
-    assert res.num_candidate_variants == 2, (
-        "two different PTC designs collapsed to one variant, so an ambiguous match reported "
-        "is_unambiguous=True"
+    res_a = M.match_sequence(_read(donor_a), None, tables)
+    res_b = M.match_sequence(_read(donor_b), None, tables)
+    # the label `PTC` is shared, so if it were the identity these would be ONE variant
+    assert res_a.num_candidate_oligos == 1 and res_b.num_candidate_oligos == 1
+    assert res_a.oligo_name != res_b.oligo_name, (
+        "two different PTC designs collapsed to one oligo -- the class label was used as an "
+        "identity instead of falling back to the donor"
     )
-    assert res.is_unambiguous is False
+    assert res_a.is_unambiguous is True and res_b.is_unambiguous is True
 
 
 def test_d15_identical_edits_still_collapse_to_one_variant(tmp_path):
@@ -1611,24 +1624,34 @@ def test_nn249_recurrence_across_wells_is_flagged_and_counted():
     assert out["bc1_recurs_across_wells"].nunique() == 2
 
 
-@pytest.mark.parametrize("vc,expect", [
-    (706445, "chrII:706445:deletion"),
-    (706445.0, "chrII:706445:deletion"),      # pandas dtype inference gives a FLOAT
-    ("706445.0", "chrII:706445:deletion"),    # and the file itself stores it that way
-    ("706445", "chrII:706445:deletion"),
-    (" 706445 ", "chrII:706445:deletion"),
-    ("706445.5", "chrII:706445.5:deletion"),  # genuinely fractional: left alone, not truncated
-    ("chrII_extra", "chrII:chrII_extra:deletion"),   # non-numeric: passed through
+@pytest.mark.parametrize("vc", [
+    None, "", 706445, 706445.0,               # pandas dtype inference gives a FLOAT
+    "706445.0",                               # and the file itself stores it that way
+    "706445", " 706445 ",
+    706431, "706447.0",                       # a DIFFERENT coordinate for the same edit
+    "706445.5",                               # genuinely fractional
+    "chrII_extra",                            # non-numeric junk
 ])
-def test_d15_variant_coord_is_normalised_so_the_id_is_stable(vc, expect):
-    """🔴 Found by the REAL-DATA run: the harmonized table stores variant_coord as `706445.0`, so
-    the id came out `chrII:706445.0:deletion`. That is stable only while pandas infers the same
-    dtype; a column read as int in one run and float in another would silently produce TWO
-    different ids for one edit, which is a join that returns nothing. An integral coordinate is
-    normalised to an integer string; a genuinely fractional one is left alone rather than
-    truncated, because truncating would merge two distinct coordinates.
+def test_d15_the_id_is_stable_whatever_variant_coord_says(vc):
+    """🔴 D15, Kevin's ruling 2026-10-02: `variant_coord` is accepted and IGNORED.
+
+    This supersedes an earlier test that asserted the coordinate was *normalised into* the id
+    (`chrII:706445:deletion`). Normalising it only papered over the dtype problem -- the harmonized
+    table stores `706445.0`, so the id came out `chrII:706445.0:deletion`, stable only while pandas
+    inferred the same dtype. Removing the coordinate from the id solves that outright AND fixes the
+    larger defect it was hiding: one donor with ~5 redundant guides has coordinates up to 2,383 bp
+    apart, so coordinate-keying SPLIT one real edit into several ids and reported false ambiguity
+    (1,492 production rows, 708 `perfect_ambiguous`, downgraded on a single plate).
+
+    So every value below -- including two genuinely different coordinates -- must give ONE id.
     """
-    assert M.qualified_variant_id("chrII", "deletion", vc) == expect
+    assert M.qualified_variant_id("chrII", "706445_G_A_SNP", vc) == "chrII:706445_G_A_SNP"
+
+
+def test_d15_a_class_label_is_never_rescued_by_a_coordinate():
+    """The other half of the same ruling: a coordinate does not make a label an identity."""
+    for vc in (None, "", "392020", 392020.0):
+        assert M.qualified_variant_id("chrVII", "PTC", vc) is None
 
 
 def test_d13_pam_columns_are_requested_from_the_real_oligo_table():

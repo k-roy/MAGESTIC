@@ -450,11 +450,21 @@ def qualified_variant_id(chrom, individual_variants, variant_coord=None, *,
         designs into ONE variant, so a match among any of them looks unambiguous;
       * 18,468 blank.
 
-    `variant_coord` is populated on 22,434 of the 26,101 class-label rows, so most of them do have
-    a real position; `chrom` supplies the qualifier. A row that still cannot be made positional
-    returns None and the caller routes it to the donor-sequence fallback that
-    :func:`build_lookup_tables` already has for unannotated rows -- the class label is never kept
-    as an identity.
+    🔴 **CORRECTED 2026-10-02 (NN 253 §S2; Kevin's D15 ruling: "Remove the key").** An earlier
+    version of this function ALSO keyed on `variant_coord`, returning ``f"{c}:{vc}:{iv}"``. That was
+    backwards and it corrupted production output. All 327 groups it "corrected" have IDENTICAL
+    `individual_variants` and a **byte-identical donor**, with ``abs(variant_coord - PAM_coord) <= 3``
+    on 1,586/1,586 rows and `codon_variant_type = complete_CDS_deletion` on 1,568: one donor and
+    ~5 redundant guides whose coordinates span up to 2,383 bp. Keying on the coordinate therefore
+    SPLIT one real edit into several ids and manufactured false ambiguity -- **1,492 production rows,
+    708 of them `perfect_ambiguous`, downgraded on a single plate.** Removing the branch measured
+    327 -> 0 false splits and recoveries 104 -> 151, left the positional id space byte-identical
+    (108,880 rows / 24,241 distinct ids), kept `test_known_answer_roundtrip` green, and broke only
+    the 10 tests that asserted the removed branch.
+
+    `variant_coord` is still ACCEPTED and is now deliberately IGNORED, so existing callers keep
+    working. A class label is routed to the donor-sequence fallback that :func:`build_lookup_tables`
+    already has for unannotated rows; a coordinate never turns a label into an identity.
 
     THE TWO HALVES ARE DECOUPLED, deliberately:
 
@@ -470,18 +480,18 @@ def qualified_variant_id(chrom, individual_variants, variant_coord=None, *,
     iv = str(individual_variants).strip() if _nonblank(individual_variants) else None
     if iv is None:
         return None
-    vc = _norm_coord(variant_coord) if _nonblank(variant_coord) else None
     if not _nonblank(chrom):
         # No chromosome. A positional id is still an identity, just an unqualified one.
         if allow_unqualified and POSITIONAL_VARIANT_RE.match(iv):
             return iv
         return None
     c = str(chrom).strip()
-    if vc is not None:
-        return f"{c}:{vc}:{iv}"
     if POSITIONAL_VARIANT_RE.match(iv):
         return f"{c}:{iv}"
-    return None                          # a class label with no coordinate names nothing
+    # A class label names nothing. It goes to the donor-sequence fallback rather than being
+    # given a coordinate, because a coordinate does not make a label an identity -- see the
+    # D15 note above for why coordinate-keying was removed.
+    return None
 
 
 def build_lookup_tables(
