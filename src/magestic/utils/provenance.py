@@ -82,14 +82,14 @@ def file_record(path: str | os.PathLike, *, role: Optional[str] = None, md5: Opt
     return rec
 
 
-def _run(cmd: List[str], cwd: Optional[str] = None) -> Optional[str]:
+def _run(cmd: List[str], cwd: Optional[str] = None, *, strip: bool = True) -> Optional[str]:
     try:
         r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
     except Exception:
         return None
     if r.returncode != 0:
         return None
-    return r.stdout.strip()
+    return r.stdout.strip() if strip else r.stdout
 
 
 def git_state(repo_hint: Optional[str | os.PathLike] = None) -> Dict[str, Any]:
@@ -103,13 +103,24 @@ def git_state(repo_hint: Optional[str | os.PathLike] = None) -> Dict[str, Any]:
     top = _run(["git", "rev-parse", "--show-toplevel"], cwd=str(repo_hint))
     if not top:
         return {"repo": None, "commit": None, "dirty": None, "note": "not a git checkout"}
-    dirty_files = _run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=top) or ""
+    # NUL records preserve spaces/newlines and avoid Git's quoted-path syntax.
+    # In -z mode a rename has destination first, then a separate source record.
+    raw_status = _run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                      cwd=top, strip=False)
+    dirty_files = []
+    records = iter((raw_status or "").split("\0"))
+    for record in records:
+        if not record:
+            continue
+        dirty_files.append(record[3:])
+        if "R" in record[:2] or "C" in record[:2]:
+            next(records, None)
     return {
         "repo": top,
         "branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=top),
         "commit": _run(["git", "rev-parse", "HEAD"], cwd=top),
-        "dirty": bool(dirty_files),
-        "dirty_files": [ln[3:] for ln in dirty_files.splitlines()],
+        "dirty": bool(dirty_files) if raw_status is not None else None,
+        "dirty_files": dirty_files,
     }
 
 
@@ -230,13 +241,19 @@ class StepProvenance:
 
 
 def write_json_atomic(obj: Any, target: str | os.PathLike) -> None:
+    import tempfile
     target = str(target)
     os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
-    tmp = target + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(obj, fh, indent=1, default=str)
-        fh.write("\n")
-    os.replace(tmp, target)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(target)+'.', suffix='.tmp',
+                               dir=os.path.dirname(os.path.abspath(target)))
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            json.dump(obj, fh, indent=1, default=str)
+            fh.write("\n")
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def read_sidecar(path: str | os.PathLike) -> Dict[str, Any]:

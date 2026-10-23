@@ -1,72 +1,157 @@
-# Snakemake workflow for the REDI pipeline (per-plate fan-out).
-#
-# Invocation:
-#   snakemake --snakefile $(python -c "import magestic.pipelines.redi.snakemake as m; print(m.__path__[0])")/Snakefile \
-#             --config config=/path/to/screen.yaml
-#
-# The per-sample step_a expands across the configured sample_key. step_b–h
-# run once per screen on the combined outputs.
+"""REDI A-through-H workflow using the same registered inputs and stage CLIs.
 
-import yaml
+Invoke with --config config=/path/to/screen.yaml. The config loader resolves all
+paths. Samples come from dated sample/assay registration, not filename globs or
+an optional sample_name column. Stage I is a separate, unimplemented collection
+policy/robot-output path; this workflow does not claim to generate it.
+"""
 from pathlib import Path
+import re
+import sys
 
-CONFIG_PATH = Path(config["config"])
-with CONFIG_PATH.open() as fh:
-    CFG = yaml.safe_load(fh)
+import magestic.pipelines.redi as redi
+from magestic.pipelines.redi.core.config import load_config
+from magestic.pipelines.redi.core.io import source_digest, source_files
+from magestic.pipelines.redi.pipeline.run_pipeline import registered_sample_names
+from magestic.pipelines.redi.readers.keyfiles import _read_key
+from magestic.utils.provenance import md5_file
 
-PATHS = CFG["paths"]
-KEYFILES = Path(PATHS["keyfiles"])
-COUNTS = Path(PATHS["processed"]) / "read_pair_counts_tables"
-COMBINED = Path(PATHS["processed"]) / "combined_data_tables"
+shell.prefix('set -euo pipefail; ')
+if 'config' not in config:
+    raise ValueError('pass --config config=/path/to/screen.yaml')
+CONFIG_PATH = Path(config['config']).expanduser().resolve()
+CFG = load_config(CONFIG_PATH)
+PYTHON = sys.executable
+KEYFILES, COUNTS, COMBINED, PLOTS = (CFG.paths.keyfiles, CFG.paths.counts_tables,
+                                   CFG.paths.combined_data, CFG.paths.plots)
+SAMPLES = registered_sample_names(CFG)
+if not CFG.array_pairs:
+    raise ValueError('full REDI workflow requires explicit array pairs')
+if CFG.bc1_reference_table is None or CFG.wgs_outcome_table is None:
+    raise ValueError('full REDI workflow requires design annotation and registered WGS observation tables')
+PAIRS = [(pair.name_a,pair.name_b) for pair in CFG.array_pairs]
+TAGS = [a+'_'+b for a,b in PAIRS]
+if len(set(TAGS)) != len(TAGS):
+    raise ValueError('array-pair output filename collision')
+SOURCES = [str(path) for path in source_files()]
+COMMON = [str(CONFIG_PATH), *SOURCES]
+IDENTITY = md5_file(CONFIG_PATH)+':'+source_digest()
+REGISTRATION = [str(KEYFILES/name) for name in (CFG.sample_key,CFG.gdna_plate_key,CFG.redi_plate_barcode_key)]
+BARCODE_KEYS = [str(Path(name) if Path(name).is_absolute() else KEYFILES/name) for name in CFG.redi_bc_keys]
+WGS_KEYS = [str(KEYFILES/'WGS_plate_key.tsv')]
+if (KEYFILES/'384_PIXL_rearray_format.tsv').is_file():
+    WGS_KEYS.append(str(KEYFILES/'384_PIXL_rearray_format.tsv'))
+if CFG.wgs_sample_namespace is not None:WGS_KEYS.append(str(CFG.wgs_sample_namespace))
+GEOMETRY = [str(KEYFILES/'1536_PIXL_rearray_format.tsv')] if (KEYFILES/'1536_PIXL_rearray_format.tsv').is_file() else []
 
-# Expand sample list from sample_key.tsv
-import pandas as pd
-sample_key = pd.read_csv(KEYFILES / CFG.get("sample_key", "sample_key.tsv"), sep="\t")
-SAMPLES = sample_key["sample_name"].tolist() if "sample_name" in sample_key.columns else []
 
+def attestation(path):
+    return str(path)+'.provenance.json'
+
+
+B = KEYFILES/'combined_key.tsv'
+C = COMBINED/'combined_REDI_bc_MAGESTIC_bc_merged_df.tsv'
+D = COMBINED/'top_REDI_bc_MAGESTIC_bc1_df.tsv'
+E = COMBINED/'annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv'
+F = [COMBINED/(tag+'_merged_REDI_df.tsv') for tag in TAGS]
+G = COMBINED/'WGS_bc1_call_outer_merge_with_REDI_df_and_plate_key.tsv'
+PLOT_TAGS = [tag+'_' for tag in TAGS] if len(TAGS)>1 else ['']
+H = [PLOTS/(tag+'bc1_registered_position_counts.tsv') for tag in PLOT_TAGS]
+H_FILES = [PLOTS/(tag+suffix) for tag in PLOT_TAGS
+           for suffix in ('bc1_clones_distribution.png','filtered_registered_positions.tsv')]
+if 'sublibrary_ID' in _read_key(CFG.bc1_reference_table):
+    H_FILES += [PLOTS/(tag+'sublibrary_ID_counts_barchart.png') for tag in PLOT_TAGS]
+A = [COUNTS/(sample+'_R1_R2_counts.tsv') for sample in SAMPLES]
+PRIMARY_OUTPUTS = [str(path) for path in [*A,B,C,D,E,*F,G,*H]]
+VERIFY = 'import sys; from magestic.pipelines.redi.pipeline.run_pipeline import verify_completed_artifacts; verify_completed_artifacts(sys.argv[1:])'
+TRIM = 'from magestic.pipelines.redi._cli import trim_main; raise SystemExit(trim_main())'
+
+wildcard_constraints:
+    sample='|'.join(re.escape(sample) for sample in SAMPLES),
+
+localrules: all
 
 rule all:
     input:
-        COMBINED / "annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv",
-
+        [str(G),attestation(G),*[str(path) for path in H],
+         *[attestation(path) for path in H],*[str(path) for path in H_FILES]],
+    shell:
+        '{PYTHON:q} -c {VERIFY:q} {PRIMARY_OUTPUTS:q}'
 
 rule step_a_one_sample:
+    input:
+        common=COMMON,
+        registration=REGISTRATION,
+        r1=lambda wildcards: str(CFG.paths.raw_fastq/(wildcards.sample+'_R1.fastq.gz')),
+        r2=lambda wildcards: str(CFG.paths.raw_fastq/(wildcards.sample+'_R2.fastq.gz')),
     output:
-        COUNTS / "{sample}_R1_R2_counts.tsv",
+        counts=str(COUNTS/'{sample}_R1_R2_counts.tsv'),
+        proof=str(COUNTS/'{sample}_R1_R2_counts.tsv.provenance.json'),
+        trim1=str(CFG.paths.trimmed_fastq/'{sample}_trimmed_R1.fastq'),
+        trim2=str(CFG.paths.trimmed_fastq/'{sample}_trimmed_R2.fastq'),
+        merged=str(CFG.paths.merged_fastq/'{sample}_trimmed_merged.fastq'),
+        collapsed=str(CFG.paths.collapsed_fastq/'{sample}_collapsed.fastq'),
+    params: identity=IDENTITY
+    threads: 1
+    resources: mem_mb=1024
     shell:
-        "magestic-redi-trim --config {CONFIG_PATH} --sample {wildcards.sample}"
-
+        '{PYTHON:q} -c {TRIM:q} --config {CONFIG_PATH:q} --sample {wildcards.sample:q}'
 
 rule step_b_combine_keys:
-    output:
-        KEYFILES / "combined_key.tsv",
+    input: common=COMMON, registration=REGISTRATION
+    output: str(B),attestation(B)
+    params: identity=IDENTITY
     shell:
-        "magestic-redi-combine-keys --config {CONFIG_PATH}"
-
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from b --to b'
 
 rule step_c_extract_bc:
     input:
-        expand(str(COUNTS / "{sample}_R1_R2_counts.tsv"), sample=SAMPLES),
-        KEYFILES / "combined_key.tsv",
+        common=COMMON,
+        counts=[str(path) for path in A],
+        count_proofs=[attestation(path) for path in A],
+        key=str(B),key_proof=attestation(B),barcode_keys=BARCODE_KEYS,
     output:
-        COMBINED / "combined_REDI_bc_MAGESTIC_bc_merged_df.tsv",
+        str(C),attestation(C),str(COMBINED/'MAGESTIC_bc_only_grouped_df.tsv'),
+        str(COMBINED/'unassigned_REDI_read_counts.tsv'),
+    params: identity=IDENTITY
     shell:
-        "magestic-redi-extract-bc --config {CONFIG_PATH}"
-
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from c --to c'
 
 rule step_d_purity:
-    input:
-        COMBINED / "combined_REDI_bc_MAGESTIC_bc_merged_df.tsv",
-    output:
-        COMBINED / "top_REDI_bc_MAGESTIC_bc1_df.tsv",
+    input: common=COMMON,table=str(C),proof=attestation(C)
+    output: str(D),attestation(D),str(COMBINED/'top_REDI_bc_MAGESTIC_bc1_df_inspection.tsv')
+    params: identity=IDENTITY
     shell:
-        "magestic-redi-purity --config {CONFIG_PATH}"
-
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from d --to d'
 
 rule step_e_annotate:
-    input:
-        COMBINED / "top_REDI_bc_MAGESTIC_bc1_df.tsv",
-    output:
-        COMBINED / "annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv",
+    input: common=COMMON,table=str(D),proof=attestation(D),reference=str(CFG.bc1_reference_table)
+    output: str(E),attestation(E),str(COMBINED/'annotated_top_REDI_bc_MAGESTIC_bc1_df_head_100.tsv')
+    params: identity=IDENTITY
     shell:
-        "magestic-redi-annotate --config {CONFIG_PATH}"
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from e --to e'
+
+rule step_f_cross_array:
+    input: common=COMMON,table=str(E),proof=attestation(E),geometry=GEOMETRY
+    output: [str(path) for path in F]+[attestation(path) for path in F]
+    params: identity=IDENTITY
+    shell:
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from f --to f'
+
+rule step_g_wgs_check:
+    input:
+        common=COMMON,tables=[str(path) for path in F],proofs=[attestation(path) for path in F],
+        registration=WGS_KEYS,calls=str(CFG.wgs_outcome_table),
+    output: str(G),attestation(G)
+    params: identity=IDENTITY
+    shell:
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from g --to g'
+
+rule step_h_plot:
+    input:
+        common=COMMON,tables=[str(path) for path in F],proofs=[attestation(path) for path in F],
+        reference=str(CFG.bc1_reference_table),
+    output: [str(path) for path in H]+[attestation(path) for path in H]+[str(path) for path in H_FILES]
+    params: identity=IDENTITY
+    shell:
+        '{PYTHON:q} -m magestic.pipelines.redi.pipeline.run_pipeline --config {CONFIG_PATH:q} --from h --to h'

@@ -1,78 +1,75 @@
-# REDI pipeline reference (step_a → step_i)
+# REDI pipeline reference
 
-This document mirrors the per-step prose from the legacy scripts at
-`/oak/.../projects/REDI/20250312_NNS_complex_saturation_mutagenesis/scripts/`,
-formalized for the `magestic.pipelines.redi` engine.
+The reusable engine is `src/magestic/pipelines/redi/`. The Python/umbrella CLI runs B through H; A processes one named FASTQ pair. This document describes the repaired engine contract. A completed test or run needs its numerical output and provenance, not just exit status. Validation results belong in the audit ledger; documentation is not an accuracy result.
 
-## Step A — Trim, merge, collapse, counts table
+## Configuration and completion
 
-Per-sample:
+Configuration binds `project_root` to the YAML directory and other data paths to that root. Key filenames are relative to `paths.keyfiles`. Unknown/duplicate settings and invalid values fail before assay processing. Explicit assay selections and dated physical registrations are inputs, not deductions from barcode agreement.
 
-1. **bbduk**: TruSeq adapter trim + quality trim. Args: `literal=AGATCGGAAGAGCGTCGTGTAGGGAAAGA ftl=20 ktrim=r k=23 mink=11 hdist=1 tpe tbo`.
-2. **bbmerge**: merge overlapping paired reads.
-3. **collapse_identical_merged_reads_min_counts.py**: dedupe + rename header to count.
-4. **collapsed_reads_to_counts_table.py**: emit `<sample>_R1_R2_counts.tsv` with columns `[R1_seq, R2_seq, counts, sample_name]`.
+Stages publish through the REDI artifact writer. It records input hashes before reading, checks inputs and source again before publication, atomically replaces individual outputs, and writes one completion sidecar last. A set of files is not a filesystem transaction: consumers must use the primary output's `.provenance.json` as completion evidence. That sidecar includes hashes for every output, including Stage H PNGs. Stage A can reuse only its complete matching five-output attestation when explicitly called with `overwrite=False`; other stage invocations recompute their outputs.
 
-## Step B — Combine keyfiles
+## A — Trim, merge and count
 
-Merges `sample_key.tsv` ← `gDNA_plate_key.tsv` ← `REDI_plate_barcode_key.tsv` into one `combined_key.tsv`. Critical detail: `REDI_plate_barcode` is coerced via `pd.to_numeric(errors='coerce')` on both sides to avoid join failures from non-integer placeholder strings.
+`magestic-redi-trim --config screen.yaml --sample <dated-prefix>` validates paired FASTQ structure, mate identity and pair counts. It uses the installed BBTools Java implementation with explicit heap/thread limits: BBDuk adapter/end trimming and BBMerge overlap merging. The default BBDuk settings include `ftl=20`, `ktrim=r`, `k=23`, `mink=11`, `hdist=1`, `tpe`, `tbo`, and the TruSeq adapter. These are not an additional base-quality threshold.
 
-## Step C — bc1 / REDI_bc extraction
+The native disk-backed collapse counts full merged consensus sequences. Output `R1_seq` is that merged consensus and `R2_seq` its reverse complement, not two independent original reads. Unmerged pairs are counted in provenance but cannot enter assignment. The count table is `<sample>_R1_R2_counts.tsv`; the sidecar distinguishes raw pairs, trimmed pairs, merged reads, retained reads and retained unique sequences. A header-only result can represent an empty input and must be interpreted with those denominators.
 
-For each row of the concatenated counts tables, finds bc1 anchored by the 12-bp prefix `CAGGTCATGCTC`; falls back to a fixed 16-bp offset slice when the prefix isn't found (KR1965/KR1967 fixed-position case). Per-row dispatch based on `inner_primers`:
+## B — Register samples and assays
 
-- `KR1965` → bc1 from **R2**, REDI_bc from **R1**
-- `KR1967` → bc1 from **R1**, REDI_bc from **R2**
+`magestic-redi-combine-keys` joins the declared sample, gDNA assay and REDI physical-plate keys into `combined_key.tsv`. Literal identifiers are retained. Per-well primer declarations restrict assay expansion where present; the resulting outer-primer/sample identity must be unique. Unregistered or missing physical identifiers fail. Only an explicit `empty` sample is a declared empty control, and a contradictory registration status fails. The engine does not turn malformed plate IDs into a common missing value to make a join succeed.
 
-The REDI_bc prefix and length come from the per-row `MAT_a_barcode_prefix` / `MAT_a_barcode_length` columns of the combined key. Output:
+## C — Extract bc1 and REDI barcode
 
-- `combined_REDI_bc_MAGESTIC_bc_merged_df.tsv` — grouped `(bc1, REDI_bc, sample_name) → counts` plus all metadata columns from `combined_key`.
-- `MAGESTIC_bc_only_grouped_df.tsv` — `(bc1, sample_name) → counts` for samples whose `purpose == "detect all bc1 on the plate"`.
+`magestic-redi-extract-bc` selects the configured bc1 read side from the declared inner-primer rules and searches configured sequence anchors. Both anchor orientation and the configured barcode-length contract matter. The default current cassette is `CAGGTCATGCTC–bc1–CCCTAGGATACG`; older cassettes need their documented per-screen anchors. A positional fallback is disabled by default and, if explicitly enabled, cannot establish cassette identity.
 
-## Step D — Colony purity
+REDI barcoder prefix/length and library come from registered assay metadata. Barcode-to-position keys are validated for unique library/barcode assignment, coordinate shape and compatible prefix lengths. Measured/key columns cannot be overwritten by sample metadata. Explicit sequencing dates must agree with the configuration. Stage C requires all expected count tables unless partial processing is explicitly enabled; missing inputs remain in the recorded denominator.
 
-For each `(sample_name, REDI_bc)` group:
+Outputs are the grouped registered `(bc1, REDI_bc, sample_name)` counts and the separately labelled bc1-only observations. Counts and extraction/assignment categories reconcile to input read counts. Multiple candidate designs do not establish a unique edit.
 
-1. Identify the dominant bc1 (`top_bc1`) by sorting `counts` descending.
-2. Compute Levenshtein distance from every observed bc1 to `top_bc1`. Drop rows where distance is 1 or 2 (sequencing-error daughters of the dominant bc1).
-3. Take the top 4 bc1's; sum their counts → `total_counts`.
-4. `colony_purity = top_bc1.counts / total_counts`.
+## D — Observed barcode read fractions
 
-Output: `top_REDI_bc_MAGESTIC_bc1_df.tsv` (one row per `(sample_name, REDI_bc)`).
+`magestic-redi-purity` produces one observation per sample/barcoder and retains the full observed bc1 count distribution. Its primary fraction is the largest observed barcode count divided by **all observed barcode counts** in that observation. It is a barcode read fraction, not a cell-purity estimate. Close sequence neighbors are not automatically sequencing errors, and truncation to the top four does not define the primary denominator.
 
-## Step E — Annotate with bc1 reference
+Legacy distance-filtered/top-N quantities are separate diagnostics. Tied winners remain ambiguous. An observed off-length winner can remain visible in Stage D; retaining it as evidence does not make it callable in F/G. `all_bc1_counts_json` allows later pooling to reconstruct and validate the full distribution.
 
-Left-merge against the bc1-donor-bc0 reference table (output of `magestic.pipelines.bc1_donor_bc0`). Overlapping column names other than `bc1`/`counts` are prefixed `REDI_bc_bc1_` on the REDI side; `counts` → `REDI_bc_bc1_counts`. `amino_acid_position` is coerced to int with NaN → -1 sentinel.
+## E — Candidate design annotation
 
-Output: `annotated_top_REDI_bc_MAGESTIC_bc1_df.tsv`.
+`magestic-redi-annotate` requires an explicit bc1 reference table and attaches candidate design information without multiplying measured observation rows. Multiple reference matches are retained as ambiguity with candidate records; they cannot silently duplicate counts or select one design. Design metadata cannot overwrite measured quantities, physical keys or physical-validation flags. A reference match establishes a candidate relationship, not successful editing or independent clone identity.
 
-## Step F — Cross-array agreement
+## F — Compare explicitly selected assays
 
-For each configured array pair (e.g., `SHA345` vs `yT182`):
+`magestic-redi-cross-array` processes each configured array pair. Its selectors must distinguish the observations belonging to A and B; the same observation cannot validate itself. Physical joins use the explicit array barcode, 384-well color, row and column. Optional geometry metadata must be uniquely registered.
 
-1. Filter to `REDI_bc_bc1_counts >= min_counts` (default 10).
-2. Build `plate_and_position` key from `MAT_alpha_array_1536_barcode_<plate>_<row>_<col>`.
-3. Group by plate-and-position, sum read counts, deduplicate by position keeping the top-counts row.
-4. Outer-merge A and B on plate-and-position; emit `<A>_bc1_and_<B>_bc1_both_present` and `bc1_agreement` flags.
+When pooling observations at a position, the engine combines their complete barcode distributions first and then applies support/callability thresholds. Multiple top-only summaries cannot reconstruct a pooled distribution. Missing, tied, low-support and invalid-length winners remain uncalled. Arrays are outer-joined over physical positions, and agreement is nullable outside the jointly callable denominator. Repeated quadrants or matching barcodes do not establish independent biological replicates.
 
-Optional join with `1536_PIXL_rearray_format.tsv` adds 384/96-well coordinates.
+## G — Registered WGS comparison
 
-Output: `<A>_<B>_merged_REDI_df.tsv`.
+`magestic-redi-wgs-check` compares native WGS and REDI observations at independently registered physical positions. WGS is another observation; an expected identity requires independent dated physical/transfer evidence. Barcode-set membership is not a well-level expectation.
 
-## Step G — WGS comparison (type-(i) ground truth)
+The shared WGS call reader accepts the supported native/legacy schemas without padding or truncating observed barcodes. Explicit sample namespace translations may be supplied. A WGS sample must map once to physical coordinates; unregistered samples and ambiguous keys fail. Missing and invalid calls remain visible but unassessed. Every configured array pair is reported, with callable and agreement counts separately recorded. A conflict between valid A/B identities cannot be resolved by automatically favoring B.
 
-Loads Shengdi's WGS outcome table, truncates/right-pads `bc1_from_wgs` to 20 bp with `C` fill (legacy convention), merges with step_f output on plate-and-position. Output:
+Legacy plate-level WGS registration requires an explicit `sample_number` in the sequencing-index geometry. The NNS schema uses its declared `plate_96` key; another supported legacy schema uses `plate_384`. Neither geometry row order nor agreement with an observed bc1 can fill a missing sample-index-to-well map.
 
-- `wgs_and_<A>_bc1_agreement` — per-clone WGS-vs-array-A agreement
-- `wgs_and_<B>_bc1_agreement`
-- `wgs_and_<A>_<B>_agreement` — agreement when both arrays + WGS all match
-- `REDI_called_bc1` — array-B bc1 fallback to array-A
-- Output file: `WGS_bc1_call_outer_merge_with_REDI_df_and_plate_key.tsv`
+## H — Plot registered positions
 
-## Step H — Plots + filtering
+The `magestic-redi-rearray` compatibility command currently invokes plotting. It does not generate a rearray robot worklist. Stage H handles every configured pair and emits numerical `bc1_registered_position_counts.tsv`, `filtered_registered_positions.tsv`, and PNGs. Multiple pairs receive distinct filename prefixes. The legacy PNG name `bc1_clones_distribution.png` is retained, but its quantity is **registered positions per barcode**, not independent clones.
 
-High-quality clone filter (legacy): `(A_counts >= 20 AND A_purity >= 0.95) OR (B_counts >= 20 AND B_purity >= 0.95)`, plus `num_independent_replicates > 1`. Plots: `bc1_clones_distribution.png`, `sublibrary_ID_counts_barchart.png`.
+Defaults are at least20 supporting counts and an observed barcode read fraction of0.95 in a supporting assay. `plotting.min_replicates=0` explicitly means **no independent-replicate gate**. A positive requested gate requires an independently supplied `num_independent_replicates`; absence never means it passed. The engine does not infer independence from quadrant copies or repeated barcodes. Conflicting valid array identities remain unassessed. Candidate reference annotation cannot multiply plotted physical positions.
 
-## Step I — Clone selection (generic primitives only)
+The completion sidecar belongs to the primary numerical table and records the numerical/PNG output hashes, filters, registered/callable/conflicting/passing position counts and number of distinct passing barcodes. Plot test doubles check numerical data only; visual rendering requires separate inspection.
 
-Engine provides `select_top_n_per_group` (generic). Per-screen selection logic (NRD1/NAB3/SEN1/auxin/etc) lives in `REDI/screens/<screen>/driver.py`.
+## I — Selection primitive and remaining robot-output gap
+
+`pipeline/step_i_select.py` exposes `select_top_n_per_group`: it selects up to an explicit positive N per group using declared sort columns, rejects missing group identities and invalid parameters, and preserves input order for exact sorting ties. This is a generic ranking primitive. It does not establish clone eligibility, resolve candidate edits, register physical transfer lineage, assign robot targets or write a robot worklist.
+
+No screen-driver implementation is bundled at the previously advertised `REDI/screens/<screen>/driver.py` path in the audited checkout. Bounded searches were made under both `REDI/` and `src/magestic/` for `driver.py`, `screens/`, robot and rearray implementations. The engine source describes I as “generic clone-selection helpers”; the CLI executes `run_step_h(config)`. The full collection-specific selection/robot-output path therefore remains an implementation gap, not a completed Stage I run.
+
+A concrete implementation needs a declared collection policy (eligibility, per-edit/per-gene caps, tie rules and how ambiguity is handled), explicit source coordinates/lineage, and the robot's target/worklist schema. Estimated work is1–2 engineering days once those artifacts are supplied, including a small independently declared source-to-target fixture and a generated worklist review. This estimate does not count laboratory validation. Generic helper checks cannot substitute for that acceptance test.
+
+## Plate snapshots and workflow status
+
+The PlateDB reader consumes snapshots, never edits the shared workbook, accepts archived primary-ID header variants, rejects duplicate/conflicting IDs and follows only an explicit single-parent column. Cycles, nonintegral IDs, unresolved parent records and depth truncation fail. Branched mating/consolidation lineage and side-by-side spreadsheet tables require explicit role-qualified registration; row adjacency is not a transfer.
+
+The repaired exporter maps both Misc eras explicitly, validates required/unique sheet mappings and primary identities before publication, and attests its TSV/parquet output set. If the new workbook omits an optional stage whose parquet remains in an old output directory, export requires a new destination rather than mixing eras. Legacy snapshot reads do not yet enforce modern completion attestations; that consumer boundary remains under review.
+
+The repaired Snakemake source schedules A through H using the shared typed config and dated registration, declares stage companions, quotes paths, and invokes the same stage implementations as the CLI. Its final target verifies source/input/output content attestations. A missing companion is a scheduling dependency; corrupted/stale attestations fail completion and require an affected-stage rebuild. The declared two-assay fixture verifies numerical CLI/Snakemake parity, unchanged restart behavior, changed-WGS recomputation and a deleted plot companion. Source corrections and prepared assertions alone are not a passing result; consult the audit run ledger for executed outcomes.

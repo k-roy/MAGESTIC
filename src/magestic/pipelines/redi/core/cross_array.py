@@ -1,114 +1,141 @@
+"""Compare independently selected arrays at explicit physical positions.
+
+Pool complete barcode distributions before applying minimum support. Top-only
+legacy observations can be compared singly, but cannot reconstruct a pooled
+barcode distribution. Missing/tied/low-support calls remain unassessed.
 """
-magestic.pipelines.redi.core.cross_array — agreement between two REDI arrays.
-
-Generalizes legacy `step_f_check_agreement_between_SHA435_and_yT182_REDI.py`,
-which was hard-coded to "SHA345 REDI" vs "everything else". Engine version
-takes a pair of selector predicates and returns a merged comparison table
-with a `bc1_agreement` boolean and per-array purity/count columns prefixed by
-array name.
-
-Output columns include `<a>_bc1`, `<b>_bc1`, `<a>_colony_purity`,
-`<b>_colony_purity`, `<a>_REDI_bc_bc1_counts`, `<b>_REDI_bc_bc1_counts`,
-`<a>_REDI_bc_bc1_total_counts`, `<b>_REDI_bc_bc1_total_counts`,
-`<a>_bc1_and_<b>_bc1_both_present`, and `bc1_agreement`.
-"""
-
 from __future__ import annotations
-
+from collections import Counter
+import json
 import pandas as pd
+from .identity import POSITION_COLUMNS, keyed_frame, valid_barcode, count_integer
 
-
-PLATE_GROUP_COLS = [
-    "bc1",
-    "plate_and_position",
-    "MAT_alpha_array_1536_barcode",
-    "REDI_plate_color_384",
-    "REDI_row_384",
-    "REDI_col_384",
-]
-
-PLATE_AGG = {
-    "REDI_bc_bc1_counts": "sum",
-    "REDI_bc_bc1_total_counts": "sum",
-}
+PLATE_GROUP_COLS=['bc1','plate_and_position',*POSITION_COLUMNS]
+PLATE_AGG={'REDI_bc_bc1_counts':'sum','REDI_bc_bc1_total_counts':'sum'}
 
 
 def _attach_plate_and_position(df: pd.DataFrame) -> pd.DataFrame:
-    """Build the `plate_and_position` composite key used for cross-array joins."""
-    df = df[
-        df["MAT_alpha_array_1536_barcode"].notnull()
-        & df["REDI_plate_color_384"].notnull()
-    ].copy()
-    df["plate_and_position"] = (
-        df["MAT_alpha_array_1536_barcode"]
-        .astype(str)
-        .str.replace(r"\.0$", "", regex=True)
-        + "_"
-        + df["REDI_plate_color_384"]
-        + "_"
-        + df["REDI_row_384"].astype(str).str.replace(r"\.0$", "", regex=True)
-        + "_"
-        + df["REDI_col_384"].astype(str).str.replace(r"\.0$", "", regex=True)
-    )
-    return df
+    out=keyed_frame(df,POSITION_COLUMNS,label='REDI physical positions',unique=False)
+    out['plate_and_position']=out[list(POSITION_COLUMNS)].agg('_'.join,axis=1)
+    return out
 
 
-def _collapse_array(df: pd.DataFrame, array_name: str) -> pd.DataFrame:
-    """Group, aggregate, dedupe-by-position, and prefix columns for one array."""
-    g = df.groupby(PLATE_GROUP_COLS, as_index=False).agg(PLATE_AGG)
-    g = g.sort_values(by="REDI_bc_bc1_counts", ascending=False).drop_duplicates(
-        subset=["plate_and_position"]
-    )
-    g = g[g["REDI_bc_bc1_counts"] > 0].copy()
-    g["colony_purity"] = (
-        g["REDI_bc_bc1_counts"] / g["REDI_bc_bc1_total_counts"]
-    )
-    return g.rename(
-        columns={
-            "bc1": f"{array_name}_bc1",
-            "REDI_bc_bc1_counts": f"{array_name}_REDI_bc_bc1_counts",
-            "REDI_bc_bc1_total_counts": f"{array_name}_REDI_bc_bc1_total_counts",
-            "colony_purity": f"{array_name}_colony_purity",
-        }
-    )
+def _integer(value, label):
+    return count_integer(value,label)
 
 
-def compare_arrays(
-    annotated_top_bc1_df: pd.DataFrame,
-    array_a_mask: pd.Series,
-    array_b_mask: pd.Series,
-    array_a_name: str,
-    array_b_name: str,
-    min_counts: int = 10,
-) -> pd.DataFrame:
-    """Compare two arrays' REDI clone calls on shared plate-and-position keys.
+def _unique_object(pairs):
+    values={}
+    for key,value in pairs:
+        if key in values:raise ValueError('duplicate barcode')
+        values[key]=value
+    return values
 
-    Parameters
-    ----------
-    annotated_top_bc1_df : DataFrame with the columns from
-        `annotated_top_REDI_bc_MAGESTIC_bc1_df` (output of step_e).
-    array_a_mask, array_b_mask : boolean Series selecting array A / B rows.
-        Computed by the caller from `purpose` / validated flags / etc., so the
-        engine doesn't hard-code SHA345 semantics.
-    array_a_name, array_b_name : column-prefix names (e.g., "SHA345", "yT182").
-    min_counts : drop rows with `REDI_bc_bc1_counts` below this floor
-        (legacy step_f: 10).
 
-    Returns
-    -------
-    Outer-merged dataframe with one row per `plate_and_position`, plus
-    `bc1_agreement` and `<a>_bc1_and_<b>_bc1_both_present` flags.
-    """
-    df = annotated_top_bc1_df.query(f"REDI_bc_bc1_counts >= {min_counts}").copy()
-    df = _attach_plate_and_position(df)
-    df_a = _collapse_array(df[array_a_mask.loc[df.index]], array_a_name)
-    df_b = _collapse_array(df[array_b_mask.loc[df.index]], array_b_name)
-    merged = df_a.merge(df_b, how="outer", suffixes=(f"_{array_a_name}", f"_{array_b_name}"))
-    merged[f"{array_a_name}_bc1_and_{array_b_name}_bc1_both_present"] = (
-        merged[f"{array_a_name}_bc1"].notna()
-        & merged[f"{array_b_name}_bc1"].notna()
-    )
-    merged["bc1_agreement"] = (
-        merged[f"{array_a_name}_bc1"] == merged[f"{array_b_name}_bc1"]
-    )
+def _legacy_ambiguity(value) -> bool:
+    """Respect an explicit tie flag, including all-string TSV roundtrips."""
+    if pd.isna(value) or value == '':
+        return False  # Legacy tables can omit the flag; their limit stays labelled.
+    text = str(value).strip().casefold()
+    if text not in ('true', 'false', '1', '0'):
+        raise ValueError('invalid legacy identity_ambiguous flag')
+    return text in ('true', '1')
+
+
+def _collapse_array(df: pd.DataFrame,array_name: str,min_counts: int=10,
+                    bc1_length: int=20) -> pd.DataFrame:
+    records=[]
+    required={'bc1','REDI_bc_bc1_counts','REDI_bc_bc1_total_counts'}
+    if not required<=set(df):
+        raise ValueError(f'cross-array calls missing {sorted(required-set(df))}')
+    if {'sample_name','REDI_bc'}<=set(df):
+        keyed_frame(df,['sample_name','REDI_bc'],label=f'{array_name} physical observations')
+    for keys,group in df.groupby(list(POSITION_COLUMNS),sort=False):
+        counts=Counter();total=0;legacy=None
+        for _,row in group.iterrows():
+            declared=_integer(row['REDI_bc_bc1_total_counts'],'declared denominator')
+            maximum=_integer(row['REDI_bc_bc1_counts'],'top counts')
+            if maximum>declared:
+                raise ValueError('top counts exceed denominator')
+            raw=row.get('all_bc1_counts_json')
+            if pd.isna(raw) or raw=='':
+                if len(group)!=1:
+                    raise ValueError('pooling multiple observations requires all_bc1_counts_json distribution')
+                legacy=(row['bc1'],maximum,declared,_legacy_ambiguity(row.get('identity_ambiguous')))
+            else:
+                try:
+                    pairs=json.loads(raw,object_pairs_hook=_unique_object)
+                    if not isinstance(pairs,dict) or not pairs:
+                        raise ValueError('distribution must be a nonempty JSON object')
+                    values={}
+                    for barcode,n in pairs.items():
+                        if barcode in values or not isinstance(barcode,str):
+                            raise ValueError('duplicate or nonstring barcode')
+                        if not all(base in 'ACGT' for base in barcode) or not barcode:
+                            raise ValueError('invalid barcode')
+                        values[barcode]=_integer(n,'distribution')
+                    if sum(values.values())!=declared or max(values.values())!=maximum:
+                        raise ValueError('distribution does not reconcile with declared denominator/top count')
+                except (TypeError,ValueError) as exc:
+                    raise ValueError(f'invalid all_bc1_counts_json distribution: {exc}') from exc
+                counts.update(values)
+            total+=declared
+        if legacy is not None:
+            winner,maximum,total,tied=legacy
+        else:
+            maximum=max(counts.values(),default=0)
+            winners=[bc for bc,n in counts.items() if n==maximum and n>0]
+            tied=len(winners)>1
+            winner=winners[0] if len(winners)==1 else pd.NA
+        valid=bool(valid_barcode(pd.Series([winner]),bc1_length).iloc[0])
+        callable_call=valid and maximum>=min_counts and total>0 and not tied
+        record=dict(zip(POSITION_COLUMNS,keys))
+        record.update({f'{array_name}_bc1':winner if callable_call else pd.NA,
+            f'{array_name}_REDI_bc_bc1_counts':maximum,
+            f'{array_name}_REDI_bc_bc1_total_counts':total,
+            f'{array_name}_colony_purity':maximum/total if total else float('nan'),
+            f'{array_name}_identity_ambiguous':tied,
+            f'{array_name}_callable':callable_call,
+            f'{array_name}_observations':len(group),
+            f'{array_name}_purity_basis':'observed_bc1_read_fraction' if legacy is None else 'legacy_top_only_read_fraction'})
+        records.append(record)
+    fields=['bc1','REDI_bc_bc1_counts','REDI_bc_bc1_total_counts','colony_purity',
+            'identity_ambiguous','callable','observations','purity_basis']
+    result=pd.DataFrame(records,columns=[*POSITION_COLUMNS,*[f'{array_name}_{f}' for f in fields]])
+    # An outer physical-position join introduces missing values. Keep Python
+    # integers so pandas cannot round exact counts via an int64→float64 cast.
+    for field in ('REDI_bc_bc1_counts','REDI_bc_bc1_total_counts','observations'):
+        column=f'{array_name}_{field}'
+        result[column]=pd.Series([record[column] for record in records],dtype=object)
+    return result
+
+
+def compare_arrays(annotated_top_bc1_df: pd.DataFrame,array_a_mask: pd.Series,
+                   array_b_mask: pd.Series,array_a_name: str,array_b_name: str,
+                   min_counts: int=10,bc1_length: int=20) -> pd.DataFrame:
+    """One row per union of physical positions; callable denominator is explicit."""
+    if not array_a_name or not array_b_name or array_a_name==array_b_name:
+        raise ValueError('two distinct array names are required')
+    if type(min_counts) is not int or min_counts<1:
+        raise ValueError('min_counts must be a positive integer')
+    df=_attach_plate_and_position(annotated_top_bc1_df)
+    for mask in (array_a_mask,array_b_mask):
+        if (not isinstance(mask,pd.Series) or not mask.index.equals(df.index)
+                or mask.isna().any() or not pd.api.types.is_bool_dtype(mask.dtype)):
+            raise ValueError('array masks must be nonmissing booleans aligned to input rows')
+    if (array_a_mask & array_b_mask).any():
+        raise ValueError('array masks overlap; the same observation cannot validate itself')
+    if {'sample_name','REDI_bc'}<=set(df):
+        # Disjoint row masks are insufficient when one physical observation was
+        # copied under two different purpose labels. Validate their union first.
+        keyed_frame(df[array_a_mask|array_b_mask],['sample_name','REDI_bc'],
+                    label='independent cross-array observations')
+    left=_collapse_array(df[array_a_mask],array_a_name,min_counts,bc1_length)
+    right=_collapse_array(df[array_b_mask],array_b_name,min_counts,bc1_length)
+    merged=left.merge(right,on=list(POSITION_COLUMNS),how='outer',validate='one_to_one')
+    merged['plate_and_position']=merged[list(POSITION_COLUMNS)].agg('_'.join,axis=1)
+    both=(merged[f'{array_a_name}_callable'].astype('boolean').fillna(False)
+          & merged[f'{array_b_name}_callable'].astype('boolean').fillna(False))
+    merged[f'{array_a_name}_bc1_and_{array_b_name}_bc1_both_present']=both
+    merged['bc1_agreement']=(merged[f'{array_a_name}_bc1'].astype('string')==merged[f'{array_b_name}_bc1'].astype('string')).astype('boolean').where(both,pd.NA)
     return merged
