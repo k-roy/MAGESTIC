@@ -137,7 +137,7 @@ if [[ "$START_STEP" == "03b" || "$START_STEP" < "03b" ]]; then
 fi
 
 # Step 03c: Absorb Error Counts
-if [[ "$START_STEP" <= "03c" && "$END_STEP" >= "03c" ]]; then
+if [[ ! "$START_STEP" > "03c" && ! "$END_STEP" < "03c" ]]; then
     echo ""
     echo "=== Step 03c: Absorb Error Counts ==="
     run_cmd $PYTHON "$COMMON_SCRIPTS/03c_absorb_error_counts.py" \
@@ -148,7 +148,7 @@ if [[ "$START_STEP" <= "03c" && "$END_STEP" >= "03c" ]]; then
 fi
 
 # Step 04: Tier Classification
-if [[ "$START_STEP" <= "04" && "$END_STEP" >= "04" ]]; then
+if [[ ! "$START_STEP" > "04" && ! "$END_STEP" < "04" ]]; then
     echo ""
     echo "=== Step 04: Tier Classification ==="
     CLEANED_COUNTS="$DATA_DIR/bc1_counts/${LIBRARY}_bc1_counts_long_format_cleaned.tsv"
@@ -161,7 +161,7 @@ if [[ "$START_STEP" <= "04" && "$END_STEP" >= "04" ]]; then
 fi
 
 # Step 05: Create Count Matrix
-if [[ "$START_STEP" <= "05" && "$END_STEP" >= "05" ]]; then
+if [[ ! "$START_STEP" > "05" && ! "$END_STEP" < "05" ]]; then
     echo ""
     echo "=== Step 05: Create Count Matrix ==="
     CLEANED_COUNTS="$DATA_DIR/bc1_counts/${LIBRARY}_bc1_counts_long_format_cleaned.tsv"
@@ -189,7 +189,7 @@ if [[ "$START_STEP" <= "05" && "$END_STEP" >= "05" ]]; then
 fi
 
 # Step 06: Combine Technical Replicates
-if [[ "$START_STEP" <= "06" && "$END_STEP" >= "06" ]]; then
+if [[ ! "$START_STEP" > "06" && ! "$END_STEP" < "06" ]]; then
     echo ""
     echo "=== Step 06: Combine Technical Replicates ==="
     run_cmd $PYTHON "$COMMON_SCRIPTS/06_combine_technical_replicates.py" \
@@ -201,7 +201,7 @@ if [[ "$START_STEP" <= "06" && "$END_STEP" >= "06" ]]; then
 fi
 
 # Step 07: Split Comparisons
-if [[ "$START_STEP" <= "07" && "$END_STEP" >= "07" ]]; then
+if [[ ! "$START_STEP" > "07" && ! "$END_STEP" < "07" ]]; then
     echo ""
     echo "=== Step 07: Split Comparisons ==="
     run_cmd $PYTHON "$COMMON_SCRIPTS/07_split_comparisons.py" \
@@ -212,7 +212,7 @@ if [[ "$START_STEP" <= "07" && "$END_STEP" >= "07" ]]; then
 fi
 
 # Step 08: DESeq2 (via SLURM job array)
-if [[ "$START_STEP" <= "08" && "$END_STEP" >= "08" ]]; then
+if [[ ! "$START_STEP" > "08" && ! "$END_STEP" < "08" ]]; then
     echo ""
     echo "=== Step 08: DESeq2 ==="
     echo "Submit DESeq2 job array separately using:"

@@ -793,6 +793,9 @@ Examples:
                 # match is the sorted-first candidate; without these a wrong-edit row looks like a perfect one.
                 "match_method", "is_unambiguous", "num_candidates", "num_candidate_variants", "variant",
                 "candidate_oligos", "perfect_donor", "guide_match",
+                # planning 218 item 10: what the read SHOWED about the designed edit. Without these two an
+                # uncertified window candidate is indistinguishable from a certified match on this table.
+                "edit_evidence", "num_edit_certified_variants",
                 # planning 30_ step 6: guide_match=False conflated "no linked guide" with "the linked
                 # guide disagrees"; guide_status separates them and num_guide_oligos sizes the conflict.
                 "guide_status", "num_guide_oligos",

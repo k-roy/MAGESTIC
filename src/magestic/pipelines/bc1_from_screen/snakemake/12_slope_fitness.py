@@ -48,6 +48,9 @@ from typing import Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
 
+# Generations are parsed by the rule steps 08, 10 and 11 share: "6.0" is 6; missing, "none",
+# text and fractional values are refused rather than truncated to a baseline (ledger §3 item 5).
+from magestic.pipelines.bc1_from_screen.transformation_scope import parse_generation
 from magestic.pipelines.bc1_from_screen.core.slope_fitness import (
     calculate_slope_fitness_dataframe,
     compare_slope_vs_endpoint_fitness
@@ -112,21 +115,28 @@ def parse_sample_key(
     if sample_col is None:
         raise ValueError(f"Could not find sample column. Available: {filtered.columns.tolist()}")
 
+    refused, conflicts = [], {}
     for _, row in filtered.iterrows():
+        if pd.isna(row[sample_col]):
+            continue
         sample_name = str(row[sample_col])
-        gen = row[gen_col]
-
-        # Handle string generation values like "0", "4g", "t0", etc.
-        if isinstance(gen, str):
-            gen = gen.lower().replace('g', '').replace('t', '')
-            if gen == 'none' or gen == '':
-                continue
-            gen = int(gen)
-        else:
-            gen = int(gen)
-
+        try:
+            gen = parse_generation(row[gen_col])
+        except ValueError:
+            refused.append(f"{sample_name}={row[gen_col]!r}")
+            continue
+        if generation_mapping.get(sample_name, gen) != gen:
+            conflicts.setdefault(sample_name, {generation_mapping[sample_name]}).add(gen)
         generation_mapping[sample_name] = gen
 
+    if refused:
+        raise ValueError(
+            f"Generation must be an integer for every sample of {condition!r} in {library}; refused: "
+            f"{', '.join(sorted(refused)[:20])} (\"6.0\" is accepted as 6; missing, \"none\", text and "
+            f"fractional values are not).")
+    if conflicts:
+        shown = '; '.join(f"{sample}: {sorted(values)}" for sample, values in sorted(conflicts.items())[:10])
+        raise ValueError(f"Conflicting generations in the sample key for: {shown}. Step 12 will not pick one.")
     return generation_mapping
 
 

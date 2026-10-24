@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class OligoMatchResult:
     """Result of oligo matching."""
     oligo_name: Optional[str]
-    match_type: str  # 'exact', 'guide_only', 'donor_only', 'partial', 'unmatched'
+    match_type: str  # 'exact', 'guide_only', 'donor_only', 'partial', 'conflicting', 'unmatched'
     confidence: float  # 0.0 to 1.0
 
 
@@ -208,6 +208,13 @@ def resolve_oligo_name(
                 match_type="exact",
                 confidence=0.95,
             )
+        # Both components are recognized, but identify different constructs.
+        # A guide-only fallback would discard contradictory full-donor evidence.
+        return OligoMatchResult(
+            oligo_name=None,
+            match_type="conflicting",
+            confidence=0.0,
+        )
 
     # If guide matches uniquely
     if len(guide_matches) == 1:
@@ -281,10 +288,11 @@ def process_counts_file(
     row-by-row ``iterrows`` (which called :func:`resolve_oligo_name` per row) with
     a vectorized exact guide+donor ``Series.map`` plus an ``np.select`` cascade
     that reproduces ``resolve_oligo_name``'s branch order exactly
-    (exact → both-unique-same → guide-only → donor-only → partial → unmatched).
+    (exact → both-unique-same → conflicting unique evidence → guide-only →
+    donor-only → partial → unmatched).
     The flag columns (perfect_/unambiguous_) are computed by vectorized count
-    lookups. Output is byte-identical to the legacy per-row version (verified by
-    all-branch parity test); no per-row Python loop, so no joblib needed.
+    lookups. Conflicting unique guide/full-donor matches remain unassigned in
+    both scalar and vectorized paths; no per-row Python loop is needed.
 
     Parameters
     ----------
@@ -342,9 +350,11 @@ def process_counts_file(
 
         # Remaining cascade (resolve_oligo_name order), all vectorized.
         both_same = (~has_exact) & ~nag & (ng == 1) & (nd == 1) & (gsv == dsv)
-        guide_only = (~has_exact) & (~both_same) & ~nag & (ng == 1)
-        donor_only = (~has_exact) & (~both_same) & (~guide_only) & ~nag & (nd == 1)
-        partial = (~has_exact) & (~both_same) & (~guide_only) & (~donor_only) & ~nag & (nm == 1)
+        conflicting = (~has_exact) & ~nag & (ng == 1) & (nd == 1) & (gsv != dsv)
+        fallback = (~has_exact) & (~both_same) & (~conflicting) & ~nag
+        guide_only = fallback & (ng == 1)
+        donor_only = fallback & (~guide_only) & (nd == 1)
+        partial = fallback & (~guide_only) & (~donor_only) & (nm == 1)
 
         oligo = np.full(n, "NA", dtype=object)
         oligo[has_exact] = oligo_exact.to_numpy(dtype=object)[has_exact]
@@ -354,6 +364,7 @@ def process_counts_file(
         oligo[partial] = msv[partial]
 
         mtype = np.full(n, "unmatched", dtype=object)
+        mtype[conflicting] = "conflicting"
         mtype[has_exact] = "exact"
         mtype[both_same] = "exact"
         mtype[guide_only] = "guide_only"

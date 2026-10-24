@@ -77,8 +77,9 @@ def calculate_t0_counts(
         DataFrame with bc1 and t0_total columns
     """
     # Identify t0 samples for this library
-    # Handle generations as numeric for robust comparison
-    generations_numeric = pd.to_numeric(keyfile["generations"], errors="coerce").fillna(-1).astype(int)
+    # Compare generations numerically without truncation: 0.5 is not a baseline, and a
+    # non-numeric value (NaN after coercion) never equals 0.
+    generations_numeric = pd.to_numeric(keyfile["generations"], errors="coerce")
     t0_samples = keyfile[
         (keyfile["condition"] == "YPD") &
         (generations_numeric == 0) &

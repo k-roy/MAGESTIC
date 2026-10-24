@@ -272,6 +272,13 @@ def main():
         combined = combined.reset_index(drop=True)
         ex = combined["pcr_replicate_ids"].astype(str).str.split(";").explode()
         ex = ex[ex != ""]
+        # A pcr:v1: identity and a legacy underscore-joined identity for the same PCR are
+        # different strings, so unioning them would count one PCR twice.
+        v1 = ex.str.startswith("pcr:v1:")
+        if v1.any() and not v1.all():
+            raise ValueError(
+                "inputs mix pcr:v1: and legacy PCR replicate-id encodings; rebuild every "
+                "step-02 output with the same code version before integrating runs")
         universe = sorted(set(ex))
         code = {r: k for k, r in enumerate(universe)}
         or_cols = mask_columns(len(universe))

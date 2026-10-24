@@ -62,8 +62,13 @@ def test_one_edit_two_encodings_is_unambiguous_only_with_variant_column():
                          "donor": [enc1, enc2], "individual_variants": ["600_C_T_SNP", "600_C_T_SNP"]})
     q = enc1[:65]
     r = _match(olig, [q]).loc[q]
-    assert (r.match_method, bool(r.is_unambiguous), r.variant) == ("sliding_window", True, "600_C_T_SNP")
+    # the candidate set still collapses to ONE variant -- that is what individual_variants is for ...
+    assert (r.match_method, r.num_candidate_variants) == ("sliding_window", 1)
     assert r.candidate_oligos is None
+    # ... but a 65-nt read of designs carrying no donor geometry cannot show the installed allele, so this is
+    # a candidate, not a certification (planning 218, ledger item 10). Revised 2026-09-23: this asserted
+    # is_unambiguous=True with the variant, which is the window-certification defect itself.
+    assert not bool(r.is_unambiguous) and pd.isna(r.variant) and r.edit_evidence == "not_assessable"
     r = _match(olig.drop(columns=["individual_variants"]), [q]).loc[q]
     assert (r.match_method, bool(r.is_unambiguous), r.num_candidate_variants) == ("sliding_window_ambiguous", False, 2)
 

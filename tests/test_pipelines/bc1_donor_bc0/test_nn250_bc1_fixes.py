@@ -155,6 +155,17 @@ def test_d12_guard_does_not_touch_the_clean_cases(tables):
     assert M.match_sequence(_read(DONOR_A), "GGGGGGGGGGGGGGGGGGGG", tables).is_unambiguous is True
     # the right guide
     assert M.match_sequence(_read(DONOR_A), GUIDE_A, tables).is_unambiguous is True
+    # (the guide-only assertion that stood here is RETRACTED at the 218 merge; see the skipped
+    # test_d12_guide_only_fallback_is_unambiguous_RETRACTED below, which keeps the claim verbatim)
+
+
+@pytest.mark.skip(reason="RETRACTED at the 218 merge (planning/272 section 3): withdrawn claim = a guide-only "
+                         "match is is_unambiguous=True. The 218 lane's Decision D-2 (patch 43, "
+                         "8ea743a; test_bdb_edit_certification.py::test_guideonly_*) makes a designed guide "
+                         "construct evidence, never edit evidence, so a row whose donor matched nothing is not "
+                         "unambiguous. Both cannot hold; the fail-closed side is kept. Reversing it = delete "
+                         "D-2's three lines in match_sequence's guide-only branch and test_guideonly_*.")
+def test_d12_guide_only_fallback_is_unambiguous_RETRACTED(tables):
     # guide-only fallback: nothing to conflict WITH
     assert M.match_sequence(None, GUIDE_A, tables).is_unambiguous is True
 
@@ -356,6 +367,11 @@ def test_c17_a_zero_bridge_on_nonempty_input_is_an_error_not_a_quiet_zero():
         DL.recover_full_donors(bdb, bad_lookup)
 
 
+@pytest.mark.skip(reason="RETRACTED at the 218 merge (planning/272 section 3): withdrawn claim = a lookup with "
+                         "only donor_bc0_fragment+donor columns bridges. Rule R* ranks candidates by read support, "
+                         "so a lookup without counts (and bc0) is refused rather than given invented support. "
+                         "The claim that the C17 guard leaves a healthy bridge alone is re-pinned on the R* "
+                         "schema in test_rstar_donor_recovery.py::test_c17_a_healthy_key_still_bridges.")
 def test_c17_a_matching_lookup_still_bridges_and_is_not_broken_by_the_guard():
     """The guard must not fire on a healthy bridge, or it would break NN 240's 48/48 roundtrip."""
     bdb = pd.DataFrame({"bc1": ["A" * 20], "donor_bc0_fragment": [_stage01_fragment()]})

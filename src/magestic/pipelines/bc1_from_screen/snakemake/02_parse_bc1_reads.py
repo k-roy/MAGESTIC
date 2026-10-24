@@ -1212,9 +1212,10 @@ def main():
         prov.add_output(args.output, rows=len(output_df))
         sidecar = prov.write()
         logger.info(f"  Provenance sidecar: {sidecar}")
-    except Exception as e:                       # never lose the data over this
+    except Exception as e:                       # retain data, refuse completion
         logger.error(f"  FAILED to write the provenance sidecar: {e!r}. The "
                      f"counts were written but are NOT provenance-backed.")
+        return 1
 
     logger.info("Step 02: Parsing complete")
     return 0

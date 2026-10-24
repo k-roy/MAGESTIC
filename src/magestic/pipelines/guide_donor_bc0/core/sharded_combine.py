@@ -43,6 +43,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import pysam
 
+from magestic.utils.collapsed_fastq import parse_collapsed_header_count
 from magestic.utils.provenance import StepProvenance, md5_file, write_json_atomic
 from .fastq_processing import (
     SEQ_CONST,
@@ -169,7 +170,7 @@ def parse_shard(row: Dict[str, str], shard_dir: Path, fastq_md5: Optional[str] =
     with pysam.FastxFile(str(fq)) as fin, open(tmp, "w") as out:
         out.write("\t".join(SHARD_FIELDS) + "\n")
         for entry in fin:
-            count = int(entry.name)
+            count, _ = parse_collapsed_header_count(entry.name)
             reads += count
             seq = orient_read(entry.sequence, row["inner_primers"])
             leader, guide, donor, SPS, bc0, msd, frag = parse_sequence(seq, stats=stats)

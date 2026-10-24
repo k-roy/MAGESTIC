@@ -134,7 +134,15 @@ COLUMNS_BC1_DONOR_BC0 = [
 # `candidates_agree_on_pam` is None on EVERY row -- a constant column, which names nothing. They
 # are optional for the same reason as chrom/variant_coord: required would make `usecols` raise on
 # any table predating them.
-OPTIONAL_COLUMNS_BC1_DONOR_BC0 = ["chrom", "variant_coord", "PAM", "PAM_coord", "PAM_strand"]
+#
+# Donor geometry for edit certification (core/matching.py:design_edit_positions; planning 218, ledger item
+# 10). Without these three the matcher cannot place a design's intended alleles in DONOR coordinates, and
+# every window-only match is reported not_assessable instead of certified -- which the matcher already says,
+# loudly ("Design table lacks ..."). The 218 lane listed them as REQUIRED; at the 218 merge (planning/272)
+# they moved here for the reason above: required, they made `usecols` raise on master's synthetic harmonized
+# table and took out all 10 known-answer roundtrip tests.
+OPTIONAL_COLUMNS_BC1_DONOR_BC0 = ["chrom", "variant_coord", "PAM", "PAM_coord", "PAM_strand",
+                                  "donor_start_coord", "donor_end_coord", "donor_strand"]
 
 
 def get_annotation_columns_for_bc1_from_screen(
@@ -234,11 +242,16 @@ def load_oligo_annotations(
             _have = set(pd.read_csv(filepath, sep="\t", nrows=0).columns)
             _absent = [c for c in columns if c in _optional and c not in _have]
             if _absent:
-                logger.warning(
-                    f"{filepath.name} has no {_absent}; loading without them. Variant ids cannot "
-                    f"be chromosome-qualified, so two edits at one coordinate on different "
-                    f"chromosomes still merge (NN 250 / D15)."
-                )
+                _geometry = {"donor_start_coord", "donor_end_coord", "donor_strand"}
+                _consequences = []
+                if set(_absent) - _geometry:
+                    _consequences.append("variant ids cannot be chromosome-qualified, so two edits at one "
+                                         "coordinate on different chromosomes still merge (NN 250 / D15)")
+                if set(_absent) & _geometry:
+                    _consequences.append("no design's alleles can be placed in donor coordinates, so only a "
+                                         "full-donor read can certify an edit (planning 218 item 10)")
+                logger.warning(f"{filepath.name} has no {_absent}; loading without them: "
+                               + "; ".join(_consequences) + ".")
                 columns = [c for c in columns if c not in _absent]
 
     # Convert columns to tuple for caching

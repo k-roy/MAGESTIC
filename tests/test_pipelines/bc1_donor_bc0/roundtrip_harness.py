@@ -125,13 +125,18 @@ def score_table(df: pd.DataFrame, design: S.Design, scope: str,
         got = str(got)
         planted_variants = {design.variant_of(n) for n in planted_names}
         unamb = bool(r.get(unamb_col)) if unamb_col else True
-        if not unamb:
-            cands = str(r.get(cand_col) or got)
-            if any(n in cands for n in planted_names):
+        raw = r.get(cand_col) if cand_col else None
+        if not unamb and isinstance(raw, str) and raw:
+            if any(n in raw for n in planted_names):
                 sc.counts["ambiguous_incl_truth"] += 1
             else:
                 sc.counts["ambiguous_excl_truth"] += 1
             continue
+        # A row that is not is_unambiguous but lists no candidates has exactly ONE candidate: since the
+        # 218 merge (Decision D-1, fail closed) an uncertified single-design window match is no longer
+        # is_unambiguous. Its identity is not ambiguous, so it is scored like any named row -- which makes
+        # wrong_variant stricter, not looser. Before this, `str(NaN or got)` scored it as the string "nan",
+        # i.e. truth excluded, even when it named the planted oligo (planning/272 section 2c).
         if got in planted_names:
             sc.counts["exact_oligo"] += 1
         elif design.variant_of(got) in planted_variants:

@@ -67,8 +67,9 @@ def consolidate_t0_samples(
         Tuple of (consolidated matrix, updated metadata)
     """
     # Identify t0 samples for this library
-    # Handle generations as numeric for robust comparison
-    generations_numeric = pd.to_numeric(keyfile[generation_col], errors="coerce").fillna(-1).astype(int)
+    # Compare generations numerically without truncation: 0.5 is not a baseline, and a
+    # non-numeric value (NaN after coercion) never equals 0.
+    generations_numeric = pd.to_numeric(keyfile[generation_col], errors="coerce")
     t0_mask = (
         (keyfile[condition_col] == "YPD") &
         (generations_numeric == 0) &
@@ -163,9 +164,11 @@ def split_by_comparison(
     """
     # Normalize generations column to numeric for robust comparison
     metadata = metadata.copy()
+    # Compare numerically without truncation: 0.5 is not generation 0, and a
+    # non-numeric value (NaN after coercion) never equals the reference generation.
     metadata["_generations_numeric"] = pd.to_numeric(
         metadata[generation_col], errors="coerce"
-    ).fillna(-1).astype(int)
+    )
 
     # Identify reference samples
     ref_mask = (
@@ -184,7 +187,7 @@ def split_by_comparison(
     comparisons = {}
 
     for condition, generation in treatment_conditions:
-        comparison_name = f"{condition}_{int(generation)}g"
+        comparison_name = f"{condition}_{generation:g}g"  # 6.0 renders as 6
 
         # Get treatment samples for this comparison
         treat_mask = (

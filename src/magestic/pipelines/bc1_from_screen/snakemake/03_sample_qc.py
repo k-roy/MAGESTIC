@@ -174,10 +174,25 @@ def compute_diversity_metrics(bc1_counts: Dict[str, int]) -> Tuple[float, float,
     return shannon_entropy, normalized_entropy, simpson_index
 
 
+def resolve_count_column(long_table_path: Path) -> str:
+    """Name of the per-sample count column, read from the header only.
+
+    Current producers write ``counts`` (steps 02 and 04); legacy long tables used
+    ``sample_counts``. Same rule as 07_tier_classification.py.
+    """
+    columns = list(pd.read_csv(long_table_path, sep="\t", nrows=0).columns)
+    if "counts" in columns:
+        return "counts"
+    if "sample_counts" in columns:
+        return "sample_counts"
+    raise ValueError(f"{long_table_path} has neither 'counts' nor 'sample_counts': {columns}")
+
+
 def compute_sample_metrics_chunked(
     long_table_path: Path,
     keyfile: pd.DataFrame,
     config: SampleQCConfig,
+    count_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Compute QC metrics for all samples using chunked file reading.
@@ -191,6 +206,7 @@ def compute_sample_metrics_chunked(
         DataFrame with one row per sample containing all QC metrics
     """
     print(f"Computing sample metrics from {long_table_path}")
+    count_col = count_col or resolve_count_column(long_table_path)
     print(f"  Chunk size: {config.chunksize:,} rows")
 
     # Build sample metadata lookup
@@ -222,7 +238,7 @@ def compute_sample_metrics_chunked(
             print(f"  Processed {total_rows:,} rows...")
 
         # Vectorized aggregation per (sample, bc1) - much faster than iterrows
-        agg = chunk.groupby(["sample_name", "bc1"])["sample_counts"].sum()
+        agg = chunk.groupby(["sample_name", "bc1"])[count_col].sum()
         for (sample, bc1), count in agg.items():
             sample_stats[sample]["total_reads"] += count
             sample_stats[sample]["bc1_counts"][bc1] += count
@@ -281,6 +297,7 @@ def compute_replicate_concordance(
     long_table_path: Path,
     keyfile: pd.DataFrame,
     config: SampleQCConfig,
+    count_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Compute pairwise correlations between replicates of same condition.
@@ -292,6 +309,7 @@ def compute_replicate_concordance(
         DataFrame with sample_name, mean_replicate_correlation, min_replicate_correlation
     """
     print("Computing replicate concordance...")
+    count_col = count_col or resolve_count_column(long_table_path)
 
     # Create condition+generations+library+plate_type grouping
     sample_metrics = sample_metrics.copy()
@@ -321,7 +339,7 @@ def compute_replicate_concordance(
     # First pass: identify most abundant BC1s across all samples
     bc1_totals = defaultdict(int)
     for chunk in pd.read_csv(long_table_path, sep="\t", chunksize=config.chunksize):
-        for bc1, count in chunk.groupby("bc1")["sample_counts"].sum().items():
+        for bc1, count in chunk.groupby("bc1")[count_col].sum().items():
             bc1_totals[bc1] += count
 
     # Select top N BC1s
@@ -334,7 +352,7 @@ def compute_replicate_concordance(
     for chunk in pd.read_csv(long_table_path, sep="\t", chunksize=config.chunksize):
         chunk_filtered = chunk[chunk["bc1"].isin(top_bc1s)]
         # Vectorized aggregation - much faster than iterrows
-        agg = chunk_filtered.groupby(["sample_name", "bc1"])["sample_counts"].sum()
+        agg = chunk_filtered.groupby(["sample_name", "bc1"])[count_col].sum()
         for (sample, bc1), count in agg.items():
             sample_bc1_counts[sample][bc1] += count
 
@@ -410,6 +428,7 @@ def compute_pca_and_outliers(
     sample_metrics: pd.DataFrame,
     long_table_path: Path,
     config: SampleQCConfig,
+    count_col: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute PCA on log-transformed counts and detect outliers.
@@ -418,11 +437,12 @@ def compute_pca_and_outliers(
         Tuple of (PCA coordinates DataFrame, DataFrame with pca_distance per sample)
     """
     print("Computing PCA...")
+    count_col = count_col or resolve_count_column(long_table_path)
 
     # Build wide matrix (same as correlation computation)
     bc1_totals = defaultdict(int)
     for chunk in pd.read_csv(long_table_path, sep="\t", chunksize=config.chunksize):
-        for bc1, count in chunk.groupby("bc1")["sample_counts"].sum().items():
+        for bc1, count in chunk.groupby("bc1")[count_col].sum().items():
             bc1_totals[bc1] += count
 
     # Select top N BC1s by variance (total counts as proxy)
@@ -434,7 +454,7 @@ def compute_pca_and_outliers(
     for chunk in pd.read_csv(long_table_path, sep="\t", chunksize=config.chunksize):
         chunk_filtered = chunk[chunk["bc1"].isin(top_bc1s)]
         # Vectorized aggregation - much faster than iterrows
-        agg = chunk_filtered.groupby(["sample_name", "bc1"])["sample_counts"].sum()
+        agg = chunk_filtered.groupby(["sample_name", "bc1"])[count_col].sum()
         for (sample, bc1), count in agg.items():
             sample_bc1_counts[sample][bc1] += count
 
@@ -616,12 +636,11 @@ def plot_pca(
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_paths = {}
 
-    # Merge metadata
-    plot_df = pca_df.merge(
-        sample_metrics[["sample_name", "condition", "library_ID", "plate_type", "generations"]],
-        on="sample_name",
-        how="left"
-    )
+    # pca_df already carries some of these from the same sample_metrics; re-merging
+    # them produced _x/_y names and a KeyError on "condition". Add only what is missing.
+    extra = [c for c in ["condition", "library_ID", "plate_type", "generations"] if c not in pca_df.columns]
+    plot_df = pca_df.merge(sample_metrics[["sample_name"] + extra], on="sample_name",
+                           how="left", validate="one_to_one")
 
     # Get unique conditions and assign colors
     conditions = plot_df["condition"].fillna("Unknown").unique()
@@ -1003,14 +1022,19 @@ Examples:
     concordance_df = compute_replicate_concordance(
         sample_metrics, args.input_long_table, keyfile, config
     )
-    sample_metrics = sample_metrics.merge(concordance_df, on="sample_name", how="left")
+    # SampleMetrics carries 0.0 placeholders for these columns. Drop them so the computed
+    # values keep their names and reach detect_outliers (a plain merge made _x/_y copies).
+    sample_metrics = sample_metrics.drop(
+        columns=["mean_replicate_correlation", "min_replicate_correlation"], errors="ignore"
+    ).merge(concordance_df, on="sample_name", how="left", validate="one_to_one")
 
     # ========================================================================
     # Step 4: PCA and outlier detection
     # ========================================================================
     print(f"\n[4/6] Computing PCA and outlier scores")
     pca_df, distance_df = compute_pca_and_outliers(sample_metrics, args.input_long_table, config)
-    sample_metrics = sample_metrics.merge(distance_df, on="sample_name", how="left")
+    sample_metrics = sample_metrics.drop(columns=["pca_distance"], errors="ignore").merge(
+        distance_df, on="sample_name", how="left", validate="one_to_one")
 
     # ========================================================================
     # Step 5: Detect outliers

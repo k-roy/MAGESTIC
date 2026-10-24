@@ -178,9 +178,22 @@ def aggregate_across_nuclease_libraries(
         pattern, "", regex=True
     )
 
+    # Per-row helpers so the group can count DESIGNS (nuclease libraries), not rows: a
+    # design appearing in two tiers counted twice and drove concordance above 1.
+    is_ngnh = hits_df[variant_col].astype(str).str.contains("NGNH", na=False)
+    significant = hits_df[sig_col].fillna(False).astype(bool)
+    hits_df["_significant_design"] = hits_df[variant_col].where(significant)
+    hits_df["_non_ngnh_design"] = hits_df[variant_col].where(~is_ngnh)
+    hits_df["_significant_non_ngnh_design"] = hits_df[variant_col].where(significant & ~is_ngnh)
+    hits_df["_significant_ngnh_design"] = hits_df[variant_col].where(significant & is_ngnh)
+
     # Aggregate by comparison and variant_identity
     agg_dict = {
         variant_col: ["nunique", lambda x: sorted(x.unique())],
+        "_significant_design": "nunique",
+        "_non_ngnh_design": "nunique",
+        "_significant_non_ngnh_design": "nunique",
+        "_significant_ngnh_design": "nunique",
         n_bc1_col: "sum",
         lfc_col: ["mean", "median", "std"],
         concordance_col: "mean",
@@ -224,33 +237,30 @@ def aggregate_across_nuclease_libraries(
     }
     agg_df.rename(columns=rename_map, inplace=True)
 
-    # Library concordance (protect against division by zero)
+    # Library concordance: the fraction of this variant's nuclease-library DESIGNS that
+    # are significant, so it cannot exceed 1 when a design appears in several rows.
+    agg_df["n_significant_libraries"] = agg_df["_significant_design_nunique"]
     agg_df["library_concordance"] = np.where(
         agg_df["n_nuclease_libraries"] > 0,
-        agg_df["n_significant"] / agg_df["n_nuclease_libraries"],
+        agg_df["n_significant_libraries"] / agg_df["n_nuclease_libraries"],
         0.0
     )
 
-    # NGNH efficiency exception - vectorized for performance
-    # Build the logic using vectorized operations where possible
-    # For rows with >1 library, check if NGNH is failing while others pass
-
-    # First, identify which rows have NGNH in their libraries (need to iterate for list checking)
-    has_ngnh = agg_df["nuclease_libraries"].apply(
-        lambda libs: any("NGNH" in lib for lib in libs) if isinstance(libs, (list, set)) else False
-    )
-
-    # Count non-NGNH libraries for each row
-    n_non_ngnh = agg_df["nuclease_libraries"].apply(
-        lambda libs: len([lib for lib in libs if "NGNH" not in lib]) if isinstance(libs, (list, set)) else 0
-    )
-
-    # NGNH exception: more than 1 library, has NGNH, and significant count equals non-NGNH count
+    # NGNH efficiency exception: NGNH is the library expected to edit poorly, so the
+    # exception is for a variant whose non-NGNH libraries all call it while NGNH does
+    # not. It must not fire when NGNH is the only library that calls it.
+    n_non_ngnh = agg_df["_non_ngnh_design_nunique"]
+    n_significant_non_ngnh = agg_df["_significant_non_ngnh_design_nunique"]
+    has_ngnh = (agg_df["n_nuclease_libraries"] - n_non_ngnh) > 0
+    ngnh_significant = agg_df["_significant_ngnh_design_nunique"] > 0
     agg_df["ngnh_low_efficiency_exception"] = (
-        (agg_df["n_nuclease_libraries"] > 1) &
-        has_ngnh &
-        (agg_df["n_significant"] == n_non_ngnh)
+        (agg_df["n_nuclease_libraries"] > 1)
+        & has_ngnh
+        & (n_non_ngnh > 0)
+        & (n_significant_non_ngnh == n_non_ngnh)
+        & ~ngnh_significant
     )
+    agg_df = agg_df.drop(columns=[c for c in agg_df.columns if c.startswith("_")])
 
     # Aggregated significance
     agg_df["is_significant_aggregated"] = (
@@ -353,7 +363,7 @@ def aggregate_by_amino_acid_change(
 
     # Flatten column names
     agg_df.columns = [
-        f"{a}_{b}" if b not in ["<lambda_0>", "<lambda_1>"] else
+        f"{a}_{b}" if b not in ["<lambda>", "<lambda_0>", "<lambda_1>"] else
         ("variant_designs" if a == variant_col else
          "categories" if a == category_col else
          "genes" if a == gene_col else
@@ -466,16 +476,24 @@ def aggregate_by_tier(
             hits_df.loc[x.index, sig_col]
         ).sum()
 
+    # Named aggregators: pandas labels them by __name__, so the flattening below can
+    # tell the two tiers apart (two lambdas were both labelled "<lambda>").
+    def _n_tier_rows(tier_name):
+        def count(x):
+            return (x == tier_name).sum()
+        count.__name__ = f"n_{tier_name}_rows"
+        return count
+
+    def _n_tier_significant(tier_name):
+        def count(x):
+            return count_tier_significant(x, tier_name)
+        count.__name__ = f"n_{tier_name}_significant"
+        return count
+
     agg_dict = {
         comparison_col: "nunique",
-        tier_col: [
-            lambda x: (x == "abundance_high").sum(),
-            lambda x: (x == "abundance_medium").sum(),
-        ],
-        sig_col: [
-            lambda x: count_tier_significant(x, "abundance_high"),
-            lambda x: count_tier_significant(x, "abundance_medium"),
-        ],
+        tier_col: [_n_tier_rows("abundance_high"), _n_tier_rows("abundance_medium")],
+        sig_col: [_n_tier_significant("abundance_high"), _n_tier_significant("abundance_medium")],
         lfc_col: "mean",
         zscore_col: "mean",
     }

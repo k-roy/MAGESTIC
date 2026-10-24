@@ -39,12 +39,16 @@ REQUIRED VARIABLES (must be defined before include):
     - KEYFILE_DIR: Project keyfiles directory
     - LOGS_DIR: Output directory for logs
     - LIBRARIES: List of library names (e.g., ["yL437", "yL442"])
+    - SCREEN: The screen name that prefixes the step 07/08 tables (e.g., "20240806_yL406_SpG_QTL_screen").
+      Rules 10 and 13 read those tables but write per-library outputs with no {screen} in the path, so
+      Snakemake cannot infer a {screen} wildcard there (WildcardError, found by `snakemake -n`, planning/272).
 
 REQUIRED CONFIG KEYS:
     config["tier_thresholds"]: Tier classification parameters
     config["deseq2"]: DESeq2 parameters
     config["hit_calling"]: Hit calling parameters
     config["resources"]: Resource specifications for each step
+    config["comparisons"]: Step 10 transformation scope ("pooled" or "split"; no default)
 
 Author: Kevin R. Roy
 """
@@ -89,25 +93,28 @@ rule parse_02_bc1:
 # Step 03: Sample QC
 # =============================================================================
 rule qc_03_sample:
-    """Generate QC metrics for parsed BC1 counts"""
+    """Sample QC metrics, flags and plots from the combined long-format BC1 counts"""
     input:
-        bc1_counts = expand(BC1_COUNTS_DIR / "parsed" / "{sample}_bc1_counts.tsv",
-                           sample=SAMPLES)
+        bc1_counts = BC1_COUNTS_DIR / "{screen}_bc1_counts_long_format.tsv",
+        sample_key = KEYFILE_DIR / "sample_key.tsv"
     output:
-        qc_summary = BC1_COUNTS_DIR / "qc" / "sample_qc_summary.tsv",
-        qc_plot = BC1_COUNTS_DIR / "qc" / "sample_qc_plot.png"
+        qc_summary = BC1_COUNTS_DIR / "qc" / "{screen}" / "sample_qc_summary.tsv",
+        flagged = BC1_COUNTS_DIR / "qc" / "{screen}" / "flagged_samples.tsv",
+        pca = BC1_COUNTS_DIR / "qc" / "{screen}" / "pca_coordinates.tsv",
+        plots = directory(BC1_COUNTS_DIR / "qc" / "{screen}" / "plots")
     params:
         script = COMMON_SCRIPTS_DIR / "03_sample_qc.py",
-        input_dir = BC1_COUNTS_DIR / "parsed"
+        output_dir = lambda w: str(BC1_COUNTS_DIR / "qc" / w.screen)
     log:
-        LOGS_DIR / "03_qc.log"
+        LOGS_DIR / "03_qc_{screen}.log"
     threads: 1
     shell:
         """
         {PYTHON} {params.script} \\
-            --input-dir {params.input_dir} \\
-            --output-summary {output.qc_summary} \\
-            --output-plot {output.qc_plot} \\
+            --input-long-table {input.bc1_counts} \\
+            --keyfile {input.sample_key} \\
+            --output-dir {params.output_dir} \\
+            --plots-dir {output.plots} \\
             2>&1 | tee {log}
         """
 
@@ -227,18 +234,32 @@ rule matrix_08_create:
 # =============================================================================
 # Step 10: Split Count Tables by Comparison
 # =============================================================================
+# The transformation scope has no default (step 10 refuses without one). Set
+# config["comparisons"]["transformation_scope"] to "pooled", or to "split" together with
+# "bc1_reference_table" and a construction-derived "transformation_column" (e.g. trafo_ID).
+# "pooled_dates": true passes --no-consolidate for keys without a screen_date column;
+# "exclude_samples_file" lists count columns to drop. A missing key fails the rule loudly.
 rule split_10_comparisons:
-    """Split count matrix into per-comparison tables"""
+    """Split count matrix into per-comparison tables within one declared transformation scope"""
     input:
-        count_matrix = BC1_COUNTS_DIR / "{screen}_bc1_counts_wide_{library}_combined_tiers.tsv",
-        sample_key = KEYFILE_DIR / "sample_key.tsv"
+        count_matrix = BC1_COUNTS_DIR / f"{SCREEN}_bc1_counts_wide_{{library}}_combined_tiers.tsv",
+        sample_key = KEYFILE_DIR / "sample_key.tsv",
+        bc1_reference = lambda w: config["comparisons"].get("bc1_reference_table", [])
     output:
         manifest = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "comparison_manifest.tsv",
         reference_dir = directory(BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "reference"),
         treatment_dir = directory(BC1_COUNTS_DIR / "counts_for_deseq" / "{library}" / "treatment")
     params:
         script = COMMON_SCRIPTS_DIR / "10_split_comparisons.py",
-        output_dir = BC1_COUNTS_DIR / "counts_for_deseq" / "{library}"
+        output_dir = lambda w: str(BC1_COUNTS_DIR / "counts_for_deseq" / w.library),
+        scope_args = lambda w: {
+            "pooled": lambda: "--pool-transformations",
+            "split": lambda: "--split-by-yeast-sublibrary --bc1-reference-table {} --yeast-sublibrary-column {}".format(
+                config["comparisons"]["bc1_reference_table"], config["comparisons"]["transformation_column"]),
+        }[config["comparisons"]["transformation_scope"]](),
+        date_args = lambda w: "--no-consolidate" if config["comparisons"].get("pooled_dates", False) else "",
+        exclude_args = lambda w: ("--exclude-samples-file {}".format(config["comparisons"]["exclude_samples_file"])
+                                  if config["comparisons"].get("exclude_samples_file") else "")
     log:
         LOGS_DIR / "10_split_{library}.log"
     threads: 1
@@ -249,6 +270,7 @@ rule split_10_comparisons:
             --sample-key {input.sample_key} \\
             --library {wildcards.library} \\
             --output-dir {params.output_dir} \\
+            {params.scope_args} {params.date_args} {params.exclude_args} \\
             2>&1 | tee {log}
         """
 
@@ -289,27 +311,31 @@ rule deseq2_11_single:
 # Step 12: Slope Fitness (Timecourse Analysis)
 # =============================================================================
 rule slope_12_fitness:
-    """Calculate fitness slopes for timecourse experiments"""
+    """Multi-timepoint slope fitness for one condition of one library"""
     input:
-        deseq2_results = lambda wildcards: expand(
-            DESEQ2_DIR / "{library}" / "{comparison}_DESeq2_results.tsv",
-            library=wildcards.library,
-            comparison=get_timecourse_comparisons(wildcards.library)
-        )
+        count_matrix = BC1_COUNTS_DIR / "{screen}_bc1_counts_wide_{library}_combined_tiers.tsv",
+        sample_key = KEYFILE_DIR / "sample_key.tsv",
+        ref_table = KEYFILE_DIR / "bc1_reference_table.tsv"
     output:
-        slopes = DESEQ2_DIR / "{library}" / "timecourse_slopes.tsv"
+        bc1 = DESEQ2_DIR / "{library}" / "slope_fitness" / "{screen}_{condition}_bc1_slope_fitness.tsv",
+        variant = DESEQ2_DIR / "{library}" / "slope_fitness" / "{screen}_{condition}_variant_slope_fitness.tsv",
+        summary = DESEQ2_DIR / "{library}" / "slope_fitness" / "{screen}_{condition}_slope_fitness_summary.tsv"
     params:
-        script = COMMON_SCRIPTS_DIR / "12_slope_fitness.py",
-        input_dir = DESEQ2_DIR / "{library}"
+        script = COMMON_SCRIPTS_DIR / "12_slope_fitness.py"
     log:
-        LOGS_DIR / "12_slope_{library}.log"
+        LOGS_DIR / "12_slope_{screen}_{library}_{condition}.log"
     threads: 1
     shell:
         """
         {PYTHON} {params.script} \\
-            --input-dir {params.input_dir} \\
-            --output {output.slopes} \\
+            --count-matrix {input.count_matrix} \\
+            --sample-key {input.sample_key} \\
+            --bc1-reference {input.ref_table} \\
+            --output-bc1 {output.bc1} \\
+            --output-variant {output.variant} \\
+            --output-summary {output.summary} \\
             --library {wildcards.library} \\
+            --condition {wildcards.condition:q} \\
             2>&1 | tee {log}
         """
 
@@ -322,7 +348,7 @@ rule annotate_13_results:
     input:
         deseq2_results = DESEQ2_DIR / "{library}" / "{comparison}_DESeq2_results.tsv",
         ref_table = KEYFILE_DIR / "bc1_reference_table.tsv",
-        tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv",
+        tier_mapping = BC1_COUNTS_DIR / f"{SCREEN}_bc1_tier_mapping_{{library}}.tsv",
         oligo_design = KEYFILE_DIR / "oligo_design.tsv"
     output:
         annotated = DESEQ2_DIR / "per_comparison" / "{library}" / "{comparison}_annotated.tsv"
@@ -352,7 +378,7 @@ rule hit_14_calling:
     input:
         annotated = DESEQ2_DIR / "per_comparison" / "{library}" / "{comparison}_annotated.tsv"
     output:
-        hits = HIT_CALLING_DIR / "{library}" / "{comparison}_hits.tsv",
+        hits = HIT_CALLING_DIR / "{library}" / "hits_{comparison}.tsv",
         stats = HIT_CALLING_DIR / "{library}" / "{comparison}_stats.tsv"
     params:
         script = COMMON_SCRIPTS_DIR / "14_hit_calling.py",
@@ -385,20 +411,21 @@ rule hit_14_calling:
 # Step 15: Aggregate Hit Calls
 # =============================================================================
 rule aggregate_15_hits:
-    """Aggregate hits across comparisons with time series analysis"""
+    """Aggregate variant-level hit tables across comparisons (per library)"""
     input:
         hits = lambda wildcards: expand(
-            HIT_CALLING_DIR / "{library}" / "{comparison}_hits.tsv",
+            HIT_CALLING_DIR / "{library}" / "hits_{comparison}.tsv",
             library=wildcards.library,
             comparison=get_comparisons_for_library(wildcards.library)
         )
     output:
-        aggregated = HIT_CALLING_DIR / "{library}" / "aggregated_hits.tsv",
-        time_series = HIT_CALLING_DIR / "{library}" / "time_series_analysis.tsv",
-        summary = HIT_CALLING_DIR / "{library}" / "hits_summary_by_tier.tsv"
+        all_hits = HIT_CALLING_DIR / "{library}" / "aggregated" / "{library}_variant_hits_all.tsv",
+        significant = HIT_CALLING_DIR / "{library}" / "aggregated" / "{library}_variant_hits_significant.tsv",
+        stats = HIT_CALLING_DIR / "{library}" / "aggregated" / "aggregation_stats.json"
     params:
         script = COMMON_SCRIPTS_DIR / "15_aggregate_hits.py",
-        input_dir = HIT_CALLING_DIR / "{library}"
+        input_dir = lambda w: str(HIT_CALLING_DIR / w.library),
+        output_dir = lambda w: str(HIT_CALLING_DIR / w.library / "aggregated")
     log:
         LOGS_DIR / "15_aggregate_{library}.log"
     threads: 1
@@ -406,10 +433,8 @@ rule aggregate_15_hits:
         """
         {PYTHON} {params.script} \\
             --input-dir {params.input_dir} \\
-            --output-aggregated {output.aggregated} \\
-            --output-time-series {output.time_series} \\
-            --output-summary {output.summary} \\
-            --library {wildcards.library} \\
+            --output-dir {params.output_dir} \\
+            --screen-name {wildcards.library} \\
             2>&1 | tee {log}
         """
 
@@ -418,27 +443,28 @@ rule aggregate_15_hits:
 # Step 16: Rarefaction Analysis
 # =============================================================================
 rule rarefaction_16:
-    """Rarefaction analysis for power assessment"""
+    """Rarefaction of one sample's parsed BC1 counts (sequencing-depth assessment)"""
     input:
-        bc1_counts = BC1_COUNTS_DIR / "{screen}_bc1_counts_long_format.tsv",
-        tier_mapping = BC1_COUNTS_DIR / "{screen}_bc1_tier_mapping_{library}.tsv"
+        bc1_counts = BC1_COUNTS_DIR / "parsed" / "{sample}_bc1_counts.tsv"
     output:
-        rarefaction = BC1_COUNTS_DIR / "qc" / "{screen}_{library}_rarefaction.tsv",
-        rarefaction_plot = BC1_COUNTS_DIR / "qc" / "{screen}_{library}_rarefaction.png"
+        rarefaction = BC1_COUNTS_DIR / "qc" / "rarefaction" / "{sample}_rarefaction.tsv",
+        summary = BC1_COUNTS_DIR / "qc" / "rarefaction" / "{sample}_rarefaction.summary.tsv"
     params:
-        script = COMMON_SCRIPTS_DIR / "16_rarefaction.py"
+        script = COMMON_SCRIPTS_DIR / "16_rarefaction.py",
+        data_type = config.get("rarefaction", {}).get("data_type", "bc1_timepoints")
     log:
-        LOGS_DIR / "16_rarefaction_{screen}_{library}.log"
-    threads: config.get("resources", {}).get("step_16", {}).get("cpus", 4)
+        LOGS_DIR / "16_rarefaction_{sample}.log"
+    threads: 1
     resources:
         mem_mb = config.get("resources", {}).get("step_16", {}).get("mem_mb", 32000)
     shell:
         """
         {PYTHON} {params.script} \\
-            --bc1-counts {input.bc1_counts} \\
-            --tier-mapping {input.tier_mapping} \\
-            --library {wildcards.library} \\
+            --input {input.bc1_counts} \\
             --output {output.rarefaction} \\
-            --output-plot {output.rarefaction_plot} \\
+            --data-type {params.data_type} \\
+            --sample-name {wildcards.sample} \\
+            --barcode-column bc1 \\
+            --count-column counts \\
             2>&1 | tee {log}
         """

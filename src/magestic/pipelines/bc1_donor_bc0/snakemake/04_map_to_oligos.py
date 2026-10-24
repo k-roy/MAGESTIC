@@ -353,6 +353,9 @@ def main():
     # an otherwise-scoped run still fell back to the full scope.
     if _unscoped_stats is not None:
         counts.update(_unscoped_stats)
+    if "edit_evidence" in out.columns:
+        # planning 218 item 10: the before/after measure of how many rows the edit certification changes.
+        counts["edit_evidence"] = {str(k): int(v) for k, v in out["edit_evidence"].value_counts().items()}
     prov.set_counts(**counts)
     prov.add_output(args.output, rows=int(n))
     print(f"sidecar: {prov.write()}")

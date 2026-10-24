@@ -47,9 +47,13 @@ import pandas as pd
 # Fall back to the sibling config.py, which imports nothing but stdlib + yaml.
 try:
     from magestic.pipelines.bc1_from_screen.config import TierConfig
+    from magestic.pipelines.bc1_from_screen.library_scope import resolve_library_samples
+    from magestic.pipelines.bc1_from_screen.reference_projection import project_bc1_reference
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from config import TierConfig
+    from library_scope import resolve_library_samples
+    from reference_projection import project_bc1_reference
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,12 +142,17 @@ def identify_t0_samples(
     Extracted verbatim from calculate_t0_counts() (2026-08-06) so the streaming
     and in-memory paths share ONE definition of "which samples are t0".
     """
-    # Handle generations as numeric, converting strings/floats to int for comparison
-    generations_numeric = pd.to_numeric(sample_key["generations"], errors="coerce").fillna(-1).astype(int)
-    t0_mask = (
-        (sample_key["condition"] == t0_condition) &
-        (generations_numeric == 0)
-    )
+    # Compare generations numerically without truncation: 0.5 is not a baseline, and a
+    # non-numeric value (NaN after coercion) never equals 0.
+    generations_numeric = pd.to_numeric(sample_key["generations"], errors="coerce")
+    is_t0_condition = sample_key["condition"] == t0_condition
+    unparsed = is_t0_condition & generations_numeric.isna()
+    if unparsed.any():
+        logger.warning(
+            f"  {int(unparsed.sum())} '{t0_condition}' row(s) have a non-numeric generations "
+            f"value and are not treated as t0 (e.g. "
+            f"{sample_key.loc[unparsed, sample_col].astype(str).tolist()[:5]})")
+    t0_mask = is_t0_condition & (generations_numeric == 0)
 
     # Optionally filter by screen dates
     if screen_dates:
@@ -384,6 +393,17 @@ def main():
     if missing:
         raise ValueError(f"Sample key missing required columns: {missing}")
 
+    # Scope the baseline to --library with the same rule step 08 uses. Without this a
+    # multi-library key summed every library's t0 reads into this library's tiers.
+    try:
+        keep_samples = resolve_library_samples(sample_key, args.library)
+    except ValueError as error:
+        logger.error(str(error))
+        return 1
+    if keep_samples is not None:
+        sample_key = sample_key[sample_key["sample_name"].astype(str).isin(set(keep_samples))]
+        logger.info(f"  Sample key scoped to library {args.library}: {len(sample_key):,} samples")
+
     # Configure tier thresholds
     tier_config = TierConfig(
         tier_1_min_reads=args.tier_1_min,
@@ -406,15 +426,19 @@ def main():
     logger.info("Classifying BC1s into tiers...")
     tier_mapping = classify_bc1_tiers(t0_counts, tier_config)
 
-    # Add oligo information from reference table
+    # Add oligo information from the reference table, one row per BC1. A BC1 with
+    # several reference oligos abstains (oligo_name empty, candidates kept) instead of
+    # multiplying its tier row, which double-counted its reads in the tier summary.
     if "bc1" in ref_table.columns and "oligo_name" in ref_table.columns:
+        projection = project_bc1_reference(ref_table)
         tier_mapping = tier_mapping.merge(
-            ref_table[["bc1", "oligo_name"]].drop_duplicates(),
-            on="bc1",
-            how="left"
-        )
+            projection[["bc1", "oligo_name", "bc1_reference_n_oligos", "bc1_reference_oligo_candidates"]],
+            on="bc1", how="left", validate="many_to_one")
+        tier_mapping["bc1_reference_n_oligos"] = tier_mapping["bc1_reference_n_oligos"].fillna(0).astype(int)
         n_with_oligo = tier_mapping["oligo_name"].notna().sum()
-        logger.info(f"  {n_with_oligo:,} BC1s mapped to oligos")
+        n_ambiguous = int((tier_mapping["bc1_reference_n_oligos"] > 1).sum())
+        logger.info(f"  {n_with_oligo:,} BC1s mapped to one oligo; {n_ambiguous:,} have several "
+                    f"reference oligos and are left unassigned")
 
     # Create summary statistics
     tier_stats = create_tier_summary(tier_mapping, args.library)

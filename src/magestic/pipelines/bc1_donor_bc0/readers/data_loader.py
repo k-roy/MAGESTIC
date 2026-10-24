@@ -9,10 +9,15 @@ Handles loading processed bc1-donor-bc0 data from various sources:
 All loaders return DataFrames with standardized columns for downstream processing.
 """
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+import json
 import re
+from urllib.parse import quote, unquote
 import pandas as pd
 import logging
 from tqdm import tqdm
@@ -154,8 +159,38 @@ def derive_amplicon_level(trafo_id) -> str:
     return AMPLICON_LEVEL_UNKNOWN
 
 
+# Cell spellings that mean "no value": pandas' default ``na_values``. The loaders read
+# keyfiles with default NA parsing and numbered step 02 reads literal strings
+# (keep_default_na=False); normalizing both through this list makes them agree.
+MISSING_VALUE_SPELLINGS = frozenset((
+    '', '#N/A', '#N/A N/A', '#NA', '-1.#IND', '-1.#QNAN', '-NaN', '-nan', '1.#IND',
+    '1.#QNAN', '<NA>', 'N/A', 'NA', 'NULL', 'NaN', 'None', 'n/a', 'nan', 'null'))
+
+
+def declared_value(value):
+    """Return a metadata cell as stripped text, or None when it holds no value.
+
+    An integer-valued float (``1.0``, which pandas produces for an integer column
+    containing a blank) is rendered as ``1``.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    return None if text in MISSING_VALUE_SPELLINGS else text
+
+
 def build_pcr_replicate_id(row) -> str:
     """PCR-replicate identity = one independent amplification of the gDNA, per well.
+
+    BDB reads the guide-donor plasmid carried in that gDNA prep, so this identifies
+    a PCR event, not a genomic integration.
 
     Identity = :data:`PCR_REPLICATE_ID_FIELDS` — the keyfile's own
     ``PCR_plate_name`` (gDNA_plate + inner + outer) at well resolution, plus the
@@ -180,22 +215,398 @@ def build_pcr_replicate_id(row) -> str:
       artifact reappears in every re-sequencing, so it is not independent
       evidence and must collapse to a single replicate.
 
-    Absent/NaN fields render as ``"NA"`` so the id degrades gracefully (never
-    worse than the prior sample_number-only behaviour). When ``gDNA_plate_name``
-    is unavailable the re-prep guard is inactive; :func:`check_replicate_metadata`
+    Every producer (both loaders and numbered step 02) builds the identity here,
+    and the cells are normalized here so that producers agree. Surrounding
+    whitespace is removed. An absent field, or a cell spelled as in
+    :data:`MISSING_VALUE_SPELLINGS` (including a literal ``"NA"``), is missing and
+    encodes as JSON null. ``sample_number`` drops a ``sample_`` prefix and leading
+    zeros, so ``sample_01`` and ``1`` are the same well. A missing
+    ``amplicon_level`` is derived from ``trafo_ID`` with
+    :func:`derive_amplicon_level` (``unknown`` when no trafo_ID is declared),
+    exactly as the loaders derive it.
+
+    The ordered tuple is serialized as JSON behind a ``pcr:v1:`` prefix and
+    percent-escaped, so field boundaries survive underscores and the ``;`` list
+    delimiter used by merge and aggregation. When ``gDNA_plate_name`` is
+    unavailable the re-prep guard is inactive; :func:`check_replicate_metadata`
     warns so this is never silent.
 
     Args:
         row: A keyfile row (pandas Series or mapping).
 
     Returns:
-        The fields of :data:`PCR_REPLICATE_ID_FIELDS` joined by ``_``.
+        A ``pcr:v1:`` identifier. Rebuild all identities together: a legacy
+        underscore-joined id and a ``pcr:v1:`` id for the same physical PCR are
+        different strings and would be counted as two replicates.
     """
-    def _f(key: str) -> str:
-        val = row.get(key) if hasattr(row, 'get') else (row[key] if key in row else None)
-        return str(val) if pd.notna(val) else 'NA'
+    def _get(key):
+        if hasattr(row, 'get'):
+            return row.get(key)
+        return row[key] if key in row else None
 
-    return "_".join(_f(k) for k in PCR_REPLICATE_ID_FIELDS)
+    values = {key: declared_value(_get(key)) for key in PCR_REPLICATE_ID_FIELDS}
+    well = values['sample_number']
+    if well is not None:
+        well = re.sub(r'^sample_', '', well)
+        values['sample_number'] = str(int(well)) if well.isdigit() else well
+    if values['amplicon_level'] is None:
+        values['amplicon_level'] = derive_amplicon_level(declared_value(_get('trafo_ID')))
+    encoded = json.dumps([values[key] for key in PCR_REPLICATE_ID_FIELDS],
+                         separators=(',', ':'))
+    return 'pcr:v1:' + quote(encoded, safe='')
+
+
+_PCR_V1_PREFIX = 'pcr:v1:'
+_AMPLICON_LEVEL_POSITION = PCR_REPLICATE_ID_FIELDS.index('amplicon_level')
+# Branch-and-bound steps allowed for one group of compatible identities. Past this the
+# count falls back to a proven lower bound and is reported as inexact.
+PCR_COVER_SEARCH_LIMIT = 100_000
+# Components larger than this skip the exact search (it also bounds recursion depth).
+_PCR_COVER_EXACT_MAX = 40
+
+
+@lru_cache(maxsize=65536)
+def pcr_identity_fields(identity: str) -> Optional[Tuple[Optional[str], ...]]:
+    """Invert :func:`build_pcr_replicate_id`.
+
+    Returns the :data:`PCR_REPLICATE_ID_FIELDS` values of a ``pcr:v1:`` identity, with
+    None for a field the producer did not declare. Any other encoding (a legacy
+    underscore-joined id, a bare sample_number, a test label) returns None and is
+    treated by callers as an opaque identity, equal only to itself.
+    """
+    if not isinstance(identity, str) or not identity.startswith(_PCR_V1_PREFIX):
+        return None
+    try:
+        values = json.loads(unquote(identity[len(_PCR_V1_PREFIX):]))
+    except ValueError:
+        return None
+    if (not isinstance(values, list) or len(values) != len(PCR_REPLICATE_ID_FIELDS)
+            or any(value is not None and not isinstance(value, str) for value in values)):
+        return None
+    return tuple(values)
+
+
+def _declared_pcr_fields(identity):
+    """The fields an identity declares; None where nothing was declared.
+
+    A derived ``amplicon_level`` of ``unknown`` means no trafo_ID was declared, so it
+    counts as undeclared too.
+    """
+    fields = pcr_identity_fields(identity)
+    if fields is not None and fields[_AMPLICON_LEVEL_POSITION] == AMPLICON_LEVEL_UNKNOWN:
+        fields = (fields[:_AMPLICON_LEVEL_POSITION] + (None,)
+                  + fields[_AMPLICON_LEVEL_POSITION + 1:])
+    return fields
+
+
+def _can_be_one_pcr(a, b) -> bool:
+    """Two declarations can describe one PCR when every field both declare agrees."""
+    return all(x is None or y is None or x == y for x, y in zip(a, b))
+
+
+def _fields_order(fields):
+    return tuple((value is None, value or '') for value in fields)
+
+
+def _signature(fields):
+    return tuple(value is None for value in fields)
+
+
+def _proven_lower_bound(vertices) -> int:
+    """Size of a set of pairwise incompatible identities: each needs its own PCR."""
+    degree = {v: sum(_can_be_one_pcr(v, w) for w in vertices if w != v) for v in vertices}
+    chosen = []
+    for fields in sorted(vertices, key=lambda v: (degree[v], _fields_order(v))):
+        if not any(_can_be_one_pcr(fields, other) for other in chosen):
+            chosen.append(fields)
+    # Identities declaring the same fields are pairwise incompatible, so the largest such
+    # class is also a set of provably distinct PCRs.
+    return max(len(chosen), max(Counter(map(_signature, vertices)).values()))
+
+
+def _fewest_pcrs(vertices) -> int:
+    """Minimum number of groups of mutually compatible identities (a minimum clique cover).
+
+    Exact branch and bound: each identity joins a group it is compatible with or opens a
+    new one, and a branch stops once it cannot beat the best cover found. Being
+    compatible with a group's merged declaration is the same as being compatible with
+    every member, so no valid grouping is missed. When the search budget runs out, a
+    proven lower bound is returned instead of the best cover found so far, because a
+    cover found by an incomplete search can exceed the true minimum.
+    """
+    order = sorted(vertices, key=lambda v: (-sum(x is not None for x in v), _fields_order(v)))
+    best, steps = len(order), 0
+
+    def place(index, groups):
+        nonlocal best, steps
+        steps += 1
+        if steps > PCR_COVER_SEARCH_LIMIT or len(groups) >= best:
+            return
+        if index == len(order):
+            best = len(groups)
+            return
+        fields = order[index]
+        for position, merged in enumerate(groups):
+            if _can_be_one_pcr(fields, merged):
+                groups[position] = tuple(a if a is not None else b for a, b in zip(merged, fields))
+                place(index + 1, groups)
+                groups[position] = merged
+        groups.append(fields)
+        place(index + 1, groups)
+        groups.pop()
+
+    if len(order) <= _PCR_COVER_EXACT_MAX:
+        place(0, [])
+        if steps <= PCR_COVER_SEARCH_LIMIT:
+            return best
+    return _proven_lower_bound(order)
+
+
+def count_distinct_pcrs(identities: Iterable[str]) -> Tuple[int, bool]:
+    """Fewest physical PCRs consistent with a set of PCR identities, and whether that is exact.
+
+    Two ``pcr:v1:`` identities can be one physical PCR when they agree on every field
+    both declare: a field one producer did not declare is unknown, not different. This
+    matters when one PCR is sequenced by two routes whose keyfiles declare different
+    fields (the yL437/yL442 2x150 combined key has no gDNA plate, inner primers or
+    polymerase; its 2x300 plate keys do). Counting the identity strings would count that
+    one PCR twice.
+
+    The count is the minimum number of PCRs that explains every identity, so it is a
+    lower bound and never raises support above what the declarations prove. It is exact
+    when no two distinct identities could be the same PCR. When a merge had to be
+    inferred, the under-declared PCR may still be a different one, so the second value
+    is False. Identities in any other encoding are opaque and count once each.
+
+    Returns:
+        ``(count, exact)``.
+    """
+    atoms, declared = 0, set()
+    for identity in set(identities):
+        fields = _declared_pcr_fields(identity)
+        if fields is None:
+            atoms += 1
+        else:
+            declared.add(fields)
+    by_signature = defaultdict(list)
+    for fields in declared:
+        by_signature[_signature(fields)].append(fields)
+    # Within one signature, compatible means equal, so only pairs across signatures
+    # need checking.
+    if len(by_signature) < 2:
+        return atoms + len(declared), True
+    vertices = sorted(declared, key=_fields_order)
+    index = {fields: i for i, fields in enumerate(vertices)}
+    parent = list(range(len(vertices)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    groups = sorted(by_signature.values(), key=lambda group: _fields_order(min(group, key=_fields_order)))
+    for g, first in enumerate(groups):
+        for second in groups[g + 1:]:
+            for a in first:
+                for b in second:
+                    if _can_be_one_pcr(a, b):
+                        parent[root(index[a])] = root(index[b])
+    components = defaultdict(list)
+    for fields in vertices:
+        components[root(index[fields])].append(fields)
+    count, exact = atoms, True
+    for members in components.values():
+        if len(members) == 1:
+            count += 1
+        else:
+            # A component of two or more contains a compatible pair, so a merge is inferred.
+            exact = False
+            count += _fewest_pcrs(members)
+    return count, exact
+
+
+# Declarations that identify the sample, population or PCR event. When both the plate
+# key and the sample key carry one, they must agree for every file that is loaded.
+_KEY_IDENTITY_COLUMNS = frozenset((*PCR_REPLICATE_ID_FIELDS, 'sequencing_date',
+                                   'yeast_library', 'yeast_sublibrary', 'trafo_ID',
+                                   'library_ID', 'V_library', 'SPS'))
+_KEY_CONFLICTS = '_key_conflicts'
+# Columns that name the physical file ({date}_{outer}_sample_{n}_...). When both keys
+# carry one, a plate row and a sample row that disagree on it describe different files.
+_KEY_FILE_COLUMNS = ('sequencing_date', 'outer_primers', 'sample_number')
+_PLAIN_NUMBER = re.compile(r'^-?\d+(\.\d+)?$')
+
+
+def _same_declaration(a: str, b: str) -> bool:
+    """Equal declarations; plain decimal numerals compare by value (1 and 1.0 agree).
+
+    Compared as decimals, not floats: two integers past float precision (for example
+    9007199254740992 and 9007199254740993) are different declarations.
+    """
+    if a == b:
+        return True
+    if _PLAIN_NUMBER.match(a) and _PLAIN_NUMBER.match(b):
+        try:
+            return Decimal(a) == Decimal(b)
+        except InvalidOperation:
+            return False
+    return False
+
+
+def _cross_merge_keys(plate_key: pd.DataFrame, sample_key: pd.DataFrame) -> pd.DataFrame:
+    """Pair plate-key rows with sample-key rows, resolving columns that both declare.
+
+    A plain cross-merge renames a shared column to ``_x``/``_y``, so an equal
+    declaration in both keys vanishes and a contradictory one passes unnoticed.
+
+    * A shared file-naming column (:data:`_KEY_FILE_COLUMNS`) is a join key: a plate
+      row and a sample row that disagree on it describe different files and are not
+      paired. Rows left with no partner are logged; a file on disk that no pair
+      names is then reported by the loader's coverage check.
+    * Every other shared column becomes one column holding the value both keys agree
+      on, or one key's value when the other is blank.
+    * A disagreement in an identity column (:data:`_KEY_IDENTITY_COLUMNS`) is listed
+      in ``_key_conflicts``. The loader combines the lists of all rows that name one
+      file and refuses that file when it loads. Other disagreeing columns keep both
+      values as ``<column>__plate_key`` / ``<column>__sample_key`` and leave the
+      shared column empty.
+
+    Resolved shared values are stripped text (:func:`declared_value`), so a blank
+    never turns an integer date column into floats.
+    """
+    shared = sorted(set(plate_key.columns) & set(sample_key.columns))
+    combined = plate_key.rename(columns={c: f'{c}__plate_key' for c in shared}).assign(
+        _plate_row=range(len(plate_key))).merge(
+        sample_key.rename(columns={c: f'{c}__sample_key' for c in shared}).assign(
+            _sample_row=range(len(sample_key))), how='cross')
+    paired = [True] * len(combined)
+    conflicts = [[] for _ in range(len(combined))]
+    unresolved = set()
+    for column in shared:
+        resolved = []
+        pairs = zip(combined[f'{column}__plate_key'], combined[f'{column}__sample_key'])
+        for i, (plate_value, sample_value) in enumerate(pairs):
+            a, b = declared_value(plate_value), declared_value(sample_value)
+            if a is None or b is None or _same_declaration(a, b):
+                resolved.append(b if b is not None else a)
+                continue
+            resolved.append(None)
+            if column in _KEY_FILE_COLUMNS:
+                paired[i] = False
+            elif column in _KEY_IDENTITY_COLUMNS:
+                conflicts[i].append(column)
+            else:
+                unresolved.add(column)
+        combined[column] = pd.Series(resolved, index=combined.index, dtype=object)
+    combined[_KEY_CONFLICTS] = [';'.join(c) for c in conflicts]
+    kept = combined[paired]
+    if len(kept) < len(combined):
+        join_columns = [c for c in shared if c in _KEY_FILE_COLUMNS]
+        logger.info(f"  {len(combined) - len(kept):,} plate/sample row combinations disagree on "
+                    f"{join_columns} and are not paired")
+        for side, other, column in (('sample', 'plate', '_sample_row'), ('plate', 'sample', '_plate_row')):
+            lost = sorted(set(combined[column]) - set(kept[column]))
+            if lost:
+                logger.warning(f"  {len(lost)} {side}_key row(s) pair with no {other}_key row "
+                               f"(0-based rows {lost[:10]})")
+    if shared:
+        logger.info(f"  plate_key and sample_key both declare {shared}; resolved to one column each")
+    if unresolved:
+        logger.warning(
+            f"  plate_key and sample_key disagree on non-identity column(s) {sorted(unresolved)}; "
+            f"both values kept as <column>__plate_key / <column>__sample_key")
+    return kept.drop(columns=['_plate_row', '_sample_row']).reset_index(drop=True)
+
+
+def _declared_or_derived_amplicon_level(key: pd.DataFrame) -> pd.Series:
+    """The key's declared amplicon_level, else the level derived from trafo_ID."""
+    declared = (key['amplicon_level'].map(declared_value) if 'amplicon_level' in key.columns
+                else pd.Series(None, index=key.index, dtype=object))
+    derived = (key['trafo_ID'].map(derive_amplicon_level) if 'trafo_ID' in key.columns
+               else pd.Series(AMPLICON_LEVEL_UNKNOWN, index=key.index, dtype=object))
+    return declared.where(declared.notna(), derived)
+
+
+# Transformation scope (planning 218 patch 45; Kevin, 2026-09-23). The bc1 PCR fragment is joined to
+# the I-SceI-cut guide-donor plasmid in yeast at each transformation (utils/harmonize_oligos.py
+# construction chain), so a bc1-donor-bc0 linkage is one assembly event in one transformation. Its
+# PCR support counts separate PCR wells WITHIN that transformation; another transformation is a
+# question of attribution, not support. A key row's trafo_ID is a SAMPLE label: a plate of a
+# transformation ('trafo_2-1'), a pooled outgrowth of one transformation ('yL387'), a pool of several
+# ('yL406', 'yL442'), or 'empty'. The loaders keep that label in `trafo_label` and set trafo_ID to the
+# transformation it belongs to, which is what merge, aggregation and donor recovery key on.
+TRAFO_LABEL_COLUMN = 'trafo_label'
+# 'trafo_N-M' is plate M of transformation N: the yL406 notebook (20240702_SpG_QTL_trafo, entry of
+# 20240705) washes each transformation's three plates separately and pools the washes for outgrowth.
+_TRAFO_PLATE = re.compile(r'^(trafo_\d+)-\d+$')
+
+
+def load_transformation_map(keyfile_dir: Path) -> Dict[str, str]:
+    """yL -> the one transformation it pools, from every ``*trafo_key.tsv`` in ``keyfile_dir``.
+
+    Each file needs ``yL`` and ``trafo_ID`` columns; identity rows (yL equal to trafo_ID) add nothing.
+    A yL mapped to two different transformations is refused rather than resolved by file order.
+    """
+    mapping, sources = {}, {}
+    for path in sorted(Path(keyfile_dir).glob('*trafo_key.tsv')):
+        table = pd.read_csv(path, sep='\t', dtype=str)
+        if not {'yL', 'trafo_ID'} <= set(table.columns):
+            continue
+        for yl, trafo in zip(table['yL'], table['trafo_ID']):
+            yl, trafo = declared_value(yl), declared_value(trafo)
+            if yl is None or trafo is None or yl == trafo:
+                continue
+            if mapping.get(yl, trafo) != trafo:
+                raise ValueError(f'Trafo keys map {yl} to both {mapping[yl]} ({sources[yl]}) '
+                                 f'and {trafo} ({path.name})')
+            mapping[yl], sources[yl] = trafo, path.name
+    return mapping
+
+
+def transformation_of(label, trafo_map: Dict[str, str]) -> Optional[str]:
+    """The transformation a sample label belongs to (see TRAFO_LABEL_COLUMN).
+
+    A yL the trafo key maps to one transformation takes it; 'trafo_N-M' becomes 'trafo_N'; any other
+    label (a transformation, a pool of several, 'empty') is its own scope.
+    """
+    value = declared_value(label)
+    if value is None:
+        return None
+    if value in trafo_map:
+        return trafo_map[value]
+    plate = _TRAFO_PLATE.fullmatch(value)
+    return plate.group(1) if plate else value
+
+
+def _stamp_transformation(frame, row, trafo_map):
+    """Keep the row's sample label and scope the frame by its transformation.
+
+    Called after the PCR identity is built from the raw row, so a pooled outgrowth keeps its
+    'pooled_yL' amplicon level.
+    """
+    label = declared_value(row.get('trafo_ID')) if 'trafo_ID' in row else None
+    frame[TRAFO_LABEL_COLUMN] = label
+    frame['trafo_ID'] = transformation_of(label, trafo_map)
+    return frame
+
+
+def _attach_sample_scope(frame, row, source):
+    """Keep sequence evidence; validate physical scope against sample metadata."""
+    from ..core.merge import SCOPE_COLUMNS, _text
+    frame = frame.copy()
+    population = {'yeast_library', 'yeast_sublibrary', 'trafo_ID'}
+    for column in (*SCOPE_COLUMNS, 'SPS'):
+        declared = _text(row.get(column))
+        observed = {_text(value) for value in frame[column]} - {None} if column in frame else set()
+        if declared is None:
+            if column in population and observed:
+                raise ValueError(f'Sample metadata lacks {column} supplied by amplicon table: {source}')
+        else:
+            if observed - {declared}:
+                raise ValueError(f'Sample metadata conflicts with table {column}: {source}')
+            frame[column] = declared
+    return frame
 
 
 def check_replicate_metadata(df: pd.DataFrame, source_label: str = "data") -> None:
@@ -412,6 +823,9 @@ def load_keyfile(keyfile_path: Path, filters: Optional[Dict] = None) -> pd.DataF
     df = pd.read_csv(keyfile_path, sep='\t')
 
     if filters:
+        missing = set(filters) - set(df.columns)
+        if missing:
+            raise ValueError(f'Unknown keyfile filter column(s): {sorted(missing)}')
         for col, val in filters.items():
             if col in df.columns:
                 if isinstance(val, (list, tuple)):
@@ -460,6 +874,7 @@ def load_2x300_data(
             on incomplete coverage (unless require_full_coverage is False).
     """
     logger.info("Loading 2x300 bp data...")
+    trafo_map = load_transformation_map(keyfile_dir)
 
     # Load ALL matching plate keyfiles (recent screens ship one per sequencing
     # date; each carries that date's gDNA_plate_name needed by the replicate
@@ -524,26 +939,20 @@ def load_2x300_data(
             'polymerase': 'sample_listed_polymerase',
             'plate_category': 'plate_category_from_sample_key',
         })
-        overlap = set(plate_key.columns) & set(sample_key.columns)
-        if overlap:
-            logger.warning(
-                f"  plate_key/sample_key still share column(s) {sorted(overlap)}; "
-                f"a cross-merge will suffix them _x/_y and they will not resolve by name."
-            )
-        combined_key = plate_key.merge(sample_key, how='cross')
+        combined_key = _cross_merge_keys(plate_key, sample_key)
     else:
         combined_key = plate_key
 
     # Derive the amplicon level explicitly rather than leaving it implied by
-    # sample_number (trafo-level vs trafos-pooled-before-barcoding).
+    # sample_number (trafo-level vs trafos-pooled-before-barcoding). A level the key
+    # declares is kept; only missing levels are derived, as build_pcr_replicate_id does.
+    combined_key['amplicon_level'] = _declared_or_derived_amplicon_level(combined_key)
     if 'trafo_ID' in combined_key.columns:
-        combined_key['amplicon_level'] = combined_key['trafo_ID'].apply(derive_amplicon_level)
         lvl = combined_key['amplicon_level'].value_counts().to_dict()
-        logger.info(f"  Amplicon levels (from trafo_ID): {lvl}")
-    else:
-        combined_key['amplicon_level'] = AMPLICON_LEVEL_UNKNOWN
+        logger.info(f"  Amplicon levels (declared, else from trafo_ID): {lvl}")
+    elif (combined_key['amplicon_level'] == AMPLICON_LEVEL_UNKNOWN).any():
         logger.warning(
-            "  No trafo_ID column -> amplicon_level='unknown' for every row. "
+            "  No trafo_ID column -> amplicon_level='unknown' where the key declares none. "
             "Trafo-level and pooled-yL amplicons cannot be distinguished, so a "
             "bc1 present in both will still be counted correctly ONLY because "
             "they carry different sample_numbers."
@@ -558,6 +967,13 @@ def load_2x300_data(
                     if c in combined_key.columns]
     if file_id_cols:
         before = len(combined_key)
+        if _KEY_CONFLICTS in combined_key.columns:
+            # A conflicting row must not be de-duplicated away behind an agreeing
+            # sibling that names the same file: every row for the file carries the
+            # conflicts of all of them, and the file is refused when it loads.
+            combined_key[_KEY_CONFLICTS] = combined_key.groupby(
+                file_id_cols, dropna=False, sort=False)[_KEY_CONFLICTS].transform(
+                lambda values: ';'.join(sorted({c for value in values for c in value.split(';') if c})))
         # Rows sharing a file can DIFFER in the descriptive columns -- yL406's
         # sample_key lists each sample_number twice (once per polymerase) and the
         # second row is often blank (`trafo_ID='empty'`). drop_duplicates keeps
@@ -620,7 +1036,14 @@ def load_2x300_data(
         )
 
         if filepath and filepath.exists():
+            conflicts = row.get(_KEY_CONFLICTS)
+            if conflicts:
+                raise ValueError(
+                    f"plate_key and sample_key declare conflicting {conflicts.split(';')} "
+                    f"for {filepath.name}; correct the keyfiles before loading")
             df = pd.read_csv(filepath, sep='\t')
+
+            df = _attach_sample_scope(df, row, filepath)
 
             # Standardize columns
             df['sample_number'] = row.get('sample_number', 'unknown')
@@ -636,9 +1059,10 @@ def load_2x300_data(
             # function of a field already carried, so naming them does not change
             # the distinct-id count -- asserted after the load.
             for col in ('plate_polymerase', 'condition', 'amplicon_level',
-                        'trafo_ID', 'sample_listed_polymerase'):
+                        'sample_listed_polymerase'):
                 df[col] = row.get(col) if pd.notna(row.get(col)) else 'NA'
             df['pcr_replicate_id'] = build_pcr_replicate_id(row)
+            df = _stamp_transformation(df, row, trafo_map)
             df['sequencing_run'] = '2x300'
             df['data_source'] = '2x300'
 
@@ -647,16 +1071,9 @@ def load_2x300_data(
             # 40-nt key that cannot join stage 01's 60-nt key.
             df = ensure_donor_bc0_fragment(df, source=str(filepath.name))
 
-            # Select standard columns
-            std_cols = ['counts', 'bc1', 'donor', 'bc0', 'donor_bc0_fragment',
-                       'sample_number', 'outer_primers', 'inner_primers',
-                       'gDNA_plate_name', 'sequencing_date', 'pcr_replicate_id',
-                       # explicit replicate-identity attributes (2026-07-28)
-                       'plate_polymerase', 'condition', 'amplicon_level',
-                       'trafo_ID', 'sample_listed_polymerase',
-                       'sequencing_run', 'data_source']
-            available_cols = [c for c in std_cols if c in df.columns]
-            dfs.append(df[available_cols])
+            # Preserve input sequence/annotation evidence and validated sample
+            # scope; a whitelist previously erased donor/guide/SPS/population.
+            dfs.append(df)
             loaded_files.append(filepath)
 
     # DEFECT 4 FIX (2026-07-28): coverage assertion. Runs BEFORE the empty-result
@@ -710,6 +1127,44 @@ def load_2x300_data(
     return combined, info
 
 
+def _key_row_patterns(row, exact_suffixes, loose_pattern):
+    """Exact ``{date}_{outer}_{sample}{suffix}`` names, or the loose glob only when none can be built.
+
+    A loose ``*_{sample}_*`` glob accepts a single match from any other date or plate, so a
+    row whose own file is absent would silently load another row's file under its metadata.
+    It is used only when the key cannot name the file (no date, outer primers or sample).
+    """
+    fields = [row.get(column) if column in row else None
+              for column in ('sequencing_date', 'outer_primers', 'sample_number')]
+    values = [declared_value(value) for value in fields]
+    if all(value is not None for value in values):
+        # declared_value renders an integer-valued float date (20251125.0) as 20251125.
+        stem = '_'.join(values)
+        return [stem + suffix for suffix in exact_suffixes]
+    if 'sample_number' in row and declared_value(row.get('sample_number')) is not None:
+        return [loose_pattern.format(sample=row['sample_number'])]
+    return []
+
+
+def _claim_physical_file(claims, filepath, row, description):
+    """Register ``filepath`` for one key row; True when it was already loaded for the same row.
+
+    One physical file (the same device and inode, however it is named) loads once. A second
+    key row naming it with different metadata is refused, because loading it again would
+    count its reads twice under two sets of metadata.
+    """
+    status = filepath.stat()
+    identity = (status.st_dev, status.st_ino)
+    metadata = tuple(sorted((str(column), declared_value(value)) for column, value in row.items()))
+    if identity in claims:
+        if claims[identity] != metadata:
+            raise ValueError(f'The combined key names one physical file under conflicting '
+                             f'{description} rows: {filepath}')
+        return True
+    claims[identity] = metadata
+    return False
+
+
 def load_2x150_bc1_donor_bc0_data(
     data_dir: Path,
     keyfile_dir: Path,
@@ -717,6 +1172,7 @@ def load_2x150_bc1_donor_bc0_data(
     debug_mode: bool = False,
     debug_n_samples: int = 4,
     allow_ambiguous: bool = False,
+    require_full_coverage: bool = True,
 ) -> Tuple[pd.DataFrame, DataSourceInfo]:
     """
     Load 2x150 bp bc1-donor-bc0 fragment data.
@@ -724,12 +1180,18 @@ def load_2x150_bc1_donor_bc0_data(
     The 2x150 bp reads capture bc1 + partial donor (donor_bc0_fragment).
     Full donor must be recovered via separate donor-bc0 amplicon.
 
+    Each key row loads its own ``{date}_{outer}_{sample}_bc1_donor_bc0_fragment_counts.tsv`` or
+    nothing; a row naming a file that is not in ``data_dir`` (for example another sequencing
+    run) is logged and skipped. Every fragment table in ``data_dir`` must be named by a row.
+
     Args:
         data_dir: Directory containing processed TSV files
         keyfile_dir: Directory containing keyfiles
         combined_key_name: Name of combined keyfile
         debug_mode: If True, only load a few samples
         debug_n_samples: Number of samples to load in debug mode
+        require_full_coverage: If True (default), raise when a fragment table in
+            ``data_dir`` is named by no key row. Suppressed in debug_mode.
 
     Returns:
         Tuple of (DataFrame, DataSourceInfo)
@@ -747,6 +1209,11 @@ def load_2x150_bc1_donor_bc0_data(
             return pd.DataFrame(), DataSourceInfo("2x150", 0, 0, 0, [])
 
     combined_key = pd.read_csv(keyfile_path, sep='\t')
+    trafo_map = load_transformation_map(keyfile_dir)
+
+    if 'plate_polymerase' not in combined_key and 'polymerase' in combined_key:
+        combined_key = combined_key.rename(columns={'polymerase': 'plate_polymerase'})
+    combined_key['amplicon_level'] = _declared_or_derived_amplicon_level(combined_key)
 
     # Filter to bc1-donor-bc0 amplicons from 2x150 run
     if 'description' in combined_key.columns:
@@ -760,14 +1227,13 @@ def load_2x150_bc1_donor_bc0_data(
 
     dfs = []
     loaded_files = []
+    claims = {}
+    unnamed_rows = []
 
     for _, row in tqdm(combined_key.iterrows(), total=len(combined_key),
                        desc="Loading 2x150 bc1-donor-bc0", disable=len(combined_key) < 10):
-        patterns = []
-        if 'sequencing_date' in row and 'outer_primers' in row and 'sample_number' in row:
-            patterns.append(f"{row['sequencing_date']}_{row['outer_primers']}_{row['sample_number']}_bc1_donor_bc0_fragment_counts.tsv")
-        if 'sample_number' in row:
-            patterns.append(f"*_{row['sample_number']}_*fragment*.tsv")
+        patterns = _key_row_patterns(row, ['_bc1_donor_bc0_fragment_counts.tsv'],
+                                     '*_{sample}_*fragment*.tsv')
 
         # Shared resolver: refuses to guess between multiple glob matches.
         # (2026-07-28 -- same defect class as the 2x300 loader; see
@@ -778,9 +1244,12 @@ def load_2x150_bc1_donor_bc0_data(
             allow_ambiguous=allow_ambiguous,
         )
 
-        if filepath and filepath.exists():
+        if not (filepath and filepath.exists()):
+            unnamed_rows.append(patterns[0] if patterns else f"sample_number={row.get('sample_number')}")
+        elif not _claim_physical_file(claims, filepath, row, 'bc1-donor-bc0'):
             df = pd.read_csv(filepath, sep='\t')
 
+            df = _attach_sample_scope(df, row, filepath)
             df['sample_number'] = row.get('sample_number', 'unknown')
             # Carry replicate-identity fields for the full PCR_plate_name
             # replicate id (gDNA_plate_name, inner_primers, outer_primers,
@@ -789,7 +1258,10 @@ def load_2x150_bc1_donor_bc0_data(
             df['inner_primers'] = row.get('inner_primers') if pd.notna(row.get('inner_primers')) else 'NA'
             df['gDNA_plate_name'] = row.get('gDNA_plate_name') if pd.notna(row.get('gDNA_plate_name')) else 'NA'
             df['sequencing_date'] = row.get('sequencing_date') if pd.notna(row.get('sequencing_date')) else 'NA'
+            for col in ('plate_polymerase', 'condition', 'amplicon_level'):
+                df[col] = row.get(col) if pd.notna(row.get(col)) else None
             df['pcr_replicate_id'] = build_pcr_replicate_id(row)
+            df = _stamp_transformation(df, row, trafo_map)
             df['sequencing_run'] = '2x150'
             df['data_source'] = '2x150'
 
@@ -797,13 +1269,14 @@ def load_2x150_bc1_donor_bc0_data(
             if 'bc0' not in df.columns and 'donor_bc0_fragment' in df.columns:
                 df['bc0'] = df['donor_bc0_fragment'].str[-10:]
 
-            std_cols = ['counts', 'bc1', 'donor_bc0_fragment', 'bc0',
-                       'sample_number', 'outer_primers', 'inner_primers',
-                       'gDNA_plate_name', 'sequencing_date', 'pcr_replicate_id',
-                       'sequencing_run', 'data_source']
-            available_cols = [c for c in std_cols if c in df.columns]
-            dfs.append(df[available_cols])
+            dfs.append(df)
             loaded_files.append(filepath)
+
+    if unnamed_rows:
+        logger.info(f"  {len(unnamed_rows)} combined-key row(s) name no file in {data_dir} "
+                    f"(for example {unnamed_rows[:3]}); they are not loaded")
+    _assert_full_coverage(data_dir, loaded_files, "2x150", glob_pattern="*fragment_counts.tsv",
+                          require_full_coverage=require_full_coverage, debug_mode=debug_mode)
 
     if not dfs:
         logger.warning("No 2x150 bc1-donor-bc0 data files loaded")
@@ -850,6 +1323,8 @@ def load_donor_bc0_lookup(
     Returns:
         DataFrame with columns: donor_bc0_fragment, donor, bc0, counts
     """
+    from ..core.donor_recovery import aggregate_donor_candidates
+    from ..core.merge import SCOPE_COLUMNS, _text
     logger.info("Loading donor-bc0 data for donor recovery...")
 
     keyfile_path = keyfile_dir / combined_key_name
@@ -862,6 +1337,7 @@ def load_donor_bc0_lookup(
             return pd.DataFrame()
 
     combined_key = pd.read_csv(keyfile_path, sep='\t')
+    trafo_map = load_transformation_map(keyfile_dir)
 
     # Filter to donor-bc0 amplicons
     if 'description' in combined_key.columns:
@@ -871,15 +1347,13 @@ def load_donor_bc0_lookup(
         combined_key = combined_key.head(debug_n_samples)
 
     dfs = []
+    registrations = {}
 
     for _, row in tqdm(combined_key.iterrows(), total=len(combined_key),
                        desc="Loading donor-bc0", disable=len(combined_key) < 10):
-        patterns = []
-        if 'sequencing_date' in row and 'outer_primers' in row and 'sample_number' in row:
-            patterns.append(f"{row['sequencing_date']}_{row['outer_primers']}_{row['sample_number']}_complete_donor_bc0_counts.tsv")
-            patterns.append(f"{row['sequencing_date']}_{row['outer_primers']}_{row['sample_number']}_donor_bc0_counts.tsv")
-        if 'sample_number' in row:
-            patterns.append(f"*_{row['sample_number']}_*donor_bc0*.tsv")
+        # A row whose own table is absent loads nothing rather than another date's table.
+        patterns = _key_row_patterns(row, ['_complete_donor_bc0_counts.tsv', '_donor_bc0_counts.tsv'],
+                                     '*_{sample}_*donor_bc0*.tsv')
 
         # Shared resolver: refuses to guess between multiple glob matches.
         # (2026-07-28 -- same defect class as the 2x300 loader; see
@@ -891,10 +1365,30 @@ def load_donor_bc0_lookup(
         )
 
         if filepath and filepath.exists():
+            # One physical file however it is named: a symlink or a hardlink under a
+            # second keyfile row shares the device and inode and is read once.
+            status = filepath.stat()
+            identity = (status.st_dev, status.st_ino)
+            metadata = tuple(_text(row.get(column)) for column in ('sample_number', *SCOPE_COLUMNS, 'SPS'))
+            if identity in registrations:
+                if registrations[identity] != metadata:
+                    raise ValueError(f'Conflicting donor-recovery registration for one physical file: {filepath}')
+                continue
+            registrations[identity] = metadata
             df = pd.read_csv(filepath, sep='\t')
             df['sample_number'] = row.get('sample_number', 'unknown')
-
-            cols = ['counts', 'donor', 'donor_bc0_fragment', 'bc0', 'sample_number']
+            for column in (*SCOPE_COLUMNS, 'SPS'):
+                value = _text(row.get(column))
+                if value is not None:
+                    if column in df and any(_text(item) not in (None, value) for item in df[column]):
+                        raise ValueError(f'Donor-recovery metadata conflicts for {column}: {filepath}')
+                    df[column] = value
+            # Donor candidates pool within a transformation: a pooled outgrowth may recover
+            # from its own transformation's donor-bc0 amplicon (planning 218 patch 45).
+            df = _stamp_transformation(df, row, trafo_map)
+            df['source_file'] = str(filepath.resolve())
+            cols = ['counts', 'donor', 'donor_bc0_fragment', 'bc0', 'sample_number',
+                    *SCOPE_COLUMNS, 'SPS', 'source_file']
             available_cols = [c for c in cols if c in df.columns]
             dfs.append(df[available_cols])
 
@@ -906,9 +1400,20 @@ def load_donor_bc0_lookup(
 
     # Aggregate to create lookup table (NN 250 / D5: support-based and counted, see below)
     logger.info("Aggregating donor-bc0 data into lookup table...")
-    agg_df, _stats = collapse_donor_bc0_lookup(combined)
+    # Rule R* (Kevin 2026-10-24, planning/259 section 7): every candidate is kept, one row per
+    # (scope, fragment, donor, bc0) with its reads summed; recover_full_donors ranks and tiers them per
+    # observation. NN 250 / D5's census is kept as a count, not as a winner-takes-row collapse.
+    agg_df = aggregate_donor_candidates(combined)
+    known = agg_df[agg_df['donor'].notna()] if len(agg_df) else agg_df
+    n_fragments = int(known['donor_bc0_fragment'].nunique()) if len(known) else 0
+    n_multi = int((known.groupby('donor_bc0_fragment')['donor'].nunique() > 1).sum()) if len(known) else 0
+    if n_multi:
+        logger.warning(
+            f"  donor-bc0 lookup: {n_multi:,} of {n_fragments:,} fragments carry >1 distinct donor; all "
+            f"candidates are kept and tiered by support per observation (rule R*, NN 267 section 20.4)")
 
-    logger.info(f"  Created lookup table with {len(agg_df)} unique donor_bc0_fragments")
+    logger.info(f"  Created lookup table with {len(agg_df)} scoped donor candidates; "
+                "num_samples_donor_bc0 counts distinct sample_number labels, not biological replicates")
 
     return agg_df
 
@@ -1042,49 +1547,64 @@ def collapse_donor_bc0_lookup(
 
 def recover_full_donors(
     bc1_df: pd.DataFrame,
-    donor_lookup: pd.DataFrame
+    donor_lookup: pd.DataFrame,
+    is_perfect_donor=None,
 ) -> pd.DataFrame:
     """
     Recover full donor sequences for 2x150 bc1-donor-bc0 data.
 
-    Links bc1-donor-bc0 records to full donors via donor_bc0_fragment.
+    Links bc1-donor-bc0 records to full donors via donor_bc0_fragment, one output row per input row, by
+    rule R* (core/donor_recovery.recover_ranked_donors): the support leader is assigned, every candidate
+    is kept in `donor_recovery_candidate_support`, and `donor_recovery_tier` says how strong the lead is.
 
     Args:
-        bc1_df: DataFrame with bc1 and donor_bc0_fragment columns
-        donor_lookup: Lookup table from load_donor_bc0_lookup()
+        bc1_df: DataFrame with bc1, bc0 and donor_bc0_fragment columns
+        donor_lookup: Candidate table from load_donor_bc0_lookup()
+        is_perfect_donor: optional predicate on a candidate donor; when given, the tier is computed on
+            perfect-donor reads (R* S3)
 
     Returns:
-        DataFrame with donor column added
+        DataFrame with donor and the donor_recovery_* columns added
+
+    Raises:
+        BridgeRecoveredNothing: both tables are non-empty and share no donor_bc0_fragment (NN 250 / C17)
     """
-    if donor_lookup.empty or bc1_df.empty:
-        return bc1_df
+    from ..core.donor_recovery import recover_ranked_donors
+    from ..core.merge import _text
 
-    logger.info("Recovering full donors for 2x150 data...")
+    # 🔴 NN 250 / C17, carried onto the R* route: zero recovery from two NON-EMPTY tables is a FAILURE,
+    # never a result. The R* route labels rows rather than raising, so without this guard a drifted
+    # fragment key (the 40-nt key of C17) would read as a legitimate all-ambiguous cohort. "Recovered
+    # nothing" is decided on the fragment STRINGS: an all-ambiguous cohort, or candidates excluded by scope,
+    # still share fragments with the observations and are results. An empty lookup is a different
+    # condition (NN 240's no-bridge control) and passes through to `no_positive_candidate`.
+    if len(bc1_df) and len(donor_lookup) and 'donor_bc0_fragment' in donor_lookup:
+        observed = {_text(v) for v in bc1_df.get('donor_bc0_fragment', pd.Series(dtype=object))} - {None}
+        offered = {_text(v) for v in donor_lookup['donor_bc0_fragment']} - {None}
+        if observed and offered and not observed & offered:
+            raise BridgeRecoveredNothing(
+                f"the donor-bc0 bridge shares 0 of {len(observed):,} observed donor_bc0_fragments with "
+                f"the {len(offered):,} fragments of the lookup. Both sides are non-empty, so their "
+                f"donor_bc0_fragment keys disagree -- check that both were built by "
+                f"config.build_donor_bc0_fragment (donor[-30:] + SPS + bc0, 60 nt). Refusing to "
+                f"report this as a zero recovery rate (NN 250 / C17).")
 
-    merged = bc1_df.merge(
-        donor_lookup[['donor_bc0_fragment', 'donor']],
-        on='donor_bc0_fragment',
-        how='left'
-    )
-
-    recovered = merged['donor'].notna().sum()
-    total = len(merged)
-    logger.info(f"  Recovered full donor for {recovered}/{total} ({100*recovered/total:.1f}%) entries")
-
-    # 🔴 NN 250 / C17: zero recovery from two NON-EMPTY tables is a FAILURE, never a result.
-    # Both tables having rows while the join produces nothing means the two sides' fragment keys
-    # do not agree -- which is exactly how the drifted 40-nt key presented: as "0.0%" at INFO.
-    # An empty lookup returns early above, so NN 240's no-bridge non-vacuity control is unaffected.
-    if recovered == 0 and total > 0:
-        raise BridgeRecoveredNothing(
-            f"the gdb bridge recovered 0 of {total:,} donors while the lookup held "
-            f"{len(donor_lookup):,} fragments. Both sides are non-empty, so their "
-            f"donor_bc0_fragment keys disagree -- check that both were built by "
-            f"config.build_donor_bc0_fragment (donor[-30:] + SPS + bc0, 60 nt). Refusing to "
-            f"report this as a zero recovery rate (NN 250 / C17)."
-        )
-
-    return merged
+    logger.info("Recovering full donors for 2x150 data (rule R*: ranked, tiered, candidates kept)...")
+    result = recover_ranked_donors(bc1_df, donor_lookup, is_perfect_donor=is_perfect_donor)
+    if len(result):
+        status = result['donor_recovery_status'].value_counts().to_dict()
+        tier = result['donor_recovery_tier'].value_counts().to_dict()
+        basis = 'perfect-donor reads' if is_perfect_donor is not None else 'all reads'
+        logger.info(f"  donor recovery over {len(result):,} input BDB rows: status {status}; "
+                    f"tier ({basis}) {tier}")
+        if is_perfect_donor is not None and 'donor_recovery_perfect_reads' in result:
+            assigned = result['donor_recovery_status'].isin(['recovered_unique', 'recovered_by_support'])
+            if assigned.any() and not (result.loc[assigned, 'donor_recovery_perfect_reads'] > 0).any():
+                logger.warning(
+                    "  no assigned donor is a perfect design donor: the perfect-donor tier is empty, which "
+                    "usually means the candidate donors and the design donors are not in the same frame "
+                    "(trim) rather than that no read is perfect")
+    return result
 
 
 #: Columns searched, in order, for per-row read support when collapsing the gdb bridge.
@@ -1189,7 +1709,8 @@ def load_gdb_data(
     logger.info("Loading guide-donor-bc0 data...")
 
     # Find gdb files
-    gdb_files = list(gdb_dir.glob("*guide_donor_bc0*.tsv")) + list(gdb_dir.glob("*gdb*.tsv"))
+    gdb_files = sorted(set(gdb_dir.glob("*guide_donor_bc0*.tsv")) |
+                       set(gdb_dir.glob("*gdb*.tsv")))
 
     if not gdb_files:
         logger.warning(f"No gdb files found in {gdb_dir}")
@@ -1257,6 +1778,7 @@ def load_all_data_sources(
     config,
     debug_mode: bool = False,
     debug_n_samples: int = 4,
+    is_perfect_donor=None,
 ) -> Dict[str, Tuple[pd.DataFrame, DataSourceInfo]]:
     """
     Load all available data sources based on configuration.
@@ -1265,6 +1787,8 @@ def load_all_data_sources(
         config: PipelineConfig object with data source paths
         debug_mode: If True, only load subset of data
         debug_n_samples: Number of samples to load in debug mode
+        is_perfect_donor: optional predicate passed to recover_full_donors, so the 2x150 donor
+            recovery tiers its leads on perfect-donor reads (rule R* S3)
 
     Returns:
         Dict mapping source name to (DataFrame, DataSourceInfo) tuple
@@ -1314,7 +1838,7 @@ def load_all_data_sources(
 
         # Recover full donors
         if not df_bc1.empty and not donor_lookup.empty:
-            df_bc1 = recover_full_donors(df_bc1, donor_lookup)
+            df_bc1 = recover_full_donors(df_bc1, donor_lookup, is_perfect_donor=is_perfect_donor)
 
         if not df_bc1.empty:
             results['2x150'] = (df_bc1, info_bc1)

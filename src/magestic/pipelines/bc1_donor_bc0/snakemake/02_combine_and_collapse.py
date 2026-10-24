@@ -33,7 +33,8 @@ Usage (manifest mode -- the rebuild path):
 
 Manifest columns: required ``sample_id parsed_path sequencing_date sample_number
 outer_primers``; replicate-identity fields ``gDNA_plate_name inner_primers
-plate_polymerase condition amplicon_level`` (absent -> "NA", warned); optional
+plate_polymerase condition amplicon_level`` (absent, blank or "NA" -> missing, warned;
+a missing amplicon_level is derived from trafo_ID as the loaders do); optional
 passthrough ``trafo_ID V_library nuclease_PAM yeast_sublibrary``.
 
 Legacy mode (one run): --parsed-dir --sample-key --plate-key --run-date [--trafo-key].
@@ -56,7 +57,8 @@ from rapidfuzz.distance import Levenshtein as _lev
 
 from magestic.utils.bc1_extraction import TIER_COUNT_COLUMNS, BC1_ORIENTATION
 from magestic.pipelines.bc1_donor_bc0.readers.data_loader import (
-    PCR_REPLICATE_ID_FIELDS, build_pcr_replicate_id)
+    PCR_REPLICATE_ID_FIELDS, _cross_merge_keys, build_pcr_replicate_id, declared_value,
+    derive_amplicon_level)
 from magestic.pipelines.bc1_donor_bc0.core.link_collapse import (
     aggregate_links, collapse_links, attach_short_donors, merge_orphan_bc1,
     mask_columns, masks_for_codes, popcount_rows, decode_masks)
@@ -100,7 +102,13 @@ def build_manifest(args) -> pd.DataFrame:
         plate_key = pd.read_csv(args.plate_key, sep="\t", dtype=str, keep_default_na=False)
         sample_key = pd.read_csv(args.sample_key, sep="\t", dtype=str, keep_default_na=False)
         plate_key = plate_key[plate_key["description"] == "bc1-donor-bc0"]
-        man = plate_key.merge(sample_key, how="cross")
+        # Same explicit renames and shared-column resolution as the 2x300 loader, so both
+        # producers read one pair of keyfiles into the same declarations.
+        plate_key = plate_key.rename(columns={"polymerase": "plate_polymerase",
+                                              "plate_category": "plate_category_from_plate_key"})
+        sample_key = sample_key.rename(columns={"polymerase": "sample_listed_polymerase",
+                                                "plate_category": "plate_category_from_sample_key"})
+        man = _cross_merge_keys(plate_key, sample_key)
         man["sequencing_date"] = args.run_date
         man["sample_id"] = (args.run_date + "_" + man["outer_primers"].astype(str)
                             + "_" + man["sample_number"].astype(str))
@@ -137,18 +145,24 @@ def build_manifest(args) -> pd.DataFrame:
 
     absent = [f for f in PCR_REPLICATE_ID_FIELDS if f not in man.columns]
     for f in absent:
-        man[f] = "NA"
+        man[f] = ""
     if absent:
-        log(f"WARNING: replicate-identity fields absent from the input definition, set to NA: {absent}")
-    gd = man["gDNA_plate_name"].replace("", "NA")
-    if (gd == "NA").any():
+        log(f"WARNING: replicate-identity fields absent from the input definition, treated as missing: {absent}")
+    # A missing amplicon_level is derived from trafo_ID, as both loaders derive it.
+    trafo = man["trafo_ID"] if "trafo_ID" in man.columns else pd.Series("", index=man.index)
+    man["amplicon_level"] = [
+        level if declared_value(level) is not None else derive_amplicon_level(declared_value(t))
+        for level, t in zip(man["amplicon_level"], trafo)]
+    no_prep = man["gDNA_plate_name"].map(declared_value).isna()
+    if no_prep.any():
         # review F6: partial blanks were silent; two different preps sharing primers + well
         # would then collapse to ONE replicate id.
-        log(f"WARNING: gDNA_plate_name unavailable for {int((gd == 'NA').sum())}/{len(man)} samples "
-            f"(e.g. {man.loc[gd == 'NA', 'sample_id'].tolist()[:5]}) -> the re-prep guard is inactive "
+        log(f"WARNING: gDNA_plate_name unavailable for {int(no_prep.sum())}/{len(man)} samples "
+            f"(e.g. {man.loc[no_prep, 'sample_id'].tolist()[:5]}) -> the re-prep guard is inactive "
             f"for them; an independent re-prep that reused the same primers would count as ONE replicate.")
-    man["pcr_replicate_id"] = man.apply(lambda r: build_pcr_replicate_id(
-        {k: (r[k] if r[k] != "" else None) for k in PCR_REPLICATE_ID_FIELDS}), axis=1)
+    # The shared builder normalizes blanks and NA spellings to missing, so this producer and
+    # the loaders encode the same declared PCR identically.
+    man["pcr_replicate_id"] = man.apply(build_pcr_replicate_id, axis=1)
 
     missing_files = [p for p in man["parsed_path"] if not Path(p).is_file()]
     if missing_files:
@@ -158,6 +172,12 @@ def build_manifest(args) -> pd.DataFrame:
         log(f"WARNING: {len(missing_files)} parsed files missing -- proceeding (--allow-missing): "
             f"{missing_files[:5]}")
     man["present"] = [Path(p).is_file() for p in man["parsed_path"]]
+    if "_key_conflicts" in man.columns:
+        conflicted = man["present"] & (man["_key_conflicts"] != "")
+        if conflicted.any():
+            die(f"plate_key and sample_key declare conflicting values for present samples: "
+                f"{man.loc[conflicted, ['sample_id', '_key_conflicts']].head(5).values.tolist()}")
+        man = man.drop(columns="_key_conflicts")
     return man
 
 

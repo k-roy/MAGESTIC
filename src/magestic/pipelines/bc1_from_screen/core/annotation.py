@@ -30,6 +30,12 @@ from magestic.utils.oligo_annotations import (
 
 logger = logging.getLogger(__name__)
 
+# One-row-per-bc1 reference projection and its status vocabulary, shared with step 07.
+from magestic.pipelines.bc1_from_screen.reference_projection import (  # noqa: E402
+    ANNOTATION_STATUS_COL, STATUS_AMBIGUOUS_REFERENCE, STATUS_ANNOTATED,
+    STATUS_BC1_NOT_IN_REFERENCE, STATUS_NO_OLIGO_IN_REFERENCE, STATUS_OLIGO_NOT_IN_REGISTRY,
+    project_bc1_reference)
+
 # Cache for annotation lookups
 _ANNOTATION_CACHE: Optional[Dict[str, dict]] = None
 
@@ -291,31 +297,69 @@ def annotate_deseq2_results(
     """
     Annotate DESeq2 results with variant information.
 
+    bc1-keyed results (step 11 writes no oligo column) are first joined to oligo
+    names through :func:`project_bc1_reference`, one row per bc1, and then to the
+    design registry. Every join is many-to-one, so the output has exactly one row
+    per input row; unmatched rows are kept with an ``annotation_status``.
+
     Args:
         deseq2_df: DESeq2 results DataFrame
         annotation_df: Optional pre-loaded annotation DataFrame.
             If None, loads from harmonized table.
-        bc1_ref_df: Optional BC1 reference table for additional info
+        bc1_ref_df: Optional BC1 reference table (bc1 -> oligo_name)
         oligo_col: Column name containing oligo names
 
     Returns:
         Annotated DataFrame
     """
     logger.info(f"Annotating DESeq2 results ({len(deseq2_df)} rows)...")
+    n_in = len(deseq2_df)
 
     # Load annotations if not provided
     if annotation_df is None:
         annotation_df = create_annotation_lookup()
 
-    # Merge with annotations
-    annotated = deseq2_df.merge(
-        annotation_df,
-        on=oligo_col,
-        how='left'
-    )
+    # bc1-keyed results are joined to oligo names through a one-row-per-bc1
+    # projection BEFORE the design annotation join.
+    projected = False
+    if oligo_col not in deseq2_df.columns:
+        if bc1_ref_df is None or "bc1" not in deseq2_df.columns:
+            raise ValueError(f"results lack {oligo_col!r}; pass bc1_ref_df to join bc1 -> {oligo_col} first")
+        if not deseq2_df["bc1"].is_unique:
+            dup = deseq2_df.loc[deseq2_df["bc1"].duplicated(), "bc1"].unique()[:5]
+            raise ValueError(f"results repeat bc1 values, e.g. {list(dup)}; expected one row per bc1")
+        deseq2_df = deseq2_df.merge(project_bc1_reference(bc1_ref_df, oligo_col),
+                                    on="bc1", how="left", validate="many_to_one")
+        deseq2_df[ANNOTATION_STATUS_COL] = deseq2_df[ANNOTATION_STATUS_COL].fillna(STATUS_BC1_NOT_IN_REFERENCE)
+        deseq2_df["bc1_reference_n_oligos"] = deseq2_df["bc1_reference_n_oligos"].fillna(0).astype(int)
+        projected = True
 
-    # Add BC1 reference info if provided
-    if bc1_ref_df is not None and 'bc1' in deseq2_df.columns:
+    # Design annotation: only the oligos in use, exact duplicate rows dropped,
+    # conflicting duplicates refused, then a many-to-one join (no row multiplication).
+    in_use = deseq2_df[oligo_col].dropna().unique()
+    registry = annotation_df[annotation_df[oligo_col].isin(in_use)].drop_duplicates()
+    clash = registry.loc[registry[oligo_col].duplicated(), oligo_col].unique()
+    if len(clash):
+        raise ValueError(f"annotation registry has conflicting rows for {len(clash)} oligo(s) in use, "
+                         f"e.g. {sorted(map(str, clash))[:5]}")
+    annotated = deseq2_df.merge(registry, on=oligo_col, how="left",
+                                validate="many_to_one", indicator="_registry_row")
+    if projected:
+        demote = (annotated[ANNOTATION_STATUS_COL] == STATUS_ANNOTATED) & (annotated["_registry_row"] == "left_only")
+        annotated.loc[demote, ANNOTATION_STATUS_COL] = STATUS_OLIGO_NOT_IN_REGISTRY
+    annotated = annotated.drop(columns="_registry_row")
+
+    # Step 14's synonymous null and step 13's own summary key on the harmonized name
+    # (14_hit_calling.py, 13_annotate_results.py); the legacy rename emits only variant_type.
+    if "codon_variant_type" not in annotated.columns and "variant_type" in annotated.columns:
+        annotated["codon_variant_type"] = annotated["variant_type"]
+
+    if len(annotated) != n_in:
+        raise AssertionError(f"annotation changed the row count {n_in} -> {len(annotated)}")
+
+    # Add BC1 reference info if provided for oligo-labelled results
+    # (bc1-keyed results already went through the projection above).
+    if bc1_ref_df is not None and not projected and 'bc1' in deseq2_df.columns:
         bc1_cols = ['bc1', 'library_ID', 'yeast_sublibrary', 'bc1_purity', 'num_PCR_replicates']
         available_cols = [c for c in bc1_cols if c in bc1_ref_df.columns]
         if available_cols:

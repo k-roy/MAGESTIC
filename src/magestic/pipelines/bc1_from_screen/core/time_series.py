@@ -57,7 +57,8 @@ class TimeSeriesConfig:
     """Configuration for time series / fitness slope validation.
 
     Attributes:
-        min_timepoints: Minimum timepoints required for slope calculation.
+        min_timepoints: Minimum distinct generations required for slope calculation (replicate
+            rows of one generation count once).
         min_r2_for_validation: Minimum R² for time_series_validated flag.
         min_monotonic_score: Minimum fraction of timepoints following expected trend.
         require_direction_consistent: All non-zero timepoints must have same sign.
@@ -197,15 +198,18 @@ def analyze_time_series_for_variant(
         extract_generation_from_comparison
     )
     variant_df = variant_df[variant_df["generation"].notna()].copy()
+    # A timepoint is a generation; replicate rows of one generation are observations, not timepoints.
+    n_generations = int(variant_df["generation"].nunique())
 
-    if len(variant_df) < ts_config.min_timepoints:
+    if n_generations < ts_config.min_timepoints:
         return {
             "fitness_slope": np.nan,
             "fitness_slope_r2": np.nan,
             "monotonic_score": np.nan,
             "direction_consistent": False,
             "time_series_validated": False,
-            "n_timepoints": len(variant_df),
+            "n_timepoints": n_generations,
+            "n_observations": len(variant_df),
         }
 
     # Sort by generation
@@ -265,7 +269,8 @@ def analyze_time_series_for_variant(
         "monotonic_score": monotonic_score,
         "direction_consistent": direction_consistent,
         "time_series_validated": time_series_validated,
-        "n_timepoints": len(variant_df),
+        "n_timepoints": n_generations,
+        "n_observations": len(variant_df),
     }
 
 

@@ -160,6 +160,16 @@ def main():
     # Load all per-comparison hit files
     hits_df = load_all_hit_files(args.input_dir)
 
+    # These are the columns run_all_aggregations dereferences unconditionally. Numbered
+    # step 14 writes BC1-level rows; no step yet produces the variant-level schema.
+    required = [args.variant_col, args.comparison_col, "mean_log2fc", "concordance_fraction",
+                "within_variant_cv", "is_significant", "z_score", "n_bc1", "category", "codon_variant_type"]
+    missing = [c for c in required if c not in hits_df.columns]
+    if missing:
+        sys.exit(f"Step 15 aggregates VARIANT-level hit tables; the input lacks {missing}. "
+                 "Numbered step 14 writes BC1-level rows and no step yet produces the variant-level "
+                 "schema (SCR-D07, deferred contract).")
+
     # Summary statistics
     n_comparisons = hits_df[args.comparison_col].nunique()
     n_variants = hits_df[args.variant_col].nunique()
@@ -256,10 +266,10 @@ def main():
         tier_agg = results["tier"]
         stats["n_cross_tier_validated"] = int(tier_agg["cross_tier_validated"].sum())
         stats["n_tier1_only"] = int(
-            (tier_agg["tier1_significant"] & ~tier_agg["tier2_significant"]).sum()
+            (tier_agg["abundance_high_significant"] & ~tier_agg["abundance_medium_significant"]).sum()
         )
         stats["n_tier2_only"] = int(
-            (tier_agg["tier2_significant"] & ~tier_agg["tier1_significant"]).sum()
+            (tier_agg["abundance_medium_significant"] & ~tier_agg["abundance_high_significant"]).sum()
         )
 
     # Add nuclease-library aggregation stats
