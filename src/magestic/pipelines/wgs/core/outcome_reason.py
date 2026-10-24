@@ -56,6 +56,7 @@ from .gvcf_adapter import window_reference_coverage
 
 __all__ = [
     "REASON_BLOCKS_NOT_EXPANDED",
+    "REASON_COVERED_BUT_WITHHELD",
     "REASON_GVCF_ABSENT",
     "REASON_INSTALLED",
     "REASON_PARTIAL",
@@ -78,13 +79,14 @@ REASON_UNEDITED_COVERED = "unedited_quantification_window_covered"
 #: Indeterminate outcomes (`callable_ is False`). Each names a DIFFERENT cause.
 REASON_QWIN_UNCOVERED = "uncallable_quantification_window_uncovered"
 
-#: 🔴 The reason that keeps this module from contradicting its own numbers.
-#: TRACE's `flag_covered` compares only POS, so an UNEXPANDED compressed gVCF yields
-#: `unknown` even when its reference blocks cover the whole window (defect 5). Without
-#: this value, `explain_outcome` would print "window uncovered" beside "covered 10/10"
-#: — a reason that argues with its own evidence, which is a new silent defect rather
-#: than a fix. The remedy is `gvcf_adapter.expand_reference_blocks`, named in the
-#: string so the reader knows what to do.
+#: 🔴 The reason that keeps this module from contradicting its own numbers: the window
+#: IS covered by TRACE's own depth rule, yet TRACE withheld the call (for example an
+#: uncovered designed base outside the window, or an ambiguous genotype). Without it,
+#: `explain_outcome` would print "window uncovered" beside "covered 10/10".
+REASON_COVERED_BUT_WITHHELD = "uncallable_window_covered_but_trace_withheld_the_call"
+#: RETIRED by planning/268, never emitted now. TRACE `7c4c10f` ignored `END`, so a
+#: covered compressed gVCF read `unknown` until `expand_reference_blocks` ran. The pinned
+#: TRACE reads `END` (with `MIN_DP`) itself, and the coverage count here follows its rule.
 REASON_BLOCKS_NOT_EXPANDED = "uncallable_gvcf_reference_blocks_not_expanded"
 REASON_GVCF_ABSENT = "uncallable_gvcf_absent"
 REASON_VCF_ABSENT = "uncallable_vcf_absent"
@@ -213,13 +215,12 @@ def explain_outcome(
         # 🔴 The reason is derived from the COVERAGE, not restated from the flag.
         # Deriving it from the flag would make this function unable to disagree with
         # TRACE, and a test that it "agrees" would then be a tautology proving nothing.
-        # The two genuinely differ in exactly one case: an unexpanded compressed gVCF,
-        # where TRACE says `unknown` (it compares only POS) while the END-aware count
-        # says the window IS covered. That case gets its own reason and names the fix.
+        # Where the window is covered by TRACE's own depth rule and TRACE still says
+        # `unknown`, the call was withheld for another reason, and is named as such.
         required = quantification_window_size * quantification_window_cov_perc
         if covered >= required and required > 0:
             return OutcomeExplanation(
-                flag=base, reason=REASON_BLOCKS_NOT_EXPANDED, callable_=False, **common
+                flag=base, reason=REASON_COVERED_BUT_WITHHELD, callable_=False, **common
             )
         return OutcomeExplanation(
             flag=base, reason=REASON_QWIN_UNCOVERED, callable_=False, **common

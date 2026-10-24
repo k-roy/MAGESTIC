@@ -147,7 +147,10 @@ def test_real_stage2_entrypoint_with_plate_split_donor_join_axis_and_fanin(stage
     lines=out.read_text().splitlines()
     assert lines[0] == '# synthetic_error_axis=disabled'
     assert len(lines) == 3
-    assert lines[2].split('\t') == ['s','designed_variant_installed',f'{CHROM}_20_A_to_C','','','[]']
+    # planning/268 merge: TRACE's six columns, then the 222 lane's appended outcome-reason
+    # columns (step_2.OUTCOME_REASON_COLUMNS), which step_5 passes through by name.
+    assert lines[1].split('\t')[6:] == list(stage.OUTCOME_REASON_COLUMNS)
+    assert lines[2].split('\t')[:6] == ['s','designed_variant_installed',f'{CHROM}_20_A_to_C','','','[]']
     assert sheets.read_axis_stamp(out) == 'disabled'
 
 
@@ -237,7 +240,8 @@ def test_cohort_preparation_batches_and_cached_restart_avoids_scans(stage_case, 
     monkeypatch.setattr(d,'load_fasta',load_count)
     out = stage.run_step_2(config)
     first = out.read_bytes()
-    assert first.decode().splitlines()[2:] == [
+    # TRACE's six columns; the appended outcome-reason columns follow (planning/268).
+    assert ['\t'.join(ln.split('\t')[:6]) for ln in first.decode().splitlines()[2:]] == [
         f's\tdesigned_variant_installed\t{CHROM}_20_A_to_C\t\t\t[]',
         't\tdesigned_variant_unedited\t\t\t\t[]',
     ]
@@ -318,7 +322,7 @@ def test_empirical_synthetic_axis_actual_stage(stage_case):
     config=replace(config,donor_precall=replace(config.donor_precall,synthetic_donor_source='synthetic_donor'))
     lines=stage.run_step_2(config).read_text().splitlines()
     assert lines[0]=='# synthetic_error_axis=enabled'
-    assert lines[2].split('\t')==['s','designed_variant_installed;synthetic_error_installed',
+    assert lines[2].split('\t')[:6]==['s','designed_variant_installed;synthetic_error_installed',
                                   f'{CHROM}_20_A_to_C',f'{CHROM}_15_A_to_G','','[]']
 
 

@@ -409,19 +409,6 @@ class WGSDonorPrecallConfig:
     """Per-plate multi-sample VCFs to split into the per-sample layout. Empty means
     Stage 2 has no input and must fail loudly rather than emit an empty table."""
 
-    resolve_underscore_contigs: bool = True
-    """Resolve GATE 3 with `core/contig_alias.ContigAlias` instead of refusing.
-
-    NN 251 defect 3. TRACE's `precall_sample` re-parses its own variant id with a
-    positional `split("_")`, so **4 of the 5 contigs the WGS reference-mapping policy
-    mandates crash it**. `True` (the default) encodes every contig name TRACE sees to
-    an underscore-free alias and DECODES the variant ids before the shard is
-    published, so no aliased name reaches a shipped table; `False` restores the old
-    unconditional `GateError`.
-
-    The alias is a no-op on an already-safe reference, so an underscore-free cohort
-    runs byte-identically either way."""
-
     min_allele_fraction: float | None = None
     """Rescue a reference-GT record whose AD-derived allele fraction clears this.
 
@@ -528,13 +515,15 @@ class WGSReconcileConfig:
     inverts every per-cell call **while the apparent aggregate rate lands on exactly
     truth** (per-cell accuracy 0.0%), so only a per-site check can detect it.
 
-    Since the TRACE pin moved to the allele-specific scorer (`planning/268`), a site is
-    scored only from its declared `intended_variants`, whose REF TRACE validates against
-    the FASTA; a site without them is `unassessed`, which a wrong frame cannot invert.
-    So a table with NO `wt_seq` column is recorded as `frame_unverified_no_wt_seq` in
-    the audit sidecar rather than refused. When `wt_seq` IS present, every window is
-    verified with `core.window_table.verify_window_frame`; `True` refuses a mismatch or an
-    empty `wt_seq`, `False` records them as accepted-unverified."""
+    Since planning/268 a window that declares `intended_variants` is scored by TRACE's
+    allele-specific scorer, which validates each REF against the FASTA, so a wrong frame
+    cannot invert it. A window that declares none is scored from read evidence against
+    `fasta.fetch` (`core.edit_profile`), where it can. So `True` refuses a table with NO
+    `wt_seq` column only when some window declares no intended allele, and otherwise
+    records `frame_unverified_no_wt_seq` in the audit sidecar. When `wt_seq` IS present
+    every window is verified with `core.window_table.verify_window_frame`; `True` refuses
+    a mismatch or an empty `wt_seq`. `False` records each case as accepted-unverified,
+    never a silent pass."""
 
     strict_window_table: bool = False
     """Also refuse a window table that repeats an oligo row.
@@ -561,8 +550,10 @@ class WGSReconcileConfig:
     """Oligo-window table (`oligo_name`, `chrom`, `donor_start_coord`,
     `donor_end_coord`, optional `intended_variants` JSON `[{pos, ref, alt}]` in the BAM
     reference frame, optional `wt_seq` / `design_donor`). TRACE's `load_oligo_windows`
-    refuses a malformed or conflicting row. A window without `intended_variants` is
-    scored `unassessed`, never `NO_EDIT`: no real table carries that column yet."""
+    refuses a malformed or conflicting row. A window with `intended_variants` is scored
+    by TRACE per allele; one without is scored from its read evidence, gated at the
+    designed base when `wt_seq` + `design_donor` give it and at the window minimum
+    otherwise, and flagged `WINDOW_EVIDENCE_NO_INTENDED_ALLELES` (planning/268)."""
 
     oligo_assignments: Path | None = None
     """Per-sample oligo assignment (`sample` -> one or more `oligo_name`), the input that

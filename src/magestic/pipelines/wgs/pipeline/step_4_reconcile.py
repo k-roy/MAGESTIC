@@ -1,17 +1,19 @@
-"""Stage 4: explicit intended-allele reconciliation with measured bc1 multiplicity.
+"""Stage 4: per-window edit reconciliation with measured bc1 multiplicity.
 
-Windows without intended variants are unassessed compatibility evidence. Explicit
-sample assignments take precedence over bridge-derived candidate sites. Shared
-windows, assignments and the bridge are loaded once per direct cohort run.
+Windows with intended variants are scored per allele by TRACE; windows without them
+are scored from their read evidence. Explicit sample assignments take precedence over
+bridge-derived candidate sites. Shared windows, assignments and the bridge are loaded
+once per direct cohort run.
 
 Merged in planning/268 with the 222 lane (NN 251/255). Kept from it: the window-table
 denominators (defect 12), logged before TRACE's loader refuses a bad row; the reference-
 frame check against `wt_seq` when the table carries one (defect 10); the BAM/reference
 consistency check (defect 14 / F3b); and the per-sample audit sidecars that make a check
-that did not run countable (F10). Retired: the `core.edit_profile` depth-gated scorer and
-the `bc_confidence`-renamed writer, because scoring is TRACE's allele-specific
-`score_edit_site` and its `confidence` already falls for unassessed, uncovered or
-incomplete sites.
+that did not run countable (F10). Scoring is per window (`core.reconcile_driver.score_sites`):
+TRACE's allele-specific `score_edit_site` where the window declares `intended_variants`, and
+the 222 lane's depth-gated `core.edit_profile` classifier on the read evidence where it does
+not, because an intended edit is not required to assign confidence to a WGS call (Kevin,
+2026-10-24). Retired: the `bc_confidence`-renamed writer; the shard is TRACE's schema.
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ from ..core.reconcile_driver import load_oligo_windows, reconcile_sample
 from ..core.window_table import (
     FrameMismatchError,
     WindowAudit,
+    designed_positions_by_oligo,
     load_windows_audited,
     verify_window_frame,
 )
@@ -236,9 +239,15 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
     if cache_valid([out], key):
         logger.info("step_4: %s verified complete — skipping", sample)
         return out
-    _check_reference_frame(config, record, inputs.audit)
+    undeclared = {o for o, w in inputs.windows.items() if not getattr(w, "intended_alleles", ())}
+    orientations = _check_reference_frame(config, record, inputs.audit, undeclared=undeclared)
     _check_reference_consistency(config, record)
     _write_audit_sidecar(config, sample)
+    # 🔴 NN 251 defects 6 + 11 for windows that declare no intended allele: they are
+    # scored from read evidence, gated at the designed base when the frame-verified
+    # `wt_seq` + `design_donor` give it, else at the window minimum (planning/268).
+    designed = (designed_positions_by_oligo(inputs.audit, orientations=orientations)
+                if inputs.audit is not None else {})
 
     sidecar = step_1_bc1_call.ensure_locus_sidecar(config)
     genome_track, plasmid_track = build_tracks(
@@ -271,6 +280,7 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
             assigned_oligos=inputs.assignments[sample] if inputs.assignments is not None else None,
             allele_bam=allele_bam,
             read_source_flags=("DONOR_CLEANED_READS" if uses_cleaned_reads(config) else "RAW_DONOR_READS",),
+            designed_positions=designed,
         )
 
     with atomic(out) as tmp:
@@ -292,7 +302,8 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
 
 
 def _check_reference_frame(
-    config: WGSConfig, record: WGSSample, audit: WindowAudit | None
+    config: WGSConfig, record: WGSSample, audit: WindowAudit | None,
+    *, undeclared: set[str] | None = None,
 ) -> dict[str, str]:
     """Verify every scored window against the design's `wt_seq` (NN 251 defect 10).
 
@@ -315,11 +326,12 @@ def _check_reference_frame(
     rather than passing. A guard that silently does not run is the failure mode this
     whole exercise is about.
 
-    Merge note (planning/268): a table with no `wt_seq` column is RECORDED, not refused.
-    The pinned TRACE scores a site only from its declared `intended_variants`, validating
-    each REF against the FASTA, and scores an undeclared site `unassessed`; neither can
-    be inverted by a wrong frame. This check still runs, and `require_frame_check` still
-    refuses a mismatch, whenever `wt_seq` is present.
+    Merge note (planning/268): a window that declares `intended_variants` has every REF
+    validated against the FASTA by TRACE, so a wrong frame cannot invert it. A window
+    that declares none is scored from read evidence against `fasta.fetch`, where it can.
+    So a table with no `wt_seq` column is refused under `require_frame_check` only when
+    `undeclared` (the oligos with no intended allele) is non-empty, and is recorded
+    otherwise. `undeclared=None` means "assume every window is undeclared".
 
     Returns
     -------
@@ -333,13 +345,23 @@ def _check_reference_frame(
                        "reference frame was not checked", record.sample)
         return orientations
     if not audit.has_wt_seq:
-        logger.warning(
-            "step_4: NOT VERIFIED: the window table %s has no `wt_seq` column, so the "
-            "reference frame cannot be checked (%s). Scoring is unaffected: only sites "
-            "with REF-validated `intended_variants` are scored, and the rest are "
-            "`unassessed`. Recorded as frame_unverified_no_wt_seq.",
-            audit.path.name, audit.frame_status,
+        exposed = sorted(undeclared) if undeclared is not None else sorted(audit.windows)
+        message = (
+            f"step_4: the window table {audit.path.name} has no `wt_seq` column, so "
+            f"the reference frame CANNOT be verified ({audit.frame_status}), and "
+            f"{len(exposed)} window(s) declare no intended allele and are scored from "
+            "read evidence against the reference. A wrong frame inverts every such "
+            "per-cell call while leaving the aggregate rate on top of truth, so the rate "
+            "cannot detect it. Add `wt_seq` (or `intended_variants`) to the window "
+            "table, or set reconcile.require_frame_check=False to accept unverified "
+            "calls and have the refusal recorded instead."
         )
+        if config.reconcile.require_frame_check and exposed:
+            raise StepIncompleteError(message)
+        logger.warning("%s", message if exposed else (
+            f"step_4: the window table {audit.path.name} has no `wt_seq` column; every "
+            "window declares REF-validated intended alleles, so the frame is checked by "
+            "TRACE instead. Recorded as frame_unverified_no_wt_seq."))
         # 🔴 This branch is the REAL COHORT's case (the design table has no `wt_seq`),
         # and the first NN 255 attempt returned here BEFORE recording anything — so
         # `frame_unverified_no_wt_seq` would have shipped 0 for a run in which not one

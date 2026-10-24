@@ -117,6 +117,7 @@ TAU_FULL = 0.85
 TAU_WT = 0.15
 MIN_COV = 4
 MIN_BASE_QUAL = 13
+MIN_MAPQ = 20  # the pinned TRACE's `window_edit_vaf` default; MAPQ 255 is always rejected
 
 #: Evidence tiers. Depth boundaries, nothing cleverer, and stated so a reader of the
 #: shipped column knows exactly what it means.
@@ -128,10 +129,13 @@ EVIDENCE_MODERATE_DEPTH = 20
 class PositionCount:
     """Non-reference evidence at one window position.
 
-    `depth` is `len(col.pileups)` as TRACE counts it (every read in the column,
-    including deletions and ref-skips), so `n_nonref / depth` reproduces TRACE's VAF
-    exactly. A position the pileup never visited is present with `depth=0` rather
-    than absent, which is what makes `min_depth` meaningful.
+    `depth` counts reads as the pinned TRACE's `window_edit_vaf` does (planning/268):
+    primary, mapped, non-duplicate, QC-passing reads with 20 <= MAPQ < 255, deletions
+    included, ref-skips and non-ACGT bases excluded. So `n_nonref / depth` reproduces
+    TRACE's VAF exactly. A ref-skip is a MISSING observation, never an alternate
+    allele: it is counted in `n_ref_skip` and nowhere else. A position the pileup never
+    visited is present with `depth=0` rather than absent, which is what makes
+    `min_depth` meaningful.
     """
 
     pos: int
@@ -144,7 +148,7 @@ class PositionCount:
 
     @property
     def n_nonref(self) -> int:
-        return self.n_substitution + self.n_deletion + self.n_insertion + self.n_ref_skip
+        return self.n_substitution + self.n_deletion + self.n_insertion
 
     @property
     def vaf(self) -> float:
@@ -161,7 +165,6 @@ class PositionCount:
             VARIANT_SUBSTITUTION: self.n_substitution,
             VARIANT_DELETION: self.n_deletion,
             VARIANT_INSERTION: self.n_insertion,
-            VARIANT_REF_SKIP: self.n_ref_skip,
         }
         top = max(parts.values())
         if top == 0:
@@ -292,10 +295,11 @@ class ScoredSite:
     """A `SiteCall` that also records WHY, and WHAT KIND of variant.
 
     🔴 **Duck-compatible with `trace_crispr.wgs.reconcile.SiteCall` on purpose.**
-    `reconcile_cell` reads only `.status`; `reconciliation_to_row` reads `.site`,
-    `.vaf`, `.cov` and `.status`. Carrying the same four attributes means this can be
-    handed straight to TRACE's own aggregation and emit code, so the extra fields are
-    additive and nothing in TRACE needs to change.
+    `reconcile_cell` reads `.status`, `.flags` and `.allele_evidence`;
+    `reconciliation_to_row` reads `.site`, `.vaf`, `.cov`, `.status` and
+    `.allele_evidence`. Carrying the same attributes means this can be handed straight
+    to TRACE's own aggregation and emit code, so the extra fields are additive and
+    nothing in TRACE needs to change.
 
     `vaf` and `cov` are TRACE's `window_edit_vaf` values unchanged, so the headline
     numbers in an existing table do not move. `status` MAY differ from
@@ -313,6 +317,10 @@ class ScoredSite:
     depth_at_designed: int | None = None
     trace_status: str = ""
     flags: tuple[str, ...] = field(default_factory=tuple)
+    #: Per-allele REF/ALT counts; empty here, because a window scored by this module has
+    #: no declared intended allele. The pinned TRACE's `reconcile_cell` and
+    #: `reconciliation_to_row` read it from every site (planning/268).
+    allele_evidence: tuple[Any, ...] = field(default_factory=tuple)
 
     @property
     def status_changed_from_trace(self) -> bool:
@@ -328,20 +336,24 @@ def window_edit_profile(
     end: int,
     *,
     min_base_qual: int = MIN_BASE_QUAL,
+    min_mapq: int = MIN_MAPQ,
+    min_cov: int = MIN_COV,
 ) -> WindowProfile:
     """Measure every position of `[start, end]` (1-based inclusive) in one pass.
 
-    The pileup call, the `stepper`, the `min_base_quality` and the non-reference
-    predicate are TRACE's, character for character, so `max_vaf`/`cov_at_max` are
-    `window_edit_vaf`'s return values. Everything else is what TRACE discarded.
+    The pileup call, the read filter, the `min_base_quality`, the non-reference
+    predicate and the choice of the reported position are the pinned TRACE's
+    `window_edit_vaf`, so `max_vaf`/`cov_at_max` are its return values (planning/268
+    re-aligned them when the pin moved). Everything else is what TRACE discards.
     """
     ref = fasta.fetch(chrom, start - 1, end).upper()
     counts: dict[int, dict[str, int]] = {}
     best_vaf, best_cov, best_pos = 0.0, 0, start
+    covered = False
 
     for col in bam.pileup(
         chrom, start - 1, end, truncate=True, stepper="samtools",
-        min_base_quality=min_base_qual,
+        min_base_quality=min_base_qual, flag_filter=0xF04,
     ):
         i = col.reference_pos - (start - 1)
         if i < 0 or i >= len(ref):
@@ -350,33 +362,43 @@ def window_edit_profile(
         sub = dele = ins = skip = 0
         total = 0
         for pr in col.pileups:
-            total += 1
-            if pr.is_del:
-                dele += 1
+            mapq = pr.alignment.mapping_quality
+            if mapq == 255 or mapq < min_mapq:
                 continue
             if pr.is_refskip:
-                skip += 1
+                skip += 1  # a missing observation, never depth or an alternate allele
+                continue
+            if pr.is_del:
+                total += 1
+                dele += 1
                 continue
             qpos = pr.query_position
             if qpos is None:
                 continue
-            mismatch = pr.alignment.query_sequence[qpos].upper() != refbase
+            base = pr.alignment.query_sequence[qpos].upper()
+            if base not in "ACGT":
+                continue
+            total += 1
             if pr.indel > 0:
                 # An insertion is scored at its anchor base, as TRACE does. When the
                 # anchor ALSO mismatches, the read is counted once, as an insertion:
                 # TRACE's `or` counts it once too, so the VAF is identical.
                 ins += 1
-            elif mismatch:
+            elif base != refbase:
                 sub += 1
         counts[col.reference_pos + 1] = {
             "depth": total, "sub": sub, "del": dele, "ins": ins, "skip": skip,
         }
         if total == 0:
             continue
-        nonref = sub + dele + ins + skip
-        vaf = nonref / total
-        # TRACE's exact tie-break, so the argmax is the same position.
-        if vaf > best_vaf or (vaf == best_vaf and total > best_cov):
+        vaf = (sub + dele + ins) / total
+        # TRACE's exact choice: the highest (vaf, depth) among positions reaching
+        # `min_cov`, else the deepest observed position, so low coverage stays explicit.
+        if total >= min_cov:
+            if not covered or (vaf, total) > (best_vaf, best_cov):
+                best_vaf, best_cov, best_pos = vaf, total, col.reference_pos + 1
+            covered = True
+        elif not covered and (total, vaf) > (best_cov, best_vaf):
             best_vaf, best_cov, best_pos = vaf, total, col.reference_pos + 1
 
     positions = tuple(

@@ -404,10 +404,10 @@ def _minor_allele_split(precall_row: dict[str, str]) -> tuple[tuple[str, ...], t
     carries an id in this column, and downgrading it would be wrong. The split is by
     intersection with this row's own `designed_variants`.
 
-    Both id strings are `{chrom}_{pos}_{ref}_to_{alt}` over RAW contig names:
-    `split_plate_vcf` runs BEFORE `alias_vcf_contigs` in `step_2._run_one_sample`, and
-    `_decode_outcome_table` maps TRACE's aliased ids back, so the two meet in the same
-    namespace. `test_f7_the_minor_allele_id_matches_the_designed_variant_id` pins that.
+    Both id strings are `{chrom}_{pos}_{ref}_to_{alt}` over RAW contig names: step_2
+    no longer aliases contigs (planning/268; the pinned TRACE builds its ids from
+    structured fields), and reads the minor ids back from the split VCF's `MAG_MINOR`
+    tags. `test_f7_the_minor_allele_id_matches_the_designed_variant_id` pins that.
     """
     minor = tuple(
         v.strip() for v in (precall_row.get("minor_allele_variants") or "").split(";")

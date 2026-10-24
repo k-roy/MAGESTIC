@@ -235,6 +235,37 @@ def expand_reference_blocks(
     return res
 
 
+def _reference_depth(cols: list[str], spans: bool) -> int | None:
+    """Reference depth of one gVCF record, by the pinned TRACE's own rule (planning/268).
+
+    A hom-reference symbolic block spanning `END` counts only its `MIN_DP`, a lower bound
+    over the whole interval; a block without `MIN_DP` cannot prove its interior covered.
+    An explicit position counts `AD`'s first value, found by FORMAT key as TRACE finds
+    it (`ad_slot` is kept in the signature for callers, no longer used to locate it), or
+    `DP` for a hom-reference genotype. This must match TRACE's
+    `donor_outcome._reference_depth`, or a reason computed here would argue with TRACE's
+    flag; `test_fixed_reason_agrees_with_traces_own_flag` checks that it does not.
+    """
+    keys = cols[8].split(":")
+    values = cols[9].split(":")
+    fmt = dict(zip(keys, values))
+    alts = cols[4].split(",")
+    symbolic = all(a in (".", "<NON_REF>", "<*>") for a in alts)
+    hom_ref = fmt.get("GT", ".").replace("|", "/") in ("0", "0/0")
+    if spans and symbolic and hom_ref:
+        value = fmt.get("MIN_DP", ".")
+    elif "AD" in fmt and fmt["AD"] != ".":
+        value = fmt["AD"].split(",")[0]
+    elif hom_ref:
+        value = fmt.get("DP", ".")
+    else:
+        value = "."
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
 def window_reference_coverage(
     gvcf_path: str | Path,
     *,
@@ -271,17 +302,10 @@ def window_reference_coverage(
                 pos = int(cols[1])
             except ValueError:
                 continue
-            info = cols[9].split(":")
-            index = ad_slot - 1
-            if len(info) <= index:
-                continue
-            try:
-                ref_depth = int(info[index].split(",")[0])
-            except ValueError:
-                continue
-            if ref_depth < ne_threshold:
-                continue
             end, _ = block_end(cols[7], pos)
+            ref_depth = _reference_depth(cols, end > pos)
+            if ref_depth is None or ref_depth < ne_threshold:
+                continue
             lo, hi = max(pos, window_start), min(max(end, pos), window_end)
             if lo <= hi:
                 covered.update(range(lo, hi + 1))
