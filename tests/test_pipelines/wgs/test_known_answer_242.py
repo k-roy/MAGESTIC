@@ -257,7 +257,7 @@ def test_precall_sample_handles_an_underscore_bearing_contig(tmp_path):
     outs = {}
     for name in ("chrXV", "integrated_plasmid_o1"):
         spec = DonorSpec("S1", name, 1000, 1020, wt, design, design)
-        vcf = _write_vcf(tmp_path / f"{name}.vcf", [(1010, "C", "T", 0, 30)], chrom=name)
+        vcf = _write_vcf(tmp_path / f"{name}.vcf", [(1010, "G", "T", 0, 30)], chrom=name)
         g = _write_vcf(tmp_path / f"{name}.g.vcf", [], chrom=name)
         outs[name] = precall_sample(spec, vcf, g, chrom_seq)
     assert outs["chrXV"].editing_outcome == outs["integrated_plasmid_o1"].editing_outcome
@@ -272,7 +272,7 @@ def test_single_underscore_contig_is_also_handled(tmp_path):
     design = wt[:10] + "T" + wt[11:]
     chrom_seq = "N" * 999 + wt + "N" * 100
     spec = DonorSpec("S3", "plasmid_o1", 1000, 1020, wt, design, design)
-    vcf = _write_vcf(tmp_path / "p.vcf", [(1010, "C", "T", 0, 30)], chrom="plasmid_o1")
+    vcf = _write_vcf(tmp_path / "p.vcf", [(1010, "G", "T", 0, 30)], chrom="plasmid_o1")
     g = _write_vcf(tmp_path / "p.g.vcf", [], chrom="plasmid_o1")
     out = precall_sample(spec, vcf, g, chrom_seq)
     assert all(v.startswith("plasmid_o1_") for v in out.designed_variants), out
@@ -401,6 +401,8 @@ def _s2(chrom="chrXV"):
 
 def _s2_vcf(path: Path, records, *, chrom="chrXV", ref_blocks=None, end_block=None):
     # Block REF from `_CHROMSEQ`: the pinned TRACE validates every gVCF REF (planning/268).
+    # The callers' variant records were written C>T at 1010, where `_WT21` carries G (the
+    # design is G>T); TRACE `7c4c10f` never checked. They now state the real REF base.
     out = ["##fileformat=VCFv4.2", f"##contig=<ID={chrom}>",
            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"]
     if end_block:
@@ -429,7 +431,7 @@ def test_stage2_has_no_allele_fraction_threshold_at_all(tmp_path, ad_ref, ad_alt
     the UPSTREAM variant caller's ploidy/min-AF, which lives outside this repo
     (`donor_precall.plate_vcfs` are supplied pre-made).
     """
-    v = _s2_vcf(tmp_path / "v.vcf", [(_EDIT, "C", "T", ad_ref, ad_alt)])
+    v = _s2_vcf(tmp_path / "v.vcf", [(_EDIT, "G", "T", ad_ref, ad_alt)])
     g = _s2_vcf(tmp_path / "g.vcf", [], ref_blocks=_FULLCOV)
     assert precall_sample(_s2(), v, g, _CHROMSEQ).editing_outcome == "designed_variant_installed"
 
@@ -456,9 +458,9 @@ def test_stage2_separates_an_indel_and_an_imprecise_repair_from_a_correct_edit(t
     all 115 raw NE rows are bare `designed_variant_unedited` with no suffix."""
     g = _s2_vcf(tmp_path / "g.vcf", [], ref_blocks=_FULLCOV)
     for label, rec in (
-        ("imprecise", (_EDIT, "C", "A", 0, 30)),
-        ("insertion", (_EDIT, "C", "CGG", 0, 30)),
-        ("deletion", (_EDIT - 1, "GC", "G", 0, 30)),
+        ("imprecise", (_EDIT, "G", "A", 0, 30)),
+        ("insertion", (_EDIT, "G", "GAA", 0, 30)),
+        ("deletion", (_EDIT - 1, "CG", "C", 0, 30)),
     ):
         v = _s2_vcf(tmp_path / f"{label}.vcf", [rec])
         out = precall_sample(_s2(), v, g, _CHROMSEQ)
@@ -577,7 +579,7 @@ def test_gate3_is_closed_on_every_mandated_composite_contig(tmp_path, chrom):
     pinned TRACE each one gives exactly the outcome the underscore-free `chrXV` gives
     for the same evidence, with its real name in every shipped id."""
     def run(name):
-        v = _s2_vcf(tmp_path / f"{name}.v.vcf", [(_EDIT, "C", "T", 0, 30)], chrom=name)
+        v = _s2_vcf(tmp_path / f"{name}.v.vcf", [(_EDIT, "G", "T", 0, 30)], chrom=name)
         g = _s2_vcf(tmp_path / f"{name}.g.vcf", [], chrom=name,
                     ref_blocks=[(p, 30) for p in range(_DS, _DE + 1)])
         return precall_sample(_s2(name), v, g, _CHROMSEQ)
