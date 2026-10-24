@@ -399,7 +399,7 @@ def _s2(chrom="chrXV"):
     return DonorSpec("S", chrom, _DS, _DE, _WT21, _DESIGN21, _DESIGN21)
 
 
-def _s2_vcf(path: Path, records, *, chrom="chrXV", ref_blocks=None, end_block=None):
+def _s2_vcf(path: Path, records, *, chrom="chrXV", ref_blocks=None, end_block=None, gt="0/1"):
     # Block REF from `_CHROMSEQ`: the pinned TRACE validates every gVCF REF (planning/268).
     # The callers' variant records were written C>T at 1010, where `_WT21` carries G (the
     # design is G>T); TRACE `7c4c10f` never checked. They now state the real REF base.
@@ -411,7 +411,7 @@ def _s2_vcf(path: Path, records, *, chrom="chrXV", ref_blocks=None, end_block=No
     for p, adr in ref_blocks or []:
         out.append(f"{chrom}\t{p}\t.\t{_CHROMSEQ[p - 1]}\t<NON_REF>\t.\t.\t.\tGT:AD\t0/0:{adr},0")
     for pos, ref, alt, adr, ada in records:
-        out.append(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\tGT:AD\t0/1:{adr},{ada}")
+        out.append(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\tGT:AD\t{gt}:{adr},{ada}")
     path.write_text("\n".join(out) + "\n")
     return path
 
@@ -421,19 +421,22 @@ _FULLCOV = [(p, 30) for p in range(_DS, _DE + 1)]
 
 @pytest.mark.parametrize("ad_ref,ad_alt", [(0, 30), (15, 15), (21, 9), (27, 3), (29, 1)])
 def test_stage2_has_no_allele_fraction_threshold_at_all(tmp_path, ad_ref, ad_alt):
-    """🔴 THE STAGE-2 FINDING. `precall_sample`'s VCF pass bucket-sorts purely on the
-    REF/ALT strings (donor_outcome.py:263-277); AD is read only for the gVCF
-    `flag_covered` count. So a well with ONE alt read in thirty (3%) is called
-    `designed_variant_installed`, byte-identical to a clean 30/30 clone.
+    """🔴 THE STAGE-2 FINDING, as it stands on the pinned TRACE (planning/268).
 
-    Consequence: the real cohort's 73.4% "correct edit" is an UPPER bound that
-    absorbs mixtures at any allele fraction. The controlling sensitivity threshold is
-    the UPSTREAM variant caller's ploidy/min-AF, which lives outside this repo
-    (`donor_precall.plate_vcfs` are supplied pre-made).
+    TRACE `7c4c10f` bucket-sorted purely on the REF/ALT strings, so a well with ONE alt
+    read in thirty (3%) was `designed_variant_installed`, byte-identical to a clean
+    30/30 clone. WITHDRAWN: "a 3% heterozygous call ships as installed". The pinned
+    TRACE selects alleles by GT: a heterozygous genotype in a clonal donor is refused as
+    `unknown;ambiguous_genotype` at every fraction, and a homozygous-alt genotype is
+    installed at every fraction. What survives, and is pinned: Stage 2 still has NO
+    allele-fraction threshold of its own. AD never changes the call, so the upstream
+    caller's genotype is the controlling threshold (`268_rescue_probe_results.tsv`).
     """
-    v = _s2_vcf(tmp_path / "v.vcf", [(_EDIT, "G", "T", ad_ref, ad_alt)])
     g = _s2_vcf(tmp_path / "g.vcf", [], ref_blocks=_FULLCOV)
-    assert precall_sample(_s2(), v, g, _CHROMSEQ).editing_outcome == "designed_variant_installed"
+    het = _s2_vcf(tmp_path / "het.vcf", [(_EDIT, "G", "T", ad_ref, ad_alt)])
+    hom = _s2_vcf(tmp_path / "hom.vcf", [(_EDIT, "G", "T", ad_ref, ad_alt)], gt="1")
+    assert precall_sample(_s2(), het, g, _CHROMSEQ).editing_outcome == "unknown;ambiguous_genotype"
+    assert precall_sample(_s2(), hom, g, _CHROMSEQ).editing_outcome == "designed_variant_installed"
 
 
 def test_stage2_calls_unedited_at_gvcf_reference_depth_one(tmp_path):
@@ -457,12 +460,14 @@ def test_stage2_separates_an_indel_and_an_imprecise_repair_from_a_correct_edit(t
     This is why imprecise repairs and indels are NOT hidden inside the real 22.6%:
     all 115 raw NE rows are bare `designed_variant_unedited` with no suffix."""
     g = _s2_vcf(tmp_path / "g.vcf", [], ref_blocks=_FULLCOV)
+    # A clonal haploid lesion is GT `1`; the pinned TRACE refuses a heterozygous
+    # genotype in a clonal donor as ambiguous (planning/268), so the fixture states it.
     for label, rec in (
         ("imprecise", (_EDIT, "G", "A", 0, 30)),
         ("insertion", (_EDIT, "G", "GAA", 0, 30)),
         ("deletion", (_EDIT - 1, "CG", "C", 0, 30)),
     ):
-        v = _s2_vcf(tmp_path / f"{label}.vcf", [rec])
+        v = _s2_vcf(tmp_path / f"{label}.vcf", [rec], gt="1")
         out = precall_sample(_s2(), v, g, _CHROMSEQ)
         assert out.editing_outcome == "designed_variant_unedited;spontaneous_mutations", label
         assert len(out.spontaneous_variants) == 1, label

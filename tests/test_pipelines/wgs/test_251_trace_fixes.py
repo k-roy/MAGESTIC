@@ -410,10 +410,12 @@ class TestDefect3UnderscoreContigs:
         spec = TR and None
         return ref, dstart, dend, wt, design, fasta, vcf, gvcf, contig
 
-    @defect_persists("3 (positional split('_') on contig names)",
-                     closed_by="donor_precall.precall_sample_aliased + ContigAlias")
     def test_repro_precall_raises_on_every_policy_contig(self, tmp_path):
-        """REPRODUCTION: all four underscore-bearing mandated contigs crash Stage 2."""
+        """REPRODUCTION: all four underscore-bearing mandated contigs crash Stage 2.
+
+        CLOSED UPSTREAM (planning/268): it XPASSed strictly against the pinned TRACE,
+        which builds variant ids from structured fields, so `defect_persists` is
+        removed and the correct result (no contig crashes) is asserted outright."""
         do = _trace.donor_outcome()
         broken = []
         for contig in POLICY_CONTIGS:
