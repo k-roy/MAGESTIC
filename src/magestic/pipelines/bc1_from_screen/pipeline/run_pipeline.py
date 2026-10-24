@@ -6,6 +6,9 @@ Main entry point for running the BC1 from screen analysis pipeline.
 Supports both local execution and SLURM jobs with Sherlock best practices.
 
 Usage:
+    # Steps 10-18 (the downstream half) from an explicit route config -- the runnable route
+    magestic-screen-analysis --route-config run.yaml [--steps split,deseq2,annotate,hitcall]
+
     # Basic usage (auto-detect project)
     python run_pipeline.py --project-dir /path/to/project
 
@@ -172,6 +175,13 @@ def run_plots(config: BC1FromScreenConfig) -> bool:
     raise NotImplementedError(_not_implemented("plots"))
 
 
+#: The downstream half, steps 10-18, run by pipeline/downstream.py from a --route-config (planning/272).
+#: These names are disjoint from AVAILABLE_STEPS' screen-config path, which still has no implementation.
+from .downstream import STAGES as DOWNSTREAM_STAGES  # noqa: E402
+
+DOWNSTREAM_STEPS = list(DOWNSTREAM_STAGES)
+
+
 STEP_FUNCTIONS = {
     "tier": run_tier_classification,
     "matrix": run_count_matrix,
@@ -331,6 +341,31 @@ def run_pipeline(
     return success
 
 
+def run_route(route_config: Path, steps: List[str], keep_going: bool = False) -> bool:
+    """Run downstream steps from a route config. True only when every stage wrote its outputs."""
+    from .downstream import RouteConfig, StageFailed, run_downstream
+    from magestic.utils.provenance import git_state
+
+    config = RouteConfig.from_yaml(route_config)
+    logger.info("=" * 70)
+    logger.info(f"BC1-FROM-SCREEN DOWNSTREAM ROUTE: {config.screen} / {config.library}")
+    logger.info(f"Steps: {', '.join(steps)}; outputs under {config.output_dir}")
+    logger.info("=" * 70)
+    try:
+        manifest = run_downstream(config, steps, git_state=git_state(Path(__file__).parent),
+                                  keep_going=keep_going)
+    except StageFailed as exc:
+        logger.error(str(exc))
+        logger.error("=" * 70)
+        logger.error(f"PIPELINE FAILED (manifest: {config.output_dir / 'run_manifest.json'})")
+        logger.error("=" * 70)
+        return False
+    logger.info("=" * 70)
+    logger.info(f"PIPELINE COMPLETED SUCCESSFULLY (manifest: {manifest})")
+    logger.info("=" * 70)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="BC1-From-Screen Pipeline Runner",
@@ -351,6 +386,12 @@ Examples:
         """
     )
 
+    parser.add_argument(
+        "--route-config",
+        type=Path,
+        help=("YAML naming the inputs and parameters of steps 10-18; runs them through "
+              "pipeline/downstream.py and checks every output (see that module's docstring)")
+    )
     parser.add_argument(
         "--project-dir",
         type=Path,
@@ -374,7 +415,13 @@ Examples:
     parser.add_argument(
         "--steps",
         type=str,
-        help=f"Comma-separated list of steps to run. Available: {','.join(AVAILABLE_STEPS)}"
+        help=(f"Comma-separated list of steps to run. With --route-config: {','.join(DOWNSTREAM_STEPS)} "
+              f"(default all); otherwise {','.join(AVAILABLE_STEPS)}")
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="With --route-config: run later stages after a stage fails; the run still exits 1"
     )
     parser.add_argument(
         "--debug",
@@ -383,6 +430,19 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.route_config:
+        if args.config or args.project_dir or args.use_spg_config:
+            parser.error("--route-config runs steps 10-18 on its own; do not combine it with "
+                         "--config, --project-dir or --use-spg-config")
+        steps = [s.strip() for s in args.steps.split(",")] if args.steps else DOWNSTREAM_STEPS
+        unknown = [s for s in steps if s not in DOWNSTREAM_STEPS]
+        if unknown:
+            parser.error(f"unknown step(s): {unknown}; available with --route-config: {DOWNSTREAM_STEPS}")
+        sys.exit(0 if run_route(args.route_config, steps, keep_going=args.keep_going) else 1)
 
     # Create configuration
     if args.config:
@@ -394,7 +454,7 @@ Examples:
         config = create_spg_qtl_screen_config()
         config.project_dir = args.project_dir
     else:
-        parser.error("Must specify --project-dir, --config, or --use-spg-config")
+        parser.error("Must specify --route-config, --project-dir, --config, or --use-spg-config")
 
     # Apply scratch setting
     if args.use_scratch:
@@ -408,10 +468,6 @@ Examples:
         unknown = [s for s in steps if s not in AVAILABLE_STEPS]
         if unknown:
             parser.error(f"unknown step(s): {unknown}; available: {AVAILABLE_STEPS}")
-
-    # Enable debug logging
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
 
     # Run pipeline
     success = run_pipeline(config, steps)
