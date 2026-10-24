@@ -287,7 +287,10 @@ rule deseq2_11_single:
         results = DESEQ2_DIR / "{library}" / "{comparison}_DESeq2_results.tsv"
     params:
         script = COMMON_SCRIPTS_DIR / "11_deseq2_single.py",
-        min_basemean = config.get("deseq2", {}).get("min_basemean", 0)
+        min_basemean = config.get("deseq2", {}).get("min_basemean", 0),
+        # pydeseq2's default "ratio" turns iterative (hours per comparison) on a zero-heavy screen matrix;
+        # "poscounts" is DESeq2's estimator for such counts. Default unchanged (planning/272).
+        size_factors_fit_type = config.get("deseq2", {}).get("size_factors_fit_type", "ratio")
     log:
         LOGS_DIR / "11_deseq2_{library}_{comparison}.log"
     threads: config.get("resources", {}).get("step_11", {}).get("cpus", 4)
@@ -303,6 +306,7 @@ rule deseq2_11_single:
             --comparison {wildcards.comparison} \\
             --library {wildcards.library} \\
             --min-basemean {params.min_basemean} \\
+            --size-factors-fit-type {params.size_factors_fit_type} \\
             2>&1 | tee {log}
         """
 

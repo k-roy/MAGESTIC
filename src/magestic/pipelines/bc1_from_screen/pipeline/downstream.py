@@ -29,7 +29,7 @@ Route config (YAML)::
       common_dir: .../common            # MAGESTIC_COMMON_DIR for step 13's registry (optional)
     split: {transformation_scope: pooled}       # or: split + transformation_column; pooled_dates: true
     comparisons: [yL406_Azauracil_12, ...]      # optional: run 11/13/14/17 on these only (default: all)
-    deseq2: {min_basemean: 0}
+    deseq2: {min_basemean: 0, size_factors_fit_type: ratio}   # ratio | poscounts | iterative
     slope: {conditions: [Azauracil]}
     hit_calling: {tier_1_z: 3.0, tier_1_concordance: 0.75, tier_2_z: 3.75, tier_2_concordance: 0.85,
                   use_synonymous_null: true}
@@ -246,7 +246,8 @@ class Route:
                 "--reference", c.split_dir / "reference" / row.reference_file,
                 "--treatment", c.split_dir / "treatment" / row.treatment_file,
                 "--output", out, "--comparison", row.comparison_id, "--library", c.library,
-                "--min-basemean", c.deseq2.get("min_basemean", 0)], [out])
+                "--min-basemean", c.deseq2.get("min_basemean", 0),
+                "--size-factors-fit-type", c.deseq2.get("size_factors_fit_type", "ratio")], [out])
 
     def run_slope(self) -> None:
         c = self.config
@@ -324,7 +325,9 @@ class Route:
                 "--treatment", c.split_dir / "treatment" / row.treatment_file,
                 "--output-dir", out_dir, "--comparison", row.comparison_id, "--library", c.library,
                 "--fractions", *r.get("fractions", [0.1, 0.25, 0.5, 0.75, 1.0]),
-                "--replicates", r.get("replicates", 5), "--seed", r.get("seed", 42)],
+                "--replicates", r.get("replicates", 5), "--seed", r.get("seed", 42),
+                "--size-factors-fit-type", r.get("size_factors_fit_type",
+                                                 c.deseq2.get("size_factors_fit_type", "ratio"))],
                 [out_dir / f"{row.comparison_id}_rarefaction_summary.tsv",
                  out_dir / f"{row.comparison_id}_rarefaction_stats.tsv"])
 

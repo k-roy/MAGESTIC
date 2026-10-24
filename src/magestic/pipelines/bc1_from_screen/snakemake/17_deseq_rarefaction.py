@@ -94,6 +94,10 @@ def parse_args():
         help="Random seed for reproducibility"
     )
     parser.add_argument(
+        "--size-factors-fit-type", choices=("ratio", "poscounts", "iterative"), default="ratio",
+        help=("pydeseq2 size-factor estimator: ratio (median of ratios; the pydeseq2 default, kept here), poscounts (DESeq2's estimator for zero-heavy counts) or iterative. Under ratio, pydeseq2 switches to the iterative estimator when every bc1 has a zero in some sample, which a screen matrix with a consolidated t0 always does; that fit ran for hours on one yL406 comparison (planning/272).")
+    )
+    parser.add_argument(
         "--padj-threshold", type=float, default=0.05,
         help="Adjusted p-value threshold for hit calling (default: 0.05)"
     )
@@ -127,7 +131,7 @@ def subsample_counts(counts: pd.DataFrame, fraction: float, rng: np.random.Gener
 
 
 def run_deseq2(ref_counts: pd.DataFrame, treat_counts: pd.DataFrame,
-               comparison: str) -> pd.DataFrame:
+               comparison: str, size_factors_fit_type: str = "ratio") -> pd.DataFrame:
     """
     Run DESeq2 analysis on subsampled counts.
     Returns results DataFrame with log2FoldChange, pvalue, padj.
@@ -169,6 +173,7 @@ def run_deseq2(ref_counts: pd.DataFrame, treat_counts: pd.DataFrame,
             metadata=metadata,
             design_factors="condition",
             refit_cooks=True,
+            size_factors_fit_type=size_factors_fit_type,
             inference=inference
         )
         dds.deseq2()
@@ -262,7 +267,7 @@ def main():
             actual_reads = ref_sub.iloc[:, 1:].sum().sum() + treat_sub.iloc[:, 1:].sum().sum()
 
             # Run DESeq2
-            deseq_results = run_deseq2(ref_sub, treat_sub, args.comparison)
+            deseq_results = run_deseq2(ref_sub, treat_sub, args.comparison, args.size_factors_fit_type)
 
             # Call hits
             hits = call_hits(deseq_results, args.padj_threshold, args.lfc_threshold)

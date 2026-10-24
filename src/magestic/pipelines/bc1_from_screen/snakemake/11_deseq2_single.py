@@ -107,6 +107,10 @@ def parse_args():
         "--pool-transformations", action="store_true", default=False,
         help="Fit columns or features from several transformations together (explicit pooling)"
     )
+    parser.add_argument(
+        "--size-factors-fit-type", choices=("ratio", "poscounts", "iterative"), default="ratio",
+        help=("pydeseq2 size-factor estimator: ratio (median of ratios; the pydeseq2 default, kept here), poscounts (DESeq2's estimator for zero-heavy counts) or iterative. Under ratio, pydeseq2 switches to the iterative estimator when every bc1 has a zero in some sample, which a screen matrix with a consolidated t0 always does; that fit ran for hours on one yL406 comparison (planning/272).")
+    )
     return parser.parse_args()
 
 
@@ -188,7 +192,17 @@ def load_and_combine_counts(reference_file: Path, treatment_file: Path) -> tuple
     return counts_df, metadata_df
 
 
-def run_deseq2(counts_df: pd.DataFrame, metadata_df: pd.DataFrame) -> pd.DataFrame:
+def size_factor_note(counts_df: pd.DataFrame, fit_type: str) -> str:
+    """Say which size-factor estimator pydeseq2 will actually use (ratio silently becomes iterative)."""
+    zero_free = int((counts_df > 0).all(axis=1).sum())
+    if fit_type == "ratio" and zero_free == 0:
+        return (f"size factors: ratio requested, but 0 of {len(counts_df):,} BC1s are zero-free, so pydeseq2 "
+                f"switches to the ITERATIVE estimator (slow at screen scale; see --size-factors-fit-type)")
+    return f"size factors: {fit_type} ({zero_free:,} of {len(counts_df):,} BC1s are zero-free)"
+
+
+def run_deseq2(counts_df: pd.DataFrame, metadata_df: pd.DataFrame,
+               size_factors_fit_type: str = "ratio") -> pd.DataFrame:
     """Run DESeq2 analysis."""
     # Ensure counts are integers
     counts_df = counts_df.round().astype(int)
@@ -197,6 +211,7 @@ def run_deseq2(counts_df: pd.DataFrame, metadata_df: pd.DataFrame) -> pd.DataFra
     counts_df = counts_df.loc[counts_df.sum(axis=1) > 0]
 
     logger.info(f"  Running DESeq2 on {len(counts_df):,} BC1s, {len(counts_df.columns)} samples")
+    logger.info(f"  {size_factor_note(counts_df, size_factors_fit_type)}")
 
     # Create DESeq2 dataset
     # Note: PyDESeq2/AnnData expects counts with rows=samples, columns=features
@@ -208,6 +223,7 @@ def run_deseq2(counts_df: pd.DataFrame, metadata_df: pd.DataFrame) -> pd.DataFra
         metadata=metadata_df,
         design_factors="condition",
         refit_cooks=True,
+        size_factors_fit_type=size_factors_fit_type,
         inference=inference,
     )
 
@@ -249,7 +265,7 @@ def main():
 
     # Run DESeq2
     logger.info("Running DESeq2...")
-    results_df = run_deseq2(counts_df, metadata_df)
+    results_df = run_deseq2(counts_df, metadata_df, args.size_factors_fit_type)
 
     # Add metadata columns
     results_df["library"] = args.library
