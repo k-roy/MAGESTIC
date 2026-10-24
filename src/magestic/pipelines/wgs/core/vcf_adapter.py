@@ -1,37 +1,17 @@
-"""
-magestic.pipelines.wgs.core.vcf_adapter — plate VCF -> the per-sample layout TRACE hardcodes.
+"""Stream a plate VCF into atomic per-sample variant and unresolved-genotype VCFs.
 
-`donor_outcome.precall` reads `{workdir}/vcf/{sample}.fil.vcf` and
-`{workdir}/gvcf/{sample}.g.vcf` — relative subpaths and suffixes hardcoded in its body,
-opened with plain `open()` (so **plain text only**, no bgzip). What this program actually
-has is six per-plate **96-sample bcftools merges** (`mpileup -q 20 -Q 20 -d 500
--a FORMAT/AD,FORMAT/DP | call -mv`, `FORMAT = GT:PL:DP:AD`).
-
-This module does the **re-representation** half of the bridge, and only that half:
-
-* 96-sample merge -> one plain-text `.fil.vcf` per sample;
-* `AD` moved from FORMAT slot 4 (bcftools) to slot 2, which is where TRACE's *positional*
-  gVCF parser reads reference depth (`cols[9].split(":")[1].split(",")[0]`);
-* records restricted to the samples that actually carry a non-reference allele.
-
-🔴 **It writes nothing into `{workdir}/gvcf/`, deliberately.** No gVCF exists anywhere in
-the cohort (GATE 2), and a re-keyed bcftools merge dropped into that directory would be a
-*fabricated* gVCF from which TRACE would happily read reference depth. Synthesizing
-per-position reference depth from a BAM pileup is **deriving a new quantity**, which by
-this module's scope test is an algorithm and belongs in TRACE, not in a magestic
-workaround. Until TRACE grows that primitive, every in-window-uncovered call collapses to
-`unknown` — and `unknown` must never be read as `unedited`.
-
-The consequence of a missing gVCF is not an error: `precall` hits
-`if not vcf_path.exists() or not gvcf_path.exists(): continue` and drops the sample with
-no warning, no stderr line and no count. Miss every sample and it writes a header-only
-file and returns normally. `precall_inputs()` enumerates exactly that set so `qc` can
-fail the run loudly instead.
+GT is selected by FORMAT name. Multiallelic records retain their allele ordering and
+GT/AD fields so TRACE can select the actual genotype allele; the adapter never derives
+an alternate genotype. Missing/incomplete genotypes remain explicit evidence rather
+than disappearing as presumed reference calls. AD reordering is a compatibility representation only, because
+the repaired TRACE parser reads named fields. No reference-depth gVCF is fabricated.
 """
 
 from __future__ import annotations
 
 import gzip
+import os
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -62,6 +42,7 @@ __all__ = [
     "precall_inputs",
     "reorder_format_field",
     "split_plate_vcf",
+    "vcf_samples",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -155,11 +136,13 @@ MPILEUP_CALL_ALL_SITES_COMMAND = (
 #:   (measured private floor 1/40 = 2.5% vs 6/40 and 34/40 for the `-v` forms).
 #: * `--ploidy 1` — correct for a haploid clone; the minority allele then arrives as
 #:   `GT 0` + a real ALT base + AD, which `min_allele_fraction` reads.
-#: * `| bcftools norm -m-` — belt and braces. `step_2` REFUSES the whole plate if any
-#:   record is multi-allelic (TRACE reads ALT whole, so `"A,G"` reaches `bucket_variant`
-#:   as a literal two-character allele). NN 255 measured `-A` NOT producing a
-#:   multi-allelic record even at a genuine 12-G/12-T site, on one fixture — which is
-#:   reassuring and not a guarantee, and `norm -m-` costs nothing.
+#: * `| bcftools norm -m-` — still recommended. The pinned TRACE now selects the ALT that
+#:   GT names, so `step_2` no longer refuses a multi-allelic record (it did while TRACE
+#:   `7c4c10f` read `"A,G"` as one literal allele; planning/268). But the `MAG_MINOR`
+#:   variant id below is built from the whole ALT column, so a minority allele on a
+#:   multi-allelic record cannot match a designed variant id in `step_5`. NN 255 measured
+#:   `-A` NOT producing a multi-allelic record even at a genuine 12-G/12-T site, on one
+#:   fixture — reassuring and not a guarantee, and `norm -m-` costs nothing.
 #:
 #: ⚠️ **What this command CANNOT see, stated so it is not discovered later:** anything
 #: outside the donor windows. NN 251 defect 8's
@@ -203,10 +186,7 @@ PRECALL_VCF_SUFFIX = ".fil.vcf"
 PRECALL_GVCF_SUBDIR = "gvcf"
 PRECALL_GVCF_SUFFIX = ".g.vcf"
 
-#: 1-based FORMAT slot TRACE's positional gVCF parser reads `AD` from.
-#: `sample_field.split(":")[1]` is the SECOND field, so slot 2. Stated 1-based to match
-#: the spec's language and `config.donor.ad_format_slot_out`, which removes an off-by-one
-#: at the boundary; conversion to a list index happens inside `reorder_format_field`.
+#: Legacy-compatible 1-based output slot for AD. TRACE now reads named FORMAT fields.
 TRACE_AD_SLOT = 2
 
 _MISSING = "."
@@ -231,11 +211,10 @@ class VcfSplitResult:
     n_records_out : dict
         `{sample: records written}`. A sample with 0 is written as a valid header-only
         VCF, which is a real "no variants called" result — distinct from an absent file,
-        which `precall` would silently skip.
+        which strict `precall` rejects.
     n_multiallelic : int
         Source records whose ALT carried more than one allele. See Notes: these are
-        passed through unchanged and are a known hazard, not a handled case.
-        **Read it** — `step_2._require_vcf_inputs` refuses a non-zero value.
+        retained with allele-indexed GT/AD for TRACE genotype selection.
     ad_slot : int
         1-based FORMAT slot `AD` was placed in.
     n_rescued_by_af : int
@@ -295,7 +274,7 @@ class VcfSplitResult:
 
 @dataclass
 class PrecallInputs:
-    """Which samples `precall` will actually process, and which it will silently drop."""
+    """Filesystem readiness of the required VCF/gVCF input pairs."""
 
     workdir: Path
     vcf_present: tuple[str, ...] = ()
@@ -311,7 +290,7 @@ class PrecallInputs:
 
     @property
     def silently_skipped(self) -> tuple[str, ...]:
-        """Requested samples `precall` would drop with no warning and no count."""
+        """Compatibility name for samples that fail strict precall input validation."""
         ready = set(self.ready)
         ordered = list(self.vcf_present) + [s for s in self.vcf_missing if s not in ready]
         return tuple(s for s in dict.fromkeys(ordered) if s not in ready)
@@ -320,23 +299,20 @@ class PrecallInputs:
 def carries_alt(genotype: str) -> bool:
     """True when a sample's GT names at least one non-reference allele.
 
-    This is the per-sample record filter, and it is the equivalent of
-    `bcftools view -s <sample> -c1`: the information is already in the GT field, so
-    selecting on it re-represents the merge rather than deriving anything new. It matters
-    because TRACE's `_iter_vcf_records` reads only columns 0/1/3/4 — it never looks at
-    GT, and it deliberately ignores FILTER — so **without this filter every sample would
-    inherit every variant called anywhere on the plate.**
+    This is a representation-level per-sample filter based on the called genotype.
+    Repaired TRACE independently validates GT before selecting a clonal allele.
 
     `./.`, `.`, and an empty field are not calls and return False.
     """
     gt = genotype.split(":", 1)[0].strip()
     if not gt or gt in (_MISSING, "./.", ".|."):
         return False
-    for allele in gt.replace("|", "/").split("/"):
+    alleles = gt.replace("|", "/").split("/")
+    for allele in alleles:
         allele = allele.strip()
-        if allele and allele != _MISSING and allele != "0":
-            return True
-    return False
+        if allele != _MISSING and (not allele.isdigit() or int(allele) < 0):
+            raise VcfAdapterError(f"invalid genotype {genotype!r}")
+    return any(allele != _MISSING and int(allele) > 0 for allele in alleles)
 
 
 def allele_fraction(
@@ -514,10 +490,8 @@ def reorder_format_field(
 ) -> tuple[list[str], list[str]]:
     """Move one FORMAT key (and its value) to a given position, keeping the rest in order.
 
-    bcftools emits `GT:PL:DP:AD`, putting `AD` in slot 4; TRACE's gVCF parser reads
-    reference depth *positionally* from slot 2 (`split(":")[1].split(",")[0]`). This is a
-    pure list permutation — no value is recomputed — so it is orchestration, and it is
-    unit-testable without a VCF.
+    This pure list permutation retains all values and allele indexing. The default
+    preserves historical output layout; the repaired algorithm reads FORMAT by name.
 
     Parameters
     ----------
@@ -529,9 +503,7 @@ def reorder_format_field(
     key : str, default "AD"
         The key to move.
     slot : int, default `TRACE_AD_SLOT`
-        Destination **1-based** FORMAT slot: `slot=2` puts `AD` in the field TRACE's
-        positional parser reads. 1-based because that is how the spec, TRACE's own
-        docstring and `config.donor.ad_format_slot_out` all state it.
+        Destination **1-based** FORMAT slot, preserving the historical default of 2.
 
     Returns
     -------
@@ -541,17 +513,12 @@ def reorder_format_field(
     Raises
     ------
     VcfAdapterError
-        `key` is absent from `format_keys`, or `slot` is below 1. Raising is deliberate:
-        a record silently written without `AD` in the expected slot would make TRACE read
-        some other field's first comma element as the reference depth.
-
-    Notes
-    -----
-    Only the gVCF-shaped file is parsed positionally — TRACE's *VCF* parser reads columns
-    0/1/3/4 and never touches FORMAT. The permutation is applied to both outputs anyway so
-    the layout is uniform, and so the helper is exercised on the path that exists today.
+        `key` is absent, the slot is below 1, keys repeat, or sample fields exceed
+        the declared FORMAT width.
     """
     keys = list(format_keys)
+    if len(keys) != len(set(keys)) or len(sample_fields) > len(keys):
+        raise VcfAdapterError("duplicate FORMAT keys or excess sample fields")
     if key not in keys:
         raise VcfAdapterError(
             f"FORMAT {keys} does not contain {key!r}; cannot place it at slot {slot}"
@@ -586,6 +553,28 @@ def _open_text(path: Path):
     if path.suffix == ".gz":
         return gzip.open(path, "rt")
     return path.open()
+
+
+def _sample_header(line: str, path: str | Path) -> list[str]:
+    header = line.rstrip("\r\n").split("\t")
+    fixed = ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
+    if len(header) < 10 or header[:9] != fixed:
+        raise VcfAdapterError(f"{path}: invalid VCF sample header")
+    samples = header[9:]
+    if any(not sample for sample in samples) or len(samples) != len(set(samples)):
+        raise VcfAdapterError(f"{path}: absent or duplicate VCF sample IDs in header")
+    return header
+
+
+def vcf_samples(path: str | Path) -> tuple[str, ...]:
+    """Read exact source sample IDs without opening or overwriting any output."""
+    with _open_text(Path(path)) as fh:
+        for line in fh:
+            if line.startswith("#CHROM\t"):
+                return tuple(_sample_header(line, path)[9:])
+            if not line.startswith("#") and line.strip():
+                break
+    raise VcfAdapterError(f"{path}: no #CHROM sample header")
 
 
 def split_plate_vcf(
@@ -658,18 +647,16 @@ def split_plate_vcf(
     ------
     VcfAdapterError
         No `#CHROM` header, a requested sample missing from the VCF, a record with fewer
-        columns than the header, or a record whose FORMAT has no `AD`.
+        columns than the header, or missing/invalid genotype fields.
 
     Notes
     -----
     The source is streamed once with all output handles open, so peak memory is bounded by
     the number of samples (~96 handles for a plate), not by the record count (§5).
 
-    🔴 **Multi-allelic records are passed through unchanged and counted, not resolved.**
-    TRACE reads column 4 whole, so an ALT of `"A,G"` reaches `bucket_variant` as a literal
-    allele. Choosing one allele per sample would be deriving a call, so this module
-    refuses to; normalize upstream (`bcftools norm -m-`) and check
-    `VcfSplitResult.n_multiallelic` is 0 before trusting Stage 2.
+    Multiallelic ALT/GT/AD are retained consistently. TRACE chooses the allele named by
+    GT and reports ambiguous genotypes as unknown for a clonal donor. A source
+    header with duplicate identities or a many-to-one sample map is rejected.
     """
     vcf_path = Path(vcf_path)
     workdir = Path(workdir)
@@ -678,7 +665,12 @@ def split_plate_vcf(
     wanted = set(samples) if samples is not None else None
     result = VcfSplitResult(workdir=workdir, ad_slot=ad_slot)
 
+    temporary_paths: dict[str, Path] = {}
     with ExitStack() as stack:
+        def cleanup():
+            for path in temporary_paths.values():
+                path.unlink(missing_ok=True)
+        stack.callback(cleanup)
         source = stack.enter_context(_open_text(vcf_path))
         meta: list[str] = []
         columns: list[str] | None = None
@@ -686,16 +678,20 @@ def split_plate_vcf(
         emit_names: list[str] = []
 
         for raw in source:
-            line = raw.rstrip("\n")
+            line = raw.rstrip("\r\n")
             if line.startswith("##"):
                 meta.append(line)
                 continue
             if line.startswith("#CHROM"):
-                header = line.split("\t")
-                if len(header) < 10:
-                    raise VcfAdapterError(f"{vcf_path}: #CHROM line carries no sample columns")
+                if columns is not None:
+                    raise VcfAdapterError(f"{vcf_path}: repeated #CHROM header")
+                header = _sample_header(line, vcf_path)
                 columns = header[9:]
                 names = [(sample_map or {}).get(c, c) for c in columns]
+                if len(names) != len(set(names)):
+                    raise VcfAdapterError(f"{vcf_path}: duplicate or many-to-one sample names")
+                if any(not n or n in (".", "..") or any(c in n for c in "/\\\t\r\n") for n in names):
+                    raise VcfAdapterError(f"{vcf_path}: sample names must be safe filenames")
                 if wanted is not None:
                     unknown = sorted(wanted - set(names))
                     if unknown:
@@ -706,7 +702,9 @@ def split_plate_vcf(
                 emit_names = [n for n in names if wanted is None or n in wanted]
                 for name in emit_names:
                     path = out_dir / f"{name}{PRECALL_VCF_SUFFIX}"
-                    fh = stack.enter_context(path.open("w", newline="\n"))
+                    fd, temp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=out_dir)
+                    temporary_paths[name] = Path(temp)
+                    fh = stack.enter_context(os.fdopen(fd, "w", newline="\n"))
                     for m in meta:
                         fh.write(m + "\n")
                     fh.write("\t".join(header[:9] + [name]) + "\n")
@@ -720,30 +718,40 @@ def split_plate_vcf(
                 raise VcfAdapterError(f"{vcf_path}: data record before the #CHROM header line")
 
             cols = line.split("\t")
-            if len(cols) < 9 + len(columns):
+            if len(cols) != 9 + len(columns):
                 raise VcfAdapterError(
-                    f"{vcf_path}: record {cols[0]}:{cols[1]} has {len(cols)} columns, "
+                    f"{vcf_path}: record {cols[:2]!r} has {len(cols)} columns, "
                     f"header declares {9 + len(columns)}"
                 )
             result.n_records_in += 1
             if "," in cols[4]:
                 result.n_multiallelic += 1
             format_keys = cols[8].split(":")
+            if "GT" not in format_keys or len(format_keys) != len(set(format_keys)):
+                raise VcfAdapterError(f"{vcf_path}: missing GT or duplicate FORMAT key")
             for i, column in enumerate(columns):
                 name = (sample_map or {}).get(column, column)
                 fh = handles.get(name)
                 if fh is None:
                     continue
                 field_value = cols[9 + i]
-                raw_fields = field_value.split(":")
+                values = field_value.split(":")
+                if len(values) > len(format_keys):
+                    raise VcfAdapterError(f"{vcf_path}: too many sample FORMAT values")
+                values += ["."] * (len(format_keys) - len(values))
+                gt = values[format_keys.index("GT")]
                 info = cols[7]
-                has_alt = carries_alt(field_value)
-                af = allele_fraction(format_keys, raw_fields)
-                n_alt = alt_depth(format_keys, raw_fields)
+                # Missing alleles are unresolved evidence, even when no called
+                # ALT remains (0/., ./., .). Retain them for TRACE's explicit
+                # unknown outcome; omitting them can manufacture an unedited call.
+                has_alt = carries_alt(gt)
+                incomplete = "." in gt.replace("|", "/").split("/")
+                af = allele_fraction(format_keys, values)
+                n_alt = alt_depth(format_keys, values)
                 if af is not None:
                     result.n_af_computed += 1
                 rescued = False
-                if not has_alt:
+                if not has_alt and not incomplete:
                     # GT says reference. Defect 1: at `--ploidy 1` that is exactly what
                     # a 5-33% haploid minor allele looks like, so fall back to the
                     # ALLELE DEPTHS, which are the actual evidence. RESCUE adds a record
@@ -763,6 +771,9 @@ def split_plate_vcf(
                         continue
                     result.n_rescued_by_af += 1
                     rescued = True
+                alleles = [int(a) for a in gt.replace("|", "/").split("/") if a != "."]
+                if any(a > len(cols[4].split(",")) for a in alleles):
+                    raise VcfAdapterError(f"{vcf_path}: GT exceeds ALT allele count")
                 # ------------------------------------------------------------------ #
                 # 🔴 NN 255 F11b — ANNOTATION IS UNCONDITIONAL, on BOTH branches.     #
                 # ------------------------------------------------------------------ #
@@ -777,9 +788,9 @@ def split_plate_vcf(
                 # describes — a guard that only fired on a non-default branch.
                 #
                 # Annotation is safe to run unconditionally because it ADDS INFO and
-                # drops nothing: TRACE's `_iter_vcf_records` reads only columns 0/1/3/4,
-                # so no INFO tag can change what Stage 2 does. Only the RESCUE above
-                # changes which records exist, and that is still opt-in.
+                # drops nothing: TRACE's genotype selection reads GT/AD from FORMAT, not
+                # INFO, so no INFO tag can change what Stage 2 does. Only the RESCUE
+                # above changes which records exist, and that is still opt-in.
                 #
                 # A clean, high-fraction record is left byte-identical (no tag at all),
                 # so the only outputs that move are the ones that were wrong.
@@ -801,9 +812,10 @@ def split_plate_vcf(
                     # The one residual silent route: a non-reference GT whose AD is
                     # unusable cannot be evaluated, so it ships unflagged. Counted.
                     result.n_no_ad_carrying_alt += 1
-                keys, values = reorder_format_field(
-                    format_keys, raw_fields, key="AD", slot=ad_slot
-                )
+                if "AD" in format_keys:
+                    keys, values = reorder_format_field(format_keys, values, key="AD", slot=ad_slot)
+                else:
+                    keys = format_keys
                 fh.write(
                     "\t".join(
                         cols[:7] + [info] + [":".join(keys), ":".join(values)]
@@ -814,20 +826,20 @@ def split_plate_vcf(
 
         if columns is None:
             raise VcfAdapterError(f"{vcf_path}: no #CHROM header line found")
+        for name, fh in handles.items():
+            fh.flush()
+            fh.close()
+        for name, path in temporary_paths.items():
+            os.replace(path, result.vcf_paths[name])
     return result
 
 
 def precall_inputs(workdir: str | Path, samples: Iterable[str]) -> PrecallInputs:
-    """Enumerate which samples `precall` will process and which it will silently skip.
+    """Enumerate required VCF/gVCF files before calling TRACE.
 
-    TRACE drops a sample whose `.fil.vcf` OR `.g.vcf` is missing with a bare `continue` —
-    no warning, no count — so an output TSV missing half a cohort looks exactly like a
-    complete one. `qc` compares `len(precall(...))` against the samplesheet row count and
-    uses `silently_skipped` to say *which* samples went missing and why.
-
-    No gVCF exists in this program today (GATE 2), so `gvcf_missing` is expected to be the
-    full sample list until TRACE grows a reference-depth primitive. That is a gate, not a
-    bug, and it must be reported rather than worked around.
+    This never substitutes called-variant depth for absent reference-depth evidence.
+    The compatibility property `silently_skipped` identifies unready inputs; repaired
+    TRACE raises for them rather than silently skipping.
     """
     workdir = Path(workdir)
     vcf_dir = workdir / PRECALL_VCF_SUBDIR

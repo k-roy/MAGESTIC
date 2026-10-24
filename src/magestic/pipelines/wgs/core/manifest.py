@@ -110,7 +110,8 @@ class WGSSample:
     background: str = ""
 
 
-def load_manifest(path: str | Path, *, base_dir: str | Path | None = None) -> list[WGSSample]:
+def load_manifest(path: str | Path, *, base_dir: str | Path | None = None,
+                  reference_root: str | Path | None = None) -> list[WGSSample]:
     """Read a header'd TSV manifest into `WGSSample`s, failing loudly on every defect.
 
     Parameters
@@ -137,6 +138,7 @@ def load_manifest(path: str | Path, *, base_dir: str | Path | None = None) -> li
     """
     path = Path(path)
     root = Path(base_dir) if base_dir is not None else path.parent
+    ref_root = Path(reference_root) if reference_root is not None else root
     with path.open(newline="") as fh:
         reader = csv.reader(fh, delimiter="\t")
         try:
@@ -144,6 +146,8 @@ def load_manifest(path: str | Path, *, base_dir: str | Path | None = None) -> li
         except StopIteration:
             raise ManifestError(f"{path}: empty manifest (no header row)") from None
         header = [c.strip() for c in header]
+        if any(not c for c in header) or len(set(header)) != len(header):
+            raise ManifestError(f"{path}: blank or duplicate header column")
         missing = [c for c in REQUIRED_COLUMNS if c not in header]
         if missing:
             raise ManifestError(
@@ -154,9 +158,9 @@ def load_manifest(path: str | Path, *, base_dir: str | Path | None = None) -> li
         samples: list[WGSSample] = []
         seen: dict[str, int] = {}
         for lineno, row in enumerate(reader, start=2):
-            if not row or not row[0].strip() or row[0].lstrip().startswith("#"):
+            if not row or not any(v.strip() for v in row) or row[0].lstrip().startswith("#"):
                 continue
-            if len(row) < len(header):
+            if len(row) != len(header):
                 raise ManifestError(
                     f"{path}:{lineno}: row has {len(row)} fields, header has {len(header)}"
                 )
@@ -165,6 +169,8 @@ def load_manifest(path: str | Path, *, base_dir: str | Path | None = None) -> li
                 if not values[column]:
                     raise ManifestError(f"{path}:{lineno}: required column {column!r} is blank")
             name = values["sample"]
+            if name in (".", "..") or "/" in name or "\\" in name:
+                raise ManifestError(f"{path}:{lineno}: sample is not a safe file identity: {name!r}")
             if name in seen:
                 raise ManifestError(
                     f"{path}:{lineno}: duplicate sample {name!r} (first seen on line {seen[name]})"
@@ -174,7 +180,7 @@ def load_manifest(path: str | Path, *, base_dir: str | Path | None = None) -> li
                 WGSSample(
                     sample=name,
                     bam=_resolve(values["bam"], root),
-                    reference=_resolve(values["reference"], root),
+                    reference=_resolve(values["reference"], ref_root),
                     cohort=values.get("cohort", ""),
                     plate=values.get("plate", ""),
                     background=values.get("background", ""),

@@ -250,25 +250,25 @@ def test_sbatch_sources_bashrc_before_set_u(sbatch_text):
     )
 
 
-def test_sbatch_skip_checks_its_own_output(sbatch_text):
-    """Array tasks are idempotent: each skip-checks its output at task start.
+def test_sbatch_delegates_requeue_reuse_to_the_stage_cache(sbatch_text):
+    """A requeued array task re-enters the stage CLI, whose cache decides reuse.
 
-    Policy section 6 requires this because the owners queue preempts and
-    requeues routinely. This is a SHAPE check on the template (a `-f` test on an
-    output path followed by an early exit) -- it is evidence the idiom is
-    present, not proof that the task is idempotent.
+    This replaces a SHAPE check that required an `if [ -f <output> ]` test with an
+    early `exit 0`. That idiom was the defect: executed on stale output names it
+    exited 0 before the stage ran, so the identity-aware cache never saw a changed
+    BAM, bridge or config. Policy section 6 idempotency is still required; the
+    stage cache provides it (Stage 1 `cache_valid`), and
+    `test_slurm_runtime_contract.py` executes the template body against stale
+    outputs. This check only keeps the short-circuit from returning.
     """
-    has_file_test = re.search(r"if\s+\[\s+-f\s", sbatch_text) or re.search(
-        r"if\s+\[\[\s+-f\s", sbatch_text
+    code = "\n".join(line for line in sbatch_text.splitlines() if not line.lstrip().startswith("#"))
+    assert not re.search(r"\[\[?\s+-[efs]\s", code), (
+        "slurm template tests output existence; reuse must be decided by the stage "
+        "cache, which checks input and code identity, not by file names"
     )
-    assert has_file_test, (
-        "slurm template has no `if [ -f <output> ]` skip-check. Section 6 "
-        "requires each array task to skip-check its own output at task start, "
-        "because the owners queue requeues and a monolithic task loses all "
-        "work in progress."
-    )
-    assert re.search(r"exit\s+0", sbatch_text), (
-        "the skip-check never exits 0 early; a requeued task would redo the work"
+    assert not re.search(r"exit\s+0", code), (
+        "slurm template exits 0 before invoking the stage; a requeued or re-run task "
+        "must reach the stage CLI so its cache can validate or recompute"
     )
 
 

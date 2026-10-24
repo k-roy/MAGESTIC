@@ -1,70 +1,43 @@
-"""
-Step 2 — donor-window editing-outcome pre-calling. **GATED — spec §8.**
+"""Stage 2: explicit donor-window outcomes from sample VCF and gVCF inputs.
 
-Orchestration over TRACE's `trace_crispr.wgs.donor_outcome` (a port of Shengdi
-Li's `precalling_target_outcome.pl`). The stage is wired end-to-end and then
-REFUSES TO RUN, because three measured gates stand between it and a correct
-answer on this program's data.
+Each selected clone needs one donor specification and both variant and reference-depth
+inputs. Missing gVCF remains a data gate, not an unedited result. Underscore contigs
+are supported by structured TRACE variants. The synthetic-error axis is stamped
+DISABLED when design sequence substitutes for an unavailable empirical donor.
 
-🔴 **The gates are DETECTED, not declared.** There is no `enabled:` switch to
-flip: each gate is a property of the inputs, checked against the filesystem every
-run, so the day the inputs change the stage starts working with no code edit —
-and until then it cannot be opened by editing a config.
-
-GATE 2 (§8.2) — **no gVCF exists anywhere**, so the reference depth
-    `precall_sample` needs to separate `designed_variant_unedited` from `unknown`
-    has no source. Checked first because it is the cheapest check and, today,
-    always true: `core.vcf_adapter.precall_inputs` reports `gvcf_missing`.
-    `core/vcf_adapter.py` does the re-representation half of the adapter
-    (96-sample bcftools merge -> per-sample plain-text `.fil.vcf`, AD remapped from
-    FORMAT slot 4 to slot 2). Synthesizing per-position reference depth from a
-    pileup would *derive* a quantity, which belongs in TRACE (spec D3), not in a
-    magestic workaround. Until then every uncovered call collapses to `unknown`,
-    and `unknown` must never be read as `unedited`.
-
-GATE 3 (§8.3) — reproduced empirically: `precall_sample` re-parses its own
-    `f"{chrom}_{pos}_{ref}_to_{alt}"` id with `split("_")` and indexes
-    positionally, so any contig name containing an underscore raises `ValueError`
-    mid-loop, after a partial output is already on disk. Every mandated composite
-    reference carries `plasmid_{oligo}` / `integrated_plasmid_{oligo}` contigs, so
-    the stage is incompatible with the reference standard this program mandates.
-    Checked before the first sample, from the samplesheet.
-
-GATE 1 (§8.1) — the SYNTHETIC_ERROR axis has no input: no per-oligo step-2 donor
-    sequence exists for the 2021 pool and none is derivable from design data (it
-    is an empirical per-oligo observation). This one does not block the run; it
-    makes the output CONDITIONALLY MEANINGFUL, so `core/samplesheet.py` sets
-    `synthetic_donor := design_donor` and stamps `synthetic_error_axis=disabled`,
-    and this step re-reads the written file to confirm the stamp survived. A zero
-    in the `synthetic_errors` column of an unstamped file is a wrong answer waiting
-    to be quoted.
-
-Author: Kevin R. Roy
+Merged in planning/268 with the 222 lane (NN 251/255), whose orthogonal guards are kept:
+the outcome-reason columns appended to every shard (defects 4 and 8), the caller
+provenance refusal read from each plate VCF's own header (NN 255), and the allele-fraction
+annotation from `split_plate_vcf` (defect 1 / F11b). Its workarounds for TRACE `7c4c10f`
+are retired, because the pinned TRACE closes those defects itself: the `ContigAlias`
+encode/decode (GATE 3; TRACE builds variant ids from structured fields), the gVCF
+reference-block expansion (defect 5; TRACE reads `INFO/END` and validates every REF,
+which the expander's copied REF failed), and the multi-allelic refusal (defect 14; TRACE
+selects the ALT that GT names).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
 from trace_crispr.wgs import donor_outcome
 
 from ..config import DONOR_PRECALL_SUBDIR, WGSConfig
-from ..core.blacklist_adapter import reference_contig_lengths
-from ..core.contig_alias import ContigAlias, alias_rows
-from ..core.donor_precall import alias_fasta, alias_vcf_contigs, audit_vcf_window
-from ..core.gvcf_adapter import expand_reference_blocks
+from ..core.donor_precall import audit_vcf_window
 from ..core.manifest import WGSSample
 from ..core.outcome_reason import explain_outcome
 from ..core.samplesheet import (
     build_samplesheet,
     read_axis_stamp,
     stamp_outcome_table,
-    underscore_contigs,
 )
 from ..core.vcf_adapter import (
     CALLER_PLOIDY,
+    MAG_MINOR_TAG,
     PLOIDY_CAVEAT,
     PRECALL_GVCF_SUBDIR,
     PRECALL_GVCF_SUFFIX,
@@ -73,15 +46,20 @@ from ..core.vcf_adapter import (
     caller_provenance,
     precall_inputs,
     split_plate_vcf,
+    vcf_samples,
 )
 from ._common import (
     GateError,
     StepIncompleteError,
+    cache_key,
+    cache_valid,
+    cache_commit,
     cohort_table,
     collect_shards,
     manifest_samples,
     publish,
     record_for,
+    require_indexed_bam,
     require_row_count,
     shard_dir,
     write_provenance,
@@ -95,19 +73,12 @@ SHARD_SUFFIX = ".donor_outcome.tsv"
 TABLE_NAME = "donor_outcome.tsv"
 
 GATE_1 = (
-    "GATE 1 (spec §8.1): no per-oligo step-2 synthetic donor exists for the 2021 pool, "
-    "so the SYNTHETIC_ERROR axis ships DISABLED and every output is stamped."
+    "The synthetic-error axis requires an explicit empirical donor; substituting "
+    "the design disables the axis and is stamped in each output."
 )
 GATE_2 = (
-    "GATE 2 (spec §8.2): no gVCF exists for this cohort, so `designed_variant_unedited` "
-    "cannot be separated from `unknown`. The missing piece is a reference-depth "
-    "primitive in TRACE, not a magestic workaround."
-)
-GATE_3 = (
-    "GATE 3 (spec §8.3): donor_outcome.precall_sample crashes on any contig name "
-    "containing '_', and every mandated composite reference carries plasmid_{oligo} / "
-    "integrated_plasmid_{oligo} contigs. The fix is TRACE-side (carry structured fields "
-    "instead of re-parsing a delimited string)."
+    "A selected sample is missing its required gVCF reference-depth input; "
+    "missing evidence cannot establish an unedited donor."
 )
 
 
@@ -126,82 +97,165 @@ def samplesheet_path(config: WGSConfig, sample: str) -> Path:
     return config.paths.samplesheets / f"{sample}.samplesheet.tsv"
 
 
+def split_vcf_path(config: WGSConfig, sample: str) -> Path:
+    """The per-sample called-variant VCF that TRACE reads.
+
+    Stage 2 PRODUCES it only when `donor_precall.plate_vcfs` is configured (the plate
+    adapter splits it). With `plate_vcfs: []` it is an externally supplied INPUT:
+    hashed where consumed, never given a Stage 2 producer receipt.
+    """
+    return config.paths.donor_precall_workdir / PRECALL_VCF_SUBDIR / f"{sample}{PRECALL_VCF_SUFFIX}"
+
+
+def gvcf_path(config: WGSConfig, sample: str) -> Path:
+    """The per-sample reference-depth gVCF (always an input)."""
+    return config.paths.donor_precall_workdir / PRECALL_GVCF_SUBDIR / f"{sample}{PRECALL_GVCF_SUFFIX}"
+
+
+def _receipt(path: Path) -> Path:
+    from ..qc.provenance import SIDECAR_SUFFIX
+    return Path(str(path) + SIDECAR_SUFFIX)
+
+
+def _owned_outputs(config: WGSConfig, sample: str) -> list[Path]:
+    """Every data artifact Stage 2 produces for one sample, shard first."""
+    owned = [shard_path(config, sample), samplesheet_path(config, sample)]
+    if config.donor_precall.plate_vcfs:
+        owned.append(split_vcf_path(config, sample))
+    return owned
+
+
+def _completion_set(config: WGSConfig, sample: str) -> list[Path]:
+    """What a completed sample consists of: each owned artifact AND its receipt.
+
+    Shared by the per-sample path and the fan-in, so a missing, foreign or damaged
+    receipt makes exactly that sample incomplete instead of being skipped.
+    """
+    owned = _owned_outputs(config, sample)
+    return owned + [_receipt(path) for path in owned]
+
+
+_MD5_MEMO: dict[tuple, str] = {}
+
+
+def _md5_attested(path: Path) -> str:
+    """Raw MD5 of an input, computed once per process per file identity.
+
+    A reference FASTA or plate VCF feeds many sample receipts; rehashing it for each
+    would cost samples x bytes. The key is the file's stat identity (device, inode,
+    size, nanosecond mtime and ctime), so a replaced or edited file is hashed again.
+    """
+    path = Path(path)
+    stat = path.stat()
+    key = (os.path.realpath(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    if key not in _MD5_MEMO:
+        digest = hashlib.md5()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 22), b""):
+                digest.update(block)
+        _MD5_MEMO[key] = digest.hexdigest()
+    return _MD5_MEMO[key]
+
+
+def _write_receipt(output: Path, *, inputs: dict[str, Path], parameters: dict, counts: dict) -> Path:
+    """One artifact's own producer receipt, without touching the run-level index.
+
+    Sample workers run concurrently under Snakemake/SLURM; refreshing the shared
+    directory index from each of them would let one overwrite another's newer
+    membership. The fan-in refreshes it once.
+    """
+    from ..qc.provenance import write_step_provenance
+    return write_step_provenance(STEP, output, inputs=inputs, parameters=parameters, counts=counts,
+                                 input_md5={role: _md5_attested(path) for role, path in inputs.items()})
+
+
+def _donor_inputs(config: WGSConfig) -> dict[str, Path]:
+    """The source tables every samplesheet row is derived from."""
+    table = getattr(config.donor_precall, "donor_table", None) or config.reconcile.oligo_windows
+    return {"manifest": Path(config.paths.manifest), "donor_table": Path(table),
+            "oligo_assignments": Path(config.reconcile.oligo_assignments)}
+
+
 def gate_reason() -> str:
     """The string `run_pipeline` records in place of an artifact path."""
-    return f"GATED: {GATE_2} | {GATE_3} | {GATE_1}"
+    return f"GATED: {GATE_2} | {GATE_1}"
 
 
 def run_step_2(config: WGSConfig, sample: str | None = None) -> Path:
     """Pre-call donor-window editing outcomes. Returns the path written.
 
-    Raises `GateError` while any blocking gate is open — which is the state today
-    for every cohort inventoried.
+    Raises `GateError` when a selected sample lacks its required gVCF input.
     """
     if sample is not None:
         return _run_one_sample(config, sample)
     return _combine(config)
 
 
-def _run_one_sample(config: WGSConfig, sample: str) -> Path:
-    """One sample. Idempotent: a finished shard short-circuits every gate check."""
+def _run_one_sample(config: WGSConfig, sample: str, *, record: WGSSample | None = None,
+                    prepared_rows: dict | None = None,
+                    loaded_reference: donor_outcome.LoadedReference | None = None) -> Path:
+    """Run one sample and publish its completed outcome atomically."""
     out = shard_path(config, sample)
-    if out.exists():
+    record = record if record is not None else record_for(config, sample)
+    workdir = config.paths.donor_precall_workdir
+    dependencies = {'vcf': split_vcf_path(config, sample), 'gvcf': gvcf_path(config, sample)}
+    completion = _completion_set(config, sample)
+    key = cache_key(config, STEP, record, inputs=dependencies)
+    if cache_valid(completion, key):
         logger.info("step_2: %s already complete — skipping", sample)
         return out
 
-    record = record_for(config, sample)
-    workdir = config.paths.donor_precall_workdir
+    require_indexed_bam(record)
 
-    minor_alleles = _require_vcf_inputs(config, record, workdir)
-    alias = _gate_3_alias(config, record)
-    sheet, axis = _build_samplesheet(config, sample, alias=alias)
-
-    genome = Path(record.reference)
-    vcf = workdir / PRECALL_VCF_SUBDIR / f"{sample}{PRECALL_VCF_SUFFIX}"
-    gvcf = workdir / PRECALL_GVCF_SUBDIR / f"{sample}{PRECALL_GVCF_SUFFIX}"
-    if alias is not None:
-        # PER-SAMPLE path, not `{stem}.aliased.fa`: step_2 fans out as a SLURM array,
-        # so every sample on the same reference would otherwise write and index the
-        # same FASTA concurrently — a torn file or a half-written `.fai`. Costs one
-        # small FASTA per sample and removes the race entirely.
-        genome = workdir / f"{sample}.{genome.stem}.aliased.fa"
-        alias_fasta(record.reference, genome, alias)
-        for path in (vcf, gvcf):
-            staged = path.with_name(path.name + ".aliased")
-            alias_vcf_contigs(path, staged, alias)
-            staged.replace(path)
-        _require_alias_consistency(alias, sheet, vcf, gvcf, genome)
-        logger.info(
-            "step_2: %s GATE 3 resolved by ContigAlias over %d aliased contig(s) "
-            "(%s...); variant ids are DECODED before the shard is published",
-            sample, len(alias.aliased), ", ".join(alias.aliased[:3]),
-        )
+    if prepared_rows is None:
+        _require_vcf_inputs(config, record, workdir)
+    elif sample not in prepared_rows:
+        raise StepIncompleteError(f"step_2: prepared inputs omit requested sample {sample!r}")
+    sheet, axis = _build_samplesheet(config, sample, row=prepared_rows[sample] if prepared_rows is not None else None)
+    _write_receipt(sheet, inputs=_donor_inputs(config),
+                   parameters={"sample": sample, "synthetic_donor_source": config.donor_precall.synthetic_donor_source,
+                               "synthetic_error_axis": axis},
+                   counts={"samplesheet_rows": 1})
+    # Adapter publication changes the generated per-sample VCF identity; capture
+    # the consumed version only after that step, retaining source plate VCFs too.
+    key = cache_key(config, STEP, record, inputs=dependencies)
 
     raw = out.with_name(out.name + ".raw")
     results = donor_outcome.precall(
         sheet,
         workdir,
-        genome,
+        Path(record.reference),
         raw,
         ne_threshold=config.donor_precall.ne_threshold,
         quantification_window_size=config.donor_precall.quantification_window_size,
         quantification_window_cov_perc=config.donor_precall.quantification_window_cov_perc,
         samples={sample},
+        loaded_reference=loaded_reference,
     )
     if len(results) != 1:
         raise StepIncompleteError(
             f"step_2: precall returned {len(results)} outcomes for {sample}, expected 1. "
-            "TRACE drops a sample whose vcf/gvcf is missing with a bare `continue` — no "
-            "warning, no count, and an output file that looks complete."
+            "The returned sample denominator must match the requested sample."
         )
-    if alias is not None:
-        n_decoded = _decode_outcome_table(raw, alias)
-        logger.info("step_2: %s decoded %d aliased variant id(s)", sample, n_decoded)
     _annotate_outcome_reason(
-        config, record, workdir, raw, results[0], minor_alleles=minor_alleles
+        config, record, workdir, raw, results[0],
+        minor_alleles=_minor_alleles_from_vcf(dependencies["vcf"]),
     )
     stamp_outcome_table(raw, synthetic_error_axis=axis)
     publish(raw, out)
+    _write_receipt(out, inputs={"samplesheet": sheet, "called_variants_vcf": dependencies["vcf"],
+                                "reference_depth_gvcf": dependencies["gvcf"], "reference": Path(record.reference)},
+                   parameters={"sample": sample,
+                               "called_variants_vcf_origin": ("stage2_plate_adapter" if config.donor_precall.plate_vcfs
+                                                              else "external_input"),
+                               "bam_preflight": str(record.bam),
+                               "ne_threshold": config.donor_precall.ne_threshold,
+                               "quantification_window_size": config.donor_precall.quantification_window_size,
+                               "quantification_window_cov_perc": config.donor_precall.quantification_window_cov_perc,
+                               "synthetic_error_axis": axis},
+                   counts={"outcome_rows": len(results)})
+    # Completion is recorded last: after every owned artifact AND its receipt exists.
+    cache_commit(completion, key)
     logger.info("step_2: %s outcome=%s", sample, results[0].editing_outcome)
     return out
 
@@ -314,113 +368,103 @@ def _append_columns(table: Path, columns: Sequence[str], values: Sequence[str]) 
             fh.write(line + "\n")
 
 
-def _require_vcf_inputs(
-    config: WGSConfig, record: WGSSample, workdir: Path
-) -> tuple[str, ...]:
-    """Run the VCF adapter, then refuse on GATE 2 if the gVCF half is still missing.
+def _minor_alleles_from_vcf(path: Path) -> tuple[str, ...]:
+    """Variant ids `split_plate_vcf` tagged `MAG_MINOR` in this sample's own VCF.
 
-    🔴 NN 251 defect 17 (found while fixing defect 1, not on the original inventory):
-    this call previously read
-
-        split_plate_vcf(..., ad_index=config.donor_precall.ad_format_slot_in)
-
-    which has **two** bugs in one line. `split_plate_vcf` has no `ad_index`
-    parameter — it is `ad_slot` — so the call was a guaranteed `TypeError`; and
-    `ad_format_slot_in` is 4, the slot bcftools writes `AD` to, where the function
-    wants the DESTINATION slot, which is `ad_format_slot_out` (2, where TRACE's
-    positional gVCF parser reads reference depth). Passing 4 would have left `AD`
-    where it already was and made TRACE read `PL`'s first comma element as the
-    reference depth. Both halves are fixed here and asserted by
-    `test_fixed_step_2_passes_the_destination_ad_slot`.
-
-    🔴 NN 251 defect 14: `VcfSplitResult.n_multiallelic` was computed and never
-    read. TRACE reads ALT whole, so a multi-allelic `"A,G"` reaches
-    `bucket_variant` as a literal two-character allele and every Levenshtein
-    distance from it is wrong. Refused here rather than discarded.
+    Read back from the file rather than carried in memory, so the per-sample SLURM path,
+    the cohort path and a cache-reused split all report the same set. An externally
+    supplied VCF (`plate_vcfs: []`) was never annotated and so yields `()`, exactly as
+    the 222 lane's in-memory route did.
     """
-    multiallelic = 0
-    minor: tuple[str, ...] = ()
-    for plate_vcf in config.donor_precall.plate_vcfs:
-        _require_recoverable_caller(config, plate_vcf)
-        split = split_plate_vcf(
-            plate_vcf,
-            workdir,
-            samples=[record.sample],
-            ad_slot=config.donor_precall.ad_format_slot_out,
+    if not Path(path).exists():
+        return ()
+    found: list[str] = []
+    with Path(path).open() as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) > 7 and MAG_MINOR_TAG in cols[7].split(";"):
+                found.append(f"{cols[0]}_{cols[1]}_{cols[3]}_to_{cols[4]}")
+    return tuple(dict.fromkeys(found))
+
+
+def _require_vcf_inputs(config: WGSConfig, record: WGSSample, workdir: Path) -> None:
+    """Use the same preparation path for a single scheduler sample."""
+    _prepare_vcf_inputs(config, [record], workdir)
+
+
+def _prepare_vcf_inputs(config: WGSConfig, records: list[WGSSample], workdir: Path) -> None:
+    """Validate reference-depth inputs, then scan each selected plate at most once."""
+    samples = [record.sample for record in records]
+    inputs = precall_inputs(workdir, samples)
+    if inputs.gvcf_missing:
+        raise GateError(f"step_2: {GATE_2} (no gVCF for {', '.join(inputs.gvcf_missing)})")
+    sources = {sample: [] for sample in samples}
+    groups = []
+    for plate in config.donor_precall.plate_vcfs:
+        names = set(vcf_samples(plate))
+        selected = [sample for sample in samples if sample in names]
+        if selected:
+            groups.append((plate, selected))
+        for sample in selected:
+            sources[sample].append(plate)
+    if config.donor_precall.plate_vcfs:
+        for sample, matching in sources.items():
+            if not matching:
+                raise StepIncompleteError(f"step_2: sample {sample!r} absent from every configured plate VCF")
+            if len(matching) != 1:
+                raise StepIncompleteError(f"step_2: sample {sample!r} occurs in multiple plate VCFs: {matching}")
+    for plate, selected in groups:
+        _require_recoverable_caller(config, plate)
+        result = split_plate_vcf(
+            plate, workdir, samples=selected, ad_slot=config.donor_precall.ad_format_slot_out,
             min_allele_fraction=config.donor_precall.min_allele_fraction,
             min_alt_reads=config.donor_precall.min_alt_reads,
         )
         if (
-            split.n_rescued_by_af or split.n_no_ad or split.n_dropped_below_af
-            or split.n_flagged_minor or split.n_dropped_below_min_alt_reads
-            or split.n_no_ad_carrying_alt
+            result.n_rescued_by_af or result.n_no_ad or result.n_dropped_below_af
+            or result.n_flagged_minor or result.n_dropped_below_min_alt_reads
+            or result.n_no_ad_carrying_alt
         ):
             logger.info(
                 "step_2: %s allele fraction — %d of %d record(s) had a usable AD; "
                 "flagged MAG_MINOR %d (of which %d ALREADY CARRIED THE ALT IN GT, the "
                 "NN 252 F11b over-call class); rescued %d, below fraction %d, below "
-                "%d alt read(s) %d, no AD %d, no AD WITH an alt GT %d; "
-                "minor-allele variants %s",
-                record.sample, split.n_af_computed, split.n_records_in,
-                split.n_flagged_minor, split.n_flagged_minor_carrying_alt,
-                split.n_rescued_by_af, split.n_dropped_below_af,
+                "%d alt read(s) %d, no AD %d, no AD WITH an alt GT %d",
+                Path(plate).name, result.n_af_computed, result.n_records_in,
+                result.n_flagged_minor, result.n_flagged_minor_carrying_alt,
+                result.n_rescued_by_af, result.n_dropped_below_af,
                 config.donor_precall.min_alt_reads,
-                split.n_dropped_below_min_alt_reads, split.n_no_ad,
-                split.n_no_ad_carrying_alt,
-                split.minor_allele_variants.get(record.sample, ()),
+                result.n_dropped_below_min_alt_reads, result.n_no_ad,
+                result.n_no_ad_carrying_alt,
             )
-        multiallelic += split.n_multiallelic
-        minor += split.minor_allele_variants.get(record.sample, ())
-    if multiallelic:
-        raise StepIncompleteError(
-            f"step_2: {multiallelic} multi-allelic record(s) in the plate VCF(s) for "
-            f"{record.sample}. TRACE reads the ALT column whole, so an ALT of 'A,G' "
-            "reaches bucket_variant as a literal allele and every edit distance from "
-            "it is wrong. Normalize upstream with `bcftools norm -m-` and re-run. "
-            "(VcfSplitResult.n_multiallelic was computed and discarded before NN 251.)"
-        )
-    inputs = precall_inputs(workdir, [record.sample])
-    if inputs.gvcf_missing:
-        raise GateError(f"step_2: {GATE_2} (no gVCF for {', '.join(inputs.gvcf_missing)})")
-    # 🔴 NN 251 defect 5, wired on the path Stage 2 actually takes. TRACE's
-    # `flag_covered` compares only POS, so a NORMAL compressed gVCF — one record per
-    # reference block carrying `INFO END=` — reports `unknown` for a well-covered
-    # unedited cell. Expanding blocks to positions is pure re-representation, and it
-    # must happen BEFORE `precall` reads the file. No gVCF exists in this cohort today
-    # (GATE 2 above), so this is a landmine being defused, not a live correction.
-    gvcf = workdir / PRECALL_GVCF_SUBDIR / f"{record.sample}{PRECALL_GVCF_SUFFIX}"
-    if gvcf.exists():
-        staged = gvcf.with_name(gvcf.name + ".expanded")
-        res = expand_reference_blocks(gvcf, staged)
-        if res.n_blocks_expanded:
-            staged.replace(gvcf)
-            logger.info(
-                "step_2: %s expanded %d gVCF reference block(s) to %d position record(s) "
-                "(widest %d bp); without this a compressed gVCF reports `unknown` for a "
-                "covered unedited cell",
-                record.sample, res.n_blocks_expanded, res.n_records_out,
-                res.max_block_width,
-            )
-        else:
-            staged.unlink(missing_ok=True)
-        if res.n_malformed_end:
-            raise StepIncompleteError(
-                f"step_2: {record.sample}'s gVCF has {res.n_malformed_end} record(s) "
-                "with an unparseable `END=`. Treating those as per-position would "
-                "UNDER-report coverage and manufacture an `unknown`, so the run stops "
-                "instead."
-            )
+        if result.n_multiallelic:
+            # Not refused since planning/268: the pinned TRACE selects the ALT that GT
+            # names. Counted, and recorded in each sample's split receipt below.
+            logger.info("step_2: %s carries %d multi-allelic record(s); TRACE selects "
+                        "the allele GT names", Path(plate).name, result.n_multiallelic)
+        for sample in selected:
+            produced = Path(result.vcf_paths[sample])
+            if produced.resolve() != split_vcf_path(config, sample).resolve():
+                raise StepIncompleteError(f"step_2: adapter wrote {produced}, expected {split_vcf_path(config, sample)}")
+            _write_receipt(produced, inputs={"plate_vcf": Path(plate)},
+                           parameters={"sample": sample, "ad_format_slot_out": result.ad_slot,
+                                       "adapter": "magestic.pipelines.wgs.core.vcf_adapter.split_plate_vcf"},
+                           counts={"plate_records_in": result.n_records_in,
+                                   "sample_records_out": result.n_records_out[sample],
+                                   "plate_multiallelic_records": result.n_multiallelic})
+    inputs = precall_inputs(workdir, samples)
     if inputs.vcf_missing:
         raise StepIncompleteError(
             f"step_2: no per-sample VCF for {', '.join(inputs.vcf_missing)} under {workdir}. "
-            "precall would skip the sample silently and still write a file."
+            "A called-variant input is required independently of reference coverage."
         )
-    # 🔴 NN 251 defect 1, second half. A RESCUED minor allele reaches Stage 2 as a
-    # 100% call, because TRACE reads only VCF columns 0/1/3/4 — never GT, FILTER,
-    # INFO or FORMAT. Returning the ids so they reach the SHARD is what stops a
-    # 10% allele from shipping as `designed_variant_installed`, which is the live
-    # over-call class of 242 section 7a (`AD=29,1` read as installed).
-    return tuple(dict.fromkeys(minor))
+    for sample in samples:
+        for path in (workdir / "vcf" / f"{sample}.fil.vcf", workdir / "gvcf" / f"{sample}.g.vcf"):
+            names = vcf_samples(path)
+            if names != (sample,):
+                raise StepIncompleteError(f"step_2: {path} sample header {names!r} does not match {sample!r}")
 
 
 def _require_recoverable_caller(config: WGSConfig, plate_vcf: Path) -> None:
@@ -499,30 +543,13 @@ def _require_recoverable_caller(config: WGSConfig, plate_vcf: Path) -> None:
         )
 
 
-def _build_samplesheet(
-    config: WGSConfig, sample: str, *, alias: ContigAlias | None = None
-) -> tuple[Path, str]:
-    """Build this sample's samplesheet and check GATE 3. Returns `(path, axis)`.
-
-    `alias` is the GATE-3 remedy from `_gate_3_alias`. When it is `None` the gate
-    refuses on an underscore contig exactly as before; when it is supplied the rows'
-    `chrom` is encoded through it and `_run_one_sample` decodes the output.
-
-    `readers.oligo_tables` is imported inside the function, not at module scope:
-    it is unreachable while GATE 2 is open, and deferring it keeps this module
-    importable (and therefore testable) without it. See the integration note in
-    the module report — the donor-row source is the one input `config` does not
-    name today.
-    """
+def _build_samplesheet(config: WGSConfig, sample: str, *, row: dict | None = None) -> tuple[Path, str]:
+    """Build this sample's explicit donor specification and axis metadata."""
     from ..readers.oligo_tables import donor_samplesheet_rows
 
-    rows = list(donor_samplesheet_rows(config, [sample]))
-    offenders = underscore_contigs(rows)
-    if offenders and alias is None:
-        raise GateError(f"step_2: {GATE_3} Offending contig(s): {', '.join(offenders[:5])}")
-    if alias is not None:
-        rows = alias_rows(rows, alias, key=config.columns.chrom_col)
-
+    rows = list(donor_samplesheet_rows(config, [sample])) if row is None else [row]
+    if any(r.get("sample") != sample for r in rows):
+        raise StepIncompleteError(f"step_2: donor row identity does not match {sample!r}")
     result = build_samplesheet(
         rows,
         samplesheet_path(config, sample),
@@ -535,169 +562,49 @@ def _build_samplesheet(
     return result.path, result.synthetic_error_axis
 
 
-def _gate_3_alias(config: WGSConfig, record: WGSSample) -> ContigAlias | None:
-    """The contig alias GATE 3 needs for this reference, or `None` when unnecessary.
+def prepare_step_2(config: WGSConfig, records: list[WGSSample]) -> dict[str, dict]:
+    """Prepare selected inputs once for direct-cohort execution.
 
-    🔴 NN 251 defect 3 + 14. `core/contig_alias.ContigAlias` is a bijective,
-    self-asserting adapter that solves GATE 3, and before NN 251 it was imported by
-    nothing — the gate simply refused. It is wired here.
-
-    Built over **every** contig in the reference, not just this sample's donor
-    contig: the alias must be a property of the reference so two samples on the same
-    reference get the same mapping and their outputs are comparable.
-
-    Returns `None` when the reference needs no aliasing, in which case Stage 2 runs
-    byte-identically to before (`ContigAlias.is_noop`).
+    Returns in-memory donor rows keyed by sample after validating/splitting source
+    VCFs. This is a preparation seam, not a cross-process cache or completion flag;
+    scheduler preparation requires separately persisted, fingerprinted artifacts.
     """
-    if not config.donor_precall.resolve_underscore_contigs:
-        return None
-    lengths = reference_contig_lengths(record.reference)
-    if not lengths:
-        raise StepIncompleteError(
-            f"step_2: no contig names readable for {record.reference}; GATE 3 cannot be "
-            "resolved without the reference's own contig list (an alias built from one "
-            "sample's rows would not be comparable across samples)."
-        )
-    alias = ContigAlias.from_names(lengths)
-    return None if alias.is_noop else alias
-
-
-def _require_alias_consistency(
-    alias: ContigAlias, sheet: Path, vcf: Path, gvcf: Path, fasta: Path
-) -> None:
-    """Refuse unless the alias was applied CONSISTENTLY to every input TRACE will read.
-
-    🔴 This is the guard that keeps wiring the alias from being worse than the crash it
-    replaces. `precall_sample` skips a record whose `v_chr != chrom` **silently**, so a
-    half-applied alias produces no error, no variants, and a plausible
-    `unedited`/`unknown` — a wrong answer where there used to be a loud `ValueError`.
-
-    The samplesheet `chrom` must be an alias this reference produced, and must be in the
-    aliased FASTA. For the two VCFs the test is **consistency, not presence**:
-
-    * a RAW name the reference carries and the alias maps away is fatal (NN 255 F6 — set
-      membership over CHROM values could not see this, because both forms can coexist);
-    * a name the reference does not carry at all is counted and named (F6b);
-    * **the donor contig being absent is NOT an error** (NN 255 F5). An unedited cell
-      legitimately has variants elsewhere and none at its donor window, and the old
-      check refused exactly that — the majority class, on the path NN 251 itself called
-      "the riskiest thing in this change set".
-    """
-    import pysam
-
-    header = sheet.read_text().splitlines()
-    if len(header) < 2:
-        raise StepIncompleteError(f"step_2: samplesheet {sheet} has no data row")
-    cols = header[0].split("\t")
-    chrom = header[1].split("\t")[cols.index("chrom")].strip()
-    if chrom not in alias.decode_map:
-        raise StepIncompleteError(
-            f"step_2: samplesheet contig {chrom!r} is not an alias this reference "
-            "produced — the alias was applied inconsistently, which would make "
-            "precall_sample skip every variant in silence."
-        )
-    with pysam.FastaFile(str(fasta)) as fa:
-        if chrom not in set(fa.references):
-            raise StepIncompleteError(
-                f"step_2: aliased contig {chrom!r} is absent from the aliased FASTA "
-                f"{fasta}. precall_sample would raise KeyError, or worse skip silently."
-            )
-    aliasable = set(alias.aliased)
-    for path, label in ((vcf, "vcf"), (gvcf, "gvcf")):
-        seen = {
-            line.split("\t", 1)[0]
-            for line in path.read_text().splitlines()
-            if line and not line.startswith("#")
-        }
-        # 🔴 NN 255 F5 + F6. The old check was `if seen and chrom not in seen: raise`,
-        # which asks the WRONG QUESTION. "Is there a variant on the donor contig?" is
-        # not the same question as "was the alias applied consistently": an UNEDITED
-        # cell — the majority class, and the one `designed_variant_unedited` exists for
-        # — legitimately carries variants elsewhere in the genome and NONE at its donor
-        # window, and NN 252 measured that the guard hard-stopped exactly that input.
-        # Its severity was also inverted by the `if seen` short-circuit: a header-only
-        # VCF passed unchecked while one off-contig record was fatal.
-        #
-        # The right question is answerable from the alias itself. A name the reference
-        # DOES carry and that needed an alias must never still be present in raw form:
-        # that, and only that, is the half-applied alias whose records TRACE would skip
-        # in silence (`v_chr != chrom`). It is also F6, which set membership over CHROM
-        # values could not see, because the raw and aliased names can both be present.
-        unaliased = sorted(seen & aliasable)
-        if unaliased:
-            raise StepIncompleteError(
-                f"step_2: the aliased {label} {path.name} still carries RAW contig "
-                f"name(s) {unaliased[:3]} that this reference's alias maps to "
-                f"{[alias.encode(c) for c in unaliased[:3]]}. The alias was applied "
-                "to some records and not others, so precall_sample would skip the "
-                "un-aliased ones in silence (v_chr != chrom) and produce a plausible "
-                "`unedited`/`unknown` instead of an error. Re-run alias_vcf_contigs "
-                "over the whole file."
-            )
-        unknown = sorted(c for c in seen if c not in alias.decode_map)
-        if unknown:
-            # F6b: `alias.encode` is identity for a name absent from the reference's
-            # `.fai`, so a VCF contig the composite reference does not carry keeps its
-            # underscores. Harmless for TRACE's positional id parse only because
-            # `precall_sample` filters `v_chr != chrom` first — a coincidence, not a
-            # guard — so it is counted and named rather than passed over.
-            logger.warning(
-                "step_2: NOT VERIFIED: the aliased %s %s carries %d CHROM value(s) "
-                "absent from the reference's own contig list, so the alias is identity "
-                "for them and they keep any underscores: %s. TRACE skips them because "
-                "they are not the donor contig, which is a coincidence rather than a "
-                "guard; they belong in the reference or out of the VCF.",
-                label, path.name, len(unknown), unknown[:5],
-            )
-        if chrom not in seen:
-            # The UNEDITED class. Not an error, and the loudest thing it deserves is a
-            # count: the alias has already been proven consistent above.
-            logger.info(
-                "step_2: %s carries no record on the donor contig %r (%d other CHROM "
-                "value(s) present). That is the `designed_variant_unedited` class, not "
-                "a mis-applied alias — the alias was verified consistent above.",
-                path.name, chrom, len(seen),
-            )
-
-
-def _decode_outcome_table(path: Path, alias: ContigAlias) -> int:
-    """Map every variant id in a Stage-2 outcome table back to real contig names.
-
-    🔴 The half the peer who wrote `ContigAlias` deliberately stopped short of, and
-    was right to: wiring the alias WITHOUT this would ship `ctg0003_131_A_to_G` into
-    a shipped table — a silent wrong name in place of a loud crash.
-
-    TRACE's schema is `#sample_name, editing_outcome, designed_variants,
-    synthetic_errors, spontaneous_variants`; the last three are `;`-joined variant
-    ids. Returns the number of ids rewritten, so the re-representation has a count.
-    """
-    lines = path.read_text().splitlines()
-    n = 0
-    out: list[str] = []
-    for line in lines:
-        if line.startswith("#") or not line.strip():
-            out.append(line)
-            continue
-        cols = line.split("\t")
-        for i in (2, 3, 4):
-            if i >= len(cols) or not cols[i].strip():
-                continue
-            ids = cols[i].split(";")
-            decoded = [alias.decode_variant_id(v) for v in ids]
-            n += sum(1 for a, b in zip(ids, decoded) if a != b)
-            cols[i] = ";".join(decoded)
-        out.append("\t".join(cols))
-    with path.open("w", newline="\n") as fh:
-        for line in out:
-            fh.write(line + "\n")
-    return n
+    from ..readers.oligo_tables import donor_samplesheet_rows
+    if not records:
+        return {}
+    samples = [record.sample for record in records]
+    if len(samples) != len(set(samples)):
+        raise StepIncompleteError("step_2: duplicate requested preparation sample")
+    _prepare_vcf_inputs(config, records, config.paths.donor_precall_workdir)
+    rows = list(donor_samplesheet_rows(config, samples))
+    prepared = {row["sample"]: row for row in rows}
+    if set(prepared) != set(samples) or len(rows) != len(samples):
+        raise StepIncompleteError("step_2: donor preparation sample denominator mismatch")
+    return prepared
 
 
 def _combine(config: WGSConfig) -> Path:
     """Fan-in: every sample, then the cohort table, then re-read the GATE-1 stamp."""
     records = manifest_samples(config)
+    groups: dict[Path, list[WGSSample]] = {}
+    workdir = config.paths.donor_precall_workdir
+    pending = []
     for record in records:
-        _run_one_sample(config, record.sample)
+        sample = record.sample
+        key = cache_key(config, STEP, record, inputs={"vcf": split_vcf_path(config, sample),
+                                                    "gvcf": gvcf_path(config, sample)})
+        if not cache_valid(_completion_set(config, sample), key):
+            pending.append(record)
+            groups.setdefault(Path(record.reference).resolve(), []).append(record)
+    prepared = prepare_step_2(config, pending)
+    for reference, group in groups.items():
+        # Release each loaded reference before the next group: memory scales with
+        # one reference, not the number of distinct backgrounds in a cohort.
+        loaded = donor_outcome.load_reference(reference)
+        for record in group:
+            _run_one_sample(config, record.sample, record=record, prepared_rows=prepared,
+                            loaded_reference=loaded)
+        del loaded
 
     header, rows = collect_shards(
         records, lambda r: shard_path(config, r.sample), label="step_2 donor outcome"
@@ -709,24 +616,41 @@ def _combine(config: WGSConfig) -> Path:
     unknown = sum(1 for row in rows if row.split("\t")[1].startswith("unknown"))
     logger.info(
         "step_2: %d samples; %d (%.1f%% of %d) outcome=unknown. unknown is NOT unedited "
-        "(GATE 2 — there is no gVCF to prove coverage).",
+        "(reference coverage or genotype evidence is insufficient).",
         n,
         unknown,
         100.0 * unknown / n if n else 0.0,
         n,
     )
 
+    # The cohort receipt binds its full source closure and the shards it concatenated.
+    inputs = dict(_donor_inputs(config))
+    for index, plate in enumerate(config.donor_precall.plate_vcfs):
+        inputs[f"plate_vcf:{index}"] = Path(plate)
+    for index, reference in enumerate(dict.fromkeys(Path(r.reference) for r in records)):
+        inputs[f"reference:{index}"] = reference
+    for record in records:
+        sample = record.sample
+        inputs[f"called_variants_vcf:{sample}"] = split_vcf_path(config, sample)
+        inputs[f"reference_depth_gvcf:{sample}"] = gvcf_path(config, sample)
+        inputs[f"samplesheet:{sample}"] = samplesheet_path(config, sample)
+        inputs[f"shard:{sample}"] = shard_path(config, sample)
     write_provenance(
         STEP,
         out,
-        inputs={"manifest": Path(config.paths.manifest)},
+        inputs=inputs,
+        input_md5={role: _md5_attested(path) for role, path in inputs.items()},
         parameters={
             "synthetic_error_axis": read_axis_stamp(out),
             "synthetic_donor_source": config.donor_precall.synthetic_donor_source,
             "ne_threshold": config.donor_precall.ne_threshold,
             "quantification_window_size": config.donor_precall.quantification_window_size,
             "quantification_window_cov_perc": config.donor_precall.quantification_window_cov_perc,
-            "gates": [GATE_1, GATE_2, GATE_3],
+            "reference_depth_inputs": "validated_per_sample_gvcf",
+            "unedited_coverage_policy": (
+                "central_window_fraction_and_all_diagnostic_positions; "
+                "length_changing_design_requires_whole_donor_reference_coverage"
+            ),
         },
         counts={"samples": n, "outcome_unknown": unknown},
     )

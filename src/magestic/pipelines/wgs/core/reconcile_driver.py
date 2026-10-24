@@ -1,262 +1,97 @@
-"""
-magestic.pipelines.wgs.core.reconcile_driver — compose TRACE's reconcile primitives.
-
-Stage 4 is the only TRACE entry point that is not library-callable with keyword
-arguments: `reconcile.run(args: argparse.Namespace)` takes a Namespace and discovers its
-BAMs with a bare `glob`. Synthesizing a Namespace to reach it would smuggle a CLI
-boundary into the middle of the orchestration layer and would re-introduce the
-silent-empty glob (a `bam_suffix` that matches nothing writes a header-only TSV and
-returns 0). So this module composes the same primitives directly, from the manifest.
-
-🔴 **It re-implements no algorithm.** `classify_site`, `window_edit_vaf`,
-`build_edit_sites` and `reconcile_cell` are called, never copied, and every threshold
-they own is left at TRACE's default unless the screen config explicitly overrides it —
-hence the `None` defaults below, which mean "TRACE decides" rather than a number
-restated in the wrong layer.
-
-The one exception is documented in `bc_confidence()`, and it is a TRACE-side gap.
-"""
-
+"""Compose TRACE's allele-specific reconciliation without a glob/CLI boundary."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
+from . import _trace
 
-from . import _trace, edit_profile
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     import pysam
     from trace_crispr.wgs.bc1_consensus import BarcodeCall, BridgeIndex, TrackConfig
     from trace_crispr.wgs.reconcile import CellReconciliation, SiteCall
 
-__all__ = [
-    "BC_CONFIDENCE_HIGH_TIERS",
-    "bc_confidence",
-    "load_oligo_windows",
-    "reconcile_sample",
-    "score_sites",
-]
-
-#: Bridge/caller confidence tiers that make a cell's bc1 evidence count as "high".
-#: Transcribed verbatim from `trace_crispr.wgs.reconcile.run` — see `bc_confidence`.
-BC_CONFIDENCE_HIGH_TIERS: tuple[str, ...] = ("high", "medium")
+BC_CONFIDENCE_HIGH_TIERS = ("high",)
 
 
 def _only_set(**kwargs: Any) -> dict[str, Any]:
-    """Drop `None` values, so TRACE's own defaults apply unless a caller overrode them."""
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
 def bc_confidence(genome_calls: Sequence[BarcodeCall]) -> str:
-    """Collapse a cell's genome-track barcode calls to the `bc_confidence` label.
-
-    🔴 **This is the one classification rule magestic owns that it should not.** It is
-    transcribed verbatim from the body of `trace_crispr.wgs.reconcile.run`
-    (`"high" if (gbcs and gbcs[0].confidence in ("high", "medium")) else "low"`), because
-    TRACE exposes the rule only inside that argparse entry point and not as a function.
-    It is isolated here, with the tier tuple as a module constant, so it is greppable and
-    so replacing it is a one-line change once TRACE grows the primitive
-    (`reconcile.bc_confidence_from(...)` is the upstream fix).
-
-    It matters more than its size suggests: `reconcile_cell` defaults
-    `bc_confidence="high"`, so a caller that omits it does not get a neutral default —
-    it gets a wrong one that inflates confidence.
-    """
-    if genome_calls and genome_calls[0].confidence in BC_CONFIDENCE_HIGH_TIERS:
-        return "high"
-    return "low"
+    """Use barcode observation confidence, independently of bridge annotation."""
+    return _trace.reconcile().bc_confidence_from(genome_calls)
 
 
 def load_oligo_windows(path: str, **column_names: str) -> dict[str, Any]:
-    """Load the `oligo_name -> donor window` map with TRACE's own loader.
-
-    Parameters
-    ----------
-    path : str
-        Header'd TSV using the shared `{oligo_name, chrom, donor_start_coord,
-        donor_end_coord}` column vocabulary. Pass `oligo_col=`, `chrom_col=`,
-        `start_col=`, `end_col=` to override.
-
-    Returns
-    -------
-    dict
-        **Opaque.** Hand it straight to `score_sites` / `build_edit_sites` and never
-        unpack a value: TRACE's element type is version-dependent, and this module's
-        contract is that the two functions that produce and consume it always agree
-        because they come from the same TRACE.
-
-    Notes
-    -----
-    TRACE's loader silently skips rows that are too short or whose coordinates are not
-    `.isdigit()`, and keeps the FIRST occurrence per oligo. Neither is reported, so a
-    caller that needs a denominator must compare `len(...)` against the source row count.
-    """
+    """Load validated windows and optional intended_variants with TRACE's parser."""
     return _trace.reconcile().load_oligo_windows(path, **column_names)
 
 
-def score_sites(
-    bam: pysam.AlignmentFile,
-    fasta: pysam.FastaFile,
-    oligos: Iterable[str],
-    oligo_windows: dict[str, Any],
-    *,
-    tau_full: float | None = None,
-    tau_wt: float | None = None,
-    min_cov: int | None = None,
-    min_base_qual: int | None = None,
-    depth_gate: bool = True,
-    designed_positions: Mapping[str, Sequence[int]] | None = None,
-) -> list[SiteCall]:
-    """Measure and classify the edit VAF at each designed window this cell's oligos predict.
+def score_sites(bam: pysam.AlignmentFile, fasta: pysam.FastaFile,
+                oligos: Iterable[str], oligo_windows: dict[str, Any], *,
+                tau_full: float | None = None, tau_wt: float | None = None,
+                min_cov: int | None = None, min_base_qual: int | None = None, min_mapq: int | None = None) -> list[SiteCall]:
+    """Delegate allele counts and site classification entirely to TRACE.
 
-    Composition of `build_edit_sites` -> the window measurement -> classification. The
-    three threshold arguments default to `None`, meaning TRACE's defaults stand; pass a
-    value only when the screen config deliberately overrides one.
-
-    Coordinates are 1-based inclusive throughout (`EditSite.start`/`end` and
-    `window_edit_vaf`), matching the samplesheet vocabulary — there is no conversion here.
-
-    🔴 **NN 251 defects 6 and 11 are closed HERE, on the path Stage 4 actually takes.**
-    With `depth_gate=True` (the default) the window is measured by
-    `core.edit_profile.window_edit_profile` and classified by `classify_window`, which:
-
-    * gates `min_cov` on the depth **at the designed position** when
-      `designed_positions` supplies it, and on the **window MINIMUM** otherwise —
-      rather than on the window MAXIMUM, which let a 6 bp hole at the edit ship as
-      `NO_EDIT cov=14 n_nocov=0 confidence=high`; and
-    * records `variant_class`, so a deletion can never be reported as a substitution.
-
-    `vaf` and `cov` on every returned site remain TRACE's `window_edit_vaf` values, and
-    `trace_status` records what `classify_site` would have said, so any reclassification
-    is explicit and auditable rather than a silent change of number.
-
-    ⚠️ **Consequence to expect, stated rather than discovered:** gating on the window
-    minimum marks a window whose EDGE dips below `min_cov` as `SITE_NOCOV`, which on a
-    10-15x cohort is common. That is the intended direction — "not measured" must not
-    read as "no edit" — but it moves cells from `NO_EDIT` to `LOW_CONF`, not from wrong
-    to right, so the cohort's NO_EDIT count will fall. Supply `designed_positions` (from
-    `core.window_table.designed_positions_by_oligo`, which needs `wt_seq` AND
-    `design_donor` in the window table) to gate at the base that actually matters
-    instead. `depth_gate=False` restores TRACE's exact behaviour for a parity run.
+    Missing intended variants yield unassessed window compatibility evidence.
+    Missing candidate windows raise rather than silently changing the denominator.
     """
     tr = _trace.reconcile()
-    site_kwargs = _only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov)
-    vaf_kwargs = _only_set(min_base_qual=min_base_qual)
-    calls: list[SiteCall] = []
-    for site in tr.build_edit_sites(list(oligos), oligo_windows):
-        if not depth_gate:
-            vaf, cov = tr.window_edit_vaf(
-                bam, fasta, site.chrom, site.start, site.end, **vaf_kwargs
-            )
-            calls.append(tr.SiteCall(site, vaf, cov, tr.classify_site(vaf, cov, **site_kwargs)))
-            continue
-        profile = edit_profile.window_edit_profile(
-            bam, fasta, site.chrom, site.start, site.end, **vaf_kwargs
-        )
-        dpos = tuple((designed_positions or {}).get(site.oligo or "", ()) or ())
-        call = edit_profile.classify_window(profile, designed_positions=dpos, **site_kwargs)
-        trace_status = tr.classify_site(profile.max_vaf, profile.cov_at_max, **site_kwargs)
-        calls.append(
-            edit_profile.ScoredSite(
-                site=site,
-                vaf=profile.max_vaf,
-                cov=profile.cov_at_max,
-                status=call.status,
-                reason=call.reason,
-                variant_class=call.variant_class,
-                min_depth=profile.min_depth,
-                n_positions_uncovered=profile.n_positions_uncovered,
-                depth_at_designed=call.depth_at_designed,
-                trace_status=trace_status,
-                flags=call.flags,
-            )
-        )
-    return calls
+    kwargs = _only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov,
+                       min_base_qual=min_base_qual, min_mapq=min_mapq)
+    return [tr.score_edit_site(bam, fasta, site, **kwargs)
+            for site in tr.build_edit_sites(list(oligos), oligo_windows, fasta=fasta)]
 
 
-def reconcile_sample(
-    bam: pysam.AlignmentFile,
-    fasta: pysam.FastaFile,
-    sample: str,
-    *,
-    genome_track: TrackConfig,
-    oligo_windows: dict[str, Any],
-    plasmid_track: TrackConfig | None = None,
-    bridge: BridgeIndex | None = None,
-    min_support: int | None = None,
-    high_only: bool = True,
-    tau_full: float | None = None,
-    tau_wt: float | None = None,
-    min_cov: int | None = None,
-    min_base_qual: int | None = None,
-    depth_gate: bool = True,
-    designed_positions: Mapping[str, Sequence[int]] | None = None,
-) -> CellReconciliation:
-    """Reconcile one cell: bc1 lineage set x per-site edit VAF -> a `CellReconciliation`.
+def reconcile_sample(bam: pysam.AlignmentFile, fasta: pysam.FastaFile, sample: str, *,
+                     genome_track: TrackConfig, oligo_windows: dict[str, Any],
+                     plasmid_track: TrackConfig | None = None,
+                     bridge: BridgeIndex | None = None,
+                     assigned_oligos: Sequence[str] | None = None,
+                     allele_bam: pysam.AlignmentFile | None = None,
+                     read_source_flags: Sequence[str] = (),
+                     min_support: int | None = None, high_only: bool = True,
+                     tau_full: float | None = None, tau_wt: float | None = None,
+                     min_cov: int | None = None, min_base_qual: int | None = None, min_mapq: int | None = None) -> CellReconciliation:
+    """Score the explicit assignment, or bridge candidates when none is supplied.
 
-    `depth_gate` and `designed_positions` are passed straight to `score_sites`, where
-    NN 251 defects 6 and 11 are closed; see that function for what they change and for
-    the consequence of gating on the window minimum.
-
-    Parameters
-    ----------
-    bam, fasta : pysam handles
-        Open, indexed. Both `extract_track` (via `bam.fetch`) and `window_edit_vaf` (via
-        `bam.pileup`) require the index; TRACE documents neither requirement. The caller
-        owns these handles, so a step can reuse one BAM across stages.
-    sample : str
-        The manifest sample name — NOT a BAM basename stripped of a suffix. Passing it in
-        is what keeps the fan-out keyed to the manifest and the glob unreachable.
-    genome_track, plasmid_track : TrackConfig
-        From `core.locus_config.build_tracks`. `plasmid_track=None` runs genome-only and
-        yields `n_plasmid_bc=0`.
-    oligo_windows : dict
-        From `load_oligo_windows`; opaque, passed straight through.
-    bridge : BridgeIndex, optional
-        bc1 -> oligo index. **Without it no oligo is attributed, so no site is scored and
-        the cell classifies from zero sites** — a legitimate bridge-less mode, but never a
-        "no edits found" result.
-    min_support, high_only : int, bool
-        Passed to `confident_barcodes`. `high_only=True` reproduces the choice
-        `reconcile.run` makes at its own entry point; it is a pipeline parameter, so a
-        screen config may override it.
-
-    Returns
-    -------
-    CellReconciliation
-        TRACE's own dataclass, unmodified. Serialize it with
-        `core.emit.write_reconciliations`, which takes the column list from TRACE too.
+    Explicit assignments define the intended sites even with no bridge. Barcode
+    observations still supply mixture evidence. Missing bridge identities cannot
+    establish absence of additional edits and therefore lower confidence.
     """
     bc1 = _trace.bc1_consensus()
     tr = _trace.reconcile()
-    barcode_kwargs = _only_set(min_support=min_support)
-
-    genome_calls = bc1.confident_barcodes(
-        bc1.extract_track(bam, genome_track), bridge, high_only=high_only, **barcode_kwargs
-    )
-    plasmid_calls: list[BarcodeCall] = []
+    kwargs = _only_set(min_support=min_support)
+    genome_calls = bc1.confident_barcodes(bc1.extract_track(bam, genome_track), bridge,
+                                         high_only=high_only, **kwargs)
+    plasmid_calls = []
     if plasmid_track is not None:
-        plasmid_calls = bc1.confident_barcodes(
-            bc1.extract_track(bam, plasmid_track), bridge, high_only=high_only, **barcode_kwargs
-        )
-
-    oligos = [b.oligo for b in (list(genome_calls) + list(plasmid_calls)) if b.oligo]
-    sites = score_sites(
-        bam,
-        fasta,
-        oligos,
-        oligo_windows,
-        tau_full=tau_full,
-        tau_wt=tau_wt,
-        min_cov=min_cov,
-        min_base_qual=min_base_qual,
-        depth_gate=depth_gate,
-        designed_positions=designed_positions,
-    )
-    return tr.reconcile_cell(
-        sample,
-        sites,
-        n_genome_bc=len(genome_calls),
-        n_plasmid_bc=len(plasmid_calls),
-        bc_confidence=bc_confidence(genome_calls),
-    )
+        plasmid_calls = bc1.confident_barcodes(bc1.extract_track(bam, plasmid_track), bridge,
+                                              high_only=high_only, **kwargs)
+    calls = list(genome_calls) + list(plasmid_calls)
+    bridged = {b.oligo for b in calls if b.oligo}
+    flags = list(read_source_flags)
+    if assigned_oligos is not None:
+        if not assigned_oligos:
+            raise ValueError(f"{sample}: explicit assignment is empty")
+        oligos = list(dict.fromkeys(assigned_oligos))
+        flags.append("EXPLICIT_ASSIGNMENT")
+        if bridged - set(oligos):
+            flags.append("BRIDGE_ASSIGNMENT_CONFLICT")
+    else:
+        oligos = sorted(bridged)
+        if any(not b.oligo for b in calls):
+            flags.append("UNRESOLVED_BC1")
+    if not genome_calls:
+        flags.append("NO_GENOME_BC1")
+    sites = score_sites(allele_bam if allele_bam is not None else bam, fasta, oligos, oligo_windows, tau_full=tau_full,
+                         tau_wt=tau_wt, min_cov=min_cov, min_base_qual=min_base_qual, min_mapq=min_mapq)
+    confidence = bc_confidence(genome_calls)
+    if "BRIDGE_ASSIGNMENT_CONFLICT" in flags:
+        confidence = "low"
+    if "RAW_DONOR_READS" in flags and plasmid_calls:
+        flags.append("RAW_DONOR_ORIGIN_UNRESOLVED")
+        confidence = "low"
+    return tr.reconcile_cell(sample, sites, n_genome_bc=len(genome_calls),
+                             n_plasmid_bc=len(plasmid_calls), bc_confidence=confidence,
+                             flags=flags)

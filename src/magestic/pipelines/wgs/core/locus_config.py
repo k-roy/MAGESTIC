@@ -113,16 +113,20 @@ def write_locus_sidecar(path: str | Path, values: Mapping[str, str]) -> Path:
     cannot be derived from it. The reference's role here is *validation*
     (`validate_tracks`), not derivation.
     """
-    missing = [k for k in LOCUS_CONFIG_KEYS if not str(values.get(k, "")).strip()]
+    missing = [k for k in LOCUS_CONFIG_KEYS[:3] if not str(values.get(k, "")).strip()]
+    plasmid_present = [bool(str(values.get(k, '')).strip()) for k in LOCUS_CONFIG_KEYS[3:]]
+    if any(plasmid_present) and not all(plasmid_present):
+        missing += [k for k in LOCUS_CONFIG_KEYS[3:] if not str(values.get(k, '')).strip()]
     if missing:
         raise LocusConfigError(
-            f"locus sidecar is missing required key(s) {missing}. All six are required even "
-            "for a genome-only run: trace_crispr.wgs.bc1_consensus.tracks_from_config "
-            "indexes the plasmid_bc_* keys unconditionally."
+            f"locus sidecar is missing required key(s) {missing}; an optional plasmid "
+            "track needs all three plasmid fields when supplied."
         )
     ordered = list(LOCUS_CONFIG_KEYS) + [k for k in values if k not in LOCUS_CONFIG_KEYS]
     lines = []
     for key in ordered:
+        if key not in values or not str(values[key]).strip():
+            continue
         value = str(values[key]).strip()
         if "\n" in value or "\r" in value:
             raise LocusConfigError(f"locus sidecar value for {key!r} contains a newline")
@@ -142,7 +146,7 @@ def load_locus_sidecar(path: str | Path) -> dict[str, str]:
     file is validated against the code that will actually consume it.
     """
     cfg = dict(_trace.bc1_consensus().load_locus_config(str(path)))
-    missing = [k for k in LOCUS_CONFIG_KEYS if not cfg.get(k)]
+    missing = [k for k in LOCUS_CONFIG_KEYS[:3] if not cfg.get(k)]
     if missing:
         raise LocusConfigError(f"{path}: sidecar parsed but missing key(s) {missing}")
     return cfg
@@ -153,7 +157,9 @@ def build_tracks(
     *,
     amplicon_left_window: str | tuple[int, int] | None = None,
     amplicon_right_window: str | tuple[int, int] | None = None,
-) -> tuple[TrackConfig, TrackConfig]:
+    use_plasmid: bool | None = None,
+    min_mapq: int | None = None,
+) -> tuple[TrackConfig, TrackConfig | None]:
     """Build the `(genome, plasmid)` TRACE tracks from a sidecar path or parsed mapping.
 
     Parameters
@@ -179,18 +185,28 @@ def build_tracks(
         amplicon_right_window
     )
     return _trace.bc1_consensus().tracks_from_config(
-        cfg, amplicon_left_window=left, amplicon_right_window=right
+        cfg, amplicon_left_window=left, amplicon_right_window=right, use_plasmid=use_plasmid,
+        min_mapq=min_mapq,
     )
 
 
 def validate_tracks(
     tracks: Sequence[TrackConfig],
     fasta: str | Path | pysam.FastaFile,
+    *,
+    amplicon_window_sequences: tuple[str | None, str | None] = (None, None),
 ) -> None:
     """Assert each track's locus is an N-run flanked by its configured junctions.
 
     Delegates to `TrackConfig.validate_against_reference`, which fails loudly on
     reference drift — the bug class that silently broke hard-coded coordinates upstream.
+
+    Amplicon windows get the same guard. A window is a raw coordinate pair, so a track
+    that carries one must be given the reference sequence the window covers
+    (`amplicon_window_sequences`, left then right), and that sequence is compared with
+    the FASTA. A window with no sequence, a sequence with no window, and a sequence the
+    reference no longer has are all refused. The default refuses every window, so a
+    caller that forgets the sequences fails closed.
 
     Parameters
     ----------
@@ -206,11 +222,30 @@ def validate_tracks(
         import pysam as _pysam  # local: keeps pysam off the import path of this module
 
         with _pysam.FastaFile(str(fasta)) as handle:
-            _validate_all(tracks, handle)
+            _validate_all(tracks, handle, amplicon_window_sequences)
     else:
-        _validate_all(tracks, fasta)
+        _validate_all(tracks, fasta, amplicon_window_sequences)
 
 
-def _validate_all(tracks: Sequence[TrackConfig], handle: Any) -> None:
+def _validate_all(tracks: Sequence[TrackConfig], handle: Any,
+                  sequences: tuple[str | None, str | None]) -> None:
     for track in tracks:
         track.validate_against_reference(handle)
+    for side, expected in zip(("left", "right"), sequences):
+        key = f"amplicon_{side}_window"
+        windowed = [t for t in tracks if getattr(t, key) is not None]
+        if expected and not windowed:
+            raise LocusConfigError(f"{key}_sequence is set but no track has {key}: it would check nothing")
+        for track in windowed:
+            lo, hi = getattr(track, key)
+            if not expected:
+                raise LocusConfigError(
+                    f"track {track.name}: {key} {lo}-{hi} has no {key}_sequence. A window is a raw "
+                    "coordinate pair; only the reference sequence it covers shows it still sits at "
+                    "the primer sites of this reference.")
+            observed = handle.fetch(track.contig, lo - 1, hi).upper()
+            if observed != expected.upper():
+                raise LocusConfigError(
+                    f"track {track.name}: {key} {track.contig}:{lo}-{hi} reads {observed!r}, not the "
+                    f"configured {expected.upper()!r}. The reference has drifted from the one the "
+                    "window was derived on.")

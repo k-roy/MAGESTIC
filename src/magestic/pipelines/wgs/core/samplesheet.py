@@ -1,29 +1,16 @@
-"""
-magestic.pipelines.wgs.core.samplesheet — TRACE's 7-column donor samplesheet, and GATE 1.
+"""Build validated donor samplesheets and preserve synthetic-axis provenance.
 
-`donor_outcome.precall` reads a header'd TSV with the columns
-`sample, chrom, donor_start_coord, donor_end_coord, wt_seq, design_donor, synthetic_donor`.
-This module builds it from an oligo table + a per-sample oligo assignment, and owns the
-one decision that cannot be deferred: **what goes in `synthetic_donor`.**
+TRACE requires sample, chrom, donor_start_coord, donor_end_coord, wt_seq,
+design_donor, and synthetic_donor. Optional donor_strand ('+'/'-') declares the
+supplied sequence orientation relative to the BAM reference and is preserved in
+an eighth column. Palindromic WT cannot orient asymmetric design or empirical
+sequences without that declaration.
 
-GATE 1 — the SYNTHETIC_ERROR axis cannot run for the 2021 pool
---------------------------------------------------------------
-`synthetic_donor` is the design donor *carrying the synthesis error actually present in
-the cloned library* — a same-length donor window, and an **empirical per-oligo
-observation, not a designable quantity**. No such table exists for the 2021 pool, and
-none can be derived from design data (ruled out on all 40,191 rows: sequence-like
-candidate columns = 0). `bucket_variant` uses the column non-optionally, so without it
-the SYNTHETIC_ERROR bucket is simply unreachable.
-
-What ships is TRACE's own degenerate input — `synthetic_donor := design_donor`, exactly
-what its `test_precall_partial` fixture does. That makes `e3 < e4` unreachable and
-collapses cleanly to DESIGNED / SPONTANEOUS without breaking the module.
-
-🔴 **The output must then be labeled as having the axis DISABLED — not as having found
-no synthesis errors.** A zero in `synthetic_errors` on an unstamped file is a wrong
-answer waiting to be quoted. `synthetic_donor_source` is therefore a REQUIRED keyword
-argument with no default, `stamp_outcome_table` writes the stamp, and `read_axis_stamp`
-lets `qc` fail a run whose Stage-2 output lacks it.
+The synthetic-error axis requires an explicit empirical donor sequence. When
+synthetic_donor_source='design_donor', the design substitutes for empirical input
+and every result is stamped synthetic_error_axis=disabled. A zero in that disabled
+axis is not evidence of absent synthesis errors. Choosing 'synthetic_donor' requires
+the nonempty empirical column and stamps the axis enabled.
 """
 
 from __future__ import annotations
@@ -31,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
+import tempfile
 
 from . import _trace
 
@@ -100,8 +89,8 @@ class SamplesheetResult:
         `AXIS_DISABLED` or `AXIS_ENABLED`. Stamp this into the Stage-2 output and the
         run's `PROVENANCE.json`.
     underscore_contigs : tuple of str
-        Contigs containing `_`, which crash `precall_sample` (GATE 3). Recorded rather
-        than raised here so `qc` owns the decision to fail.
+        Contigs containing `_`, retained as compatibility metadata. Structured TRACE
+        variants support these names; they are no longer a gate.
     """
 
     path: Path
@@ -112,16 +101,7 @@ class SamplesheetResult:
 
 
 def underscore_contigs(rows: Iterable[Mapping[str, object]]) -> list[str]:
-    """Contigs carrying an underscore, sorted and de-duplicated (GATE 3's input).
-
-    `precall_sample` re-parses its own variant id `f"{chrom}_{pos}_{ref}_to_{alt}"` with
-    `split("_")` and positionally indexes the result, so any underscore in a contig name
-    raises `ValueError` mid-loop — after part of the output is already on disk. Every
-    mandated composite reference carries `plasmid_{oligo}` and `integrated_plasmid_{oligo}`
-    contigs, so this is reachable, and it is data-dependent (the combine step is a no-op
-    until at least one designed or spontaneous variant is recorded) rather than
-    deterministic per sample.
-    """
+    """Return underscore contig names for compatibility metadata, without rejecting them."""
     return sorted({str(r.get("chrom", "")) for r in rows if "_" in str(r.get("chrom", ""))})
 
 
@@ -131,14 +111,15 @@ def build_samplesheet(
     *,
     synthetic_donor_source: str,
 ) -> SamplesheetResult:
-    """Write TRACE's 7-column donor samplesheet and verify it by reading it back.
+    """Write TRACE's required donor columns plus supplied strand metadata.
 
     Parameters
     ----------
     rows : iterable of mapping
         One mapping per sample, carrying at least `sample`, `chrom`, `donor_start_coord`,
         `donor_end_coord`, `wt_seq`, `design_donor` — plus `synthetic_donor` when
-        `synthetic_donor_source` is `SYNTHETIC_DONOR_FROM_COLUMN`.
+        `synthetic_donor_source` is `SYNTHETIC_DONOR_FROM_COLUMN`. Optional
+        `donor_strand` ('+'/'-') is retained without inferring it from observed reads.
     out_path : str or Path
         Destination TSV.
     synthetic_donor_source : str
@@ -174,6 +155,9 @@ def build_samplesheet(
             f"{SYNTHETIC_DONOR_FROM_COLUMN!r}, got {synthetic_donor_source!r}"
         )
     rows = list(rows)
+    if not rows:
+        raise SamplesheetError("samplesheet requires at least one donor row")
+    columns = SAMPLESHEET_COLUMNS + (("donor_strand",) if any("donor_strand" in row for row in rows) else ())
     required = list(SAMPLESHEET_COLUMNS[:-1])
     if synthetic_donor_source == SYNTHETIC_DONOR_FROM_COLUMN:
         required.append("synthetic_donor")
@@ -185,7 +169,7 @@ def build_samplesheet(
     lines: list[str] = []
     for i, row in enumerate(rows, start=1):
         for column in required:
-            if not str(row.get(column, "")).strip():
+            if row.get(column) is None or not str(row.get(column, "")).strip():
                 raise SamplesheetError(
                     f"{out_path}: row {i} is missing required field {column!r}"
                 )
@@ -208,16 +192,36 @@ def build_samplesheet(
             if synthetic_donor_source == SYNTHETIC_DONOR_FROM_DESIGN
             else str(row["synthetic_donor"]).strip().upper()
         )
-        lines.append("\t".join(record[c] for c in SAMPLESHEET_COLUMNS))
+        if "donor_strand" in columns:
+            strand = row.get("donor_strand")
+            strand = "" if strand is None else str(strand).strip()
+            if strand not in ("", "+", "-"):
+                raise SamplesheetError(f"{out_path}: donor_strand must be '+' or '-' on row {i}")
+            record["donor_strand"] = strand
+        start, end = int(record["donor_start_coord"]), int(record["donor_end_coord"])
+        if start < 1 or end < start or len(record["wt_seq"]) != end - start + 1:
+            raise SamplesheetError(f"{out_path}: invalid window or wt_seq length on row {i}")
+        if any(set(record[column]) - set("ACGTN") for column in ("wt_seq", "design_donor", "synthetic_donor")):
+            raise SamplesheetError(f"{out_path}: non-DNA donor sequence on row {i}")
+        if any(c in value for value in record.values() for c in "\t\r\n"):
+            raise SamplesheetError(f"{out_path}: embedded tab/newline on row {i}")
+        if sample in (".", "..") or "/" in sample or "\\" in sample:
+            raise SamplesheetError(f"{out_path}: sample is not a safe filename")
+        lines.append("\t".join(record[c] for c in columns))
 
-    with out_path.open("w", newline="\n") as fh:
-        fh.write("\t".join(SAMPLESHEET_COLUMNS) + "\n")
-        for line in lines:
-            fh.write(line + "\n")
-
-    # Verify the OUTPUT, not the fact that the write returned: read it back with the
-    # exact function Stage 2 will use, so a column-name drift in TRACE fails here.
-    parsed = _trace.donor_outcome().read_samplesheet(out_path)
+    fd, temporary = tempfile.mkstemp(prefix=out_path.name + ".", suffix=".tmp", dir=out_path.parent)
+    try:
+        with os.fdopen(fd, "w", newline="\n") as fh:
+            fh.write("\t".join(columns) + "\n")
+            for line in lines:
+                fh.write(line + "\n")
+        parsed = _trace.donor_outcome().read_samplesheet(Path(temporary))
+        if len(parsed) != len(lines):
+            raise SamplesheetError(f"{out_path}: samplesheet round-trip row count mismatch")
+        os.replace(temporary, out_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     if len(parsed) != len(lines):
         raise SamplesheetError(
             f"{out_path}: wrote {len(lines)} rows but donor_outcome.read_samplesheet "

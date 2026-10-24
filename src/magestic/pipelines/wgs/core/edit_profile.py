@@ -521,7 +521,10 @@ def edit_evidence(sites: Iterable[Any]) -> str:
     if not sites:
         return EVIDENCE_NO_SITES
     tr = _trace.reconcile()
-    covered = [s for s in sites if getattr(s, "status", None) != tr.SITE_NOCOV]
+    # An `unassessed` site (no declared intended alleles, pinned TRACE) has a depth but
+    # measured no edit, so it is evidence of nothing here, exactly like `nocov`.
+    unmeasured = {tr.SITE_NOCOV, getattr(tr, "SITE_UNASSESSED", tr.SITE_NOCOV)}
+    covered = [s for s in sites if getattr(s, "status", None) not in unmeasured]
     if not covered:
         return EVIDENCE_NONE
     best = max(int(getattr(s, "cov", 0) or 0) for s in covered)
