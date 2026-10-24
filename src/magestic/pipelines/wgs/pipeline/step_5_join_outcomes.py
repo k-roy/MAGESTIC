@@ -116,6 +116,11 @@ AGREEMENT_INDEX = JOIN_COLUMNS.index("agreement")
 #: Reason codes for `precall_state`, so the override below is never silent.
 PRECALL_STATE_FROM_OUTCOME = "from_editing_outcome"
 PRECALL_STATE_MINOR_ALLELE = "downgraded_to_mixed_minor_allele_at_designed_position"
+#: planning/268 §2e (Kevin 2026-10-24). The pinned TRACE refuses a heterozygous genotype
+#: in a clonal donor as `unknown;ambiguous_genotype`, which a rescued minority allele now
+#: always is (`vcf_adapter.RESCUED_GT`). When that same donor-window record carries
+#: `MAG_MINOR`, the well holds more than one genotype: a mixture, reported as one.
+PRECALL_STATE_MINOR_ALLELE_AMBIGUOUS = "mixture_ambiguous_genotype_with_minor_allele_in_donor_window"
 
 
 def precall_passthrough() -> tuple[str, ...]:
@@ -235,6 +240,7 @@ def run_step_5(config: WGSConfig) -> list[Path]:
     rows: list[list[str]] = []
     matrix: dict[tuple[str, str], int] = {}
     n_minor_downgraded = 0
+    n_minor_ambiguous = 0
     n_minor_elsewhere = 0
     for record in shared:  # Stage 4 order, which is manifest order
         sample = read_field(record, "sample")
@@ -245,12 +251,13 @@ def run_step_5(config: WGSConfig) -> list[Path]:
         r_state = LABEL_TO_STATE.get(label, UNDETERMINED)
         p_reason = PRECALL_STATE_FROM_OUTCOME
         minor_at_design, minor_elsewhere = _minor_allele_split(p_row)
-        if minor_elsewhere:
+        ambiguous_mixture = p_state == UNDETERMINED and _minor_allele_at_ambiguous_genotype(p_row)
+        if minor_elsewhere and not ambiguous_mixture:
             n_minor_elsewhere += 1
         if minor_at_design and p_state == EDIT:
-            # 🔴 A 10% allele reaches TRACE as `(chrom, pos, ref, alt)` and is bucketed
-            # as a full designed variant, because `_iter_vcf_records` reads neither INFO
-            # nor FORMAT. The allele FRACTION is therefore knowable only from
+            # 🔴 A 10% allele called as the clone's genotype (GT `1`) reaches TRACE as a
+            # full designed variant: TRACE selects alleles by GT and never reads AD or
+            # INFO for the call. The allele FRACTION is therefore knowable only from
             # `minor_allele_variants`, and a cross-stage table that drops it publishes a
             # mixture as a clean edit. The downgrade is recorded in its own column, never
             # applied silently, and `editing_outcome` is passed through verbatim.
@@ -266,6 +273,9 @@ def run_step_5(config: WGSConfig) -> list[Path]:
             # FRACTION at a designed base is the second, so it maps to MIXTURE.
             p_state, p_reason = MIXTURE, PRECALL_STATE_MINOR_ALLELE
             n_minor_downgraded += 1
+        elif ambiguous_mixture:
+            p_state, p_reason = MIXTURE, PRECALL_STATE_MINOR_ALLELE_AMBIGUOUS
+            n_minor_ambiguous += 1
         rows.append(
             [
                 sample,
@@ -280,12 +290,15 @@ def run_step_5(config: WGSConfig) -> list[Path]:
             ]
         )
         matrix[p_state, r_state] = matrix.get((p_state, r_state), 0) + 1
-    if n_minor_downgraded or n_minor_elsewhere:
+    if n_minor_downgraded or n_minor_ambiguous or n_minor_elsewhere:
         logger.info(
             "step_5: %d sample(s) moved EDIT -> mixture_signal because a MAG_MINOR allele sits "
-            "at a DESIGNED position (reason=%s); a further %d carry a minority allele "
-            "only ELSEWHERE in the genome and were deliberately NOT downgraded",
-            n_minor_downgraded, PRECALL_STATE_MINOR_ALLELE, n_minor_elsewhere,
+            "at a DESIGNED position (reason=%s); %d moved undetermined -> mixture_signal "
+            "because the ambiguous donor-window genotype is itself a MAG_MINOR allele "
+            "(reason=%s); a further %d carry a minority allele only ELSEWHERE in the genome "
+            "and were deliberately NOT downgraded",
+            n_minor_downgraded, PRECALL_STATE_MINOR_ALLELE, n_minor_ambiguous,
+            PRECALL_STATE_MINOR_ALLELE_AMBIGUOUS, n_minor_elsewhere,
         )
 
     columns = join_columns()
@@ -367,6 +380,7 @@ def run_step_5(config: WGSConfig) -> list[Path]:
         review_rows=len(disagreements),
         undetermined=undetermined,
         minor_allele_downgraded_to_mixed=n_minor_downgraded,
+        minor_allele_ambiguous_to_mixed=n_minor_ambiguous,
         minor_allele_elsewhere_not_downgraded=n_minor_elsewhere,
     )
     for artifact, artifact_rows in ((out, len(rows)), (disagreement_out, len(disagreements)),
@@ -421,6 +435,38 @@ def _minor_allele_split(precall_row: dict[str, str]) -> tuple[tuple[str, ...], t
         tuple(v for v in minor if v in designed),
         tuple(v for v in minor if v not in designed),
     )
+
+
+def _minor_allele_at_ambiguous_genotype(precall_row: dict[str, str]) -> bool:
+    """True when Stage 2 withheld the call for an ambiguous genotype AND a `MAG_MINOR`
+    allele sits at one of those ambiguous donor-window positions (planning/268 §2e).
+
+    Matching is by `(chrom, pos)` against TRACE's `ambiguous_genotypes` column, so a
+    minority allele elsewhere in the genome never turns an ambiguous call into a
+    mixture. An `unresolved_allele` entry (a symbolic or missing ALT) is not a genotype
+    mixture and does not count.
+    """
+    import json
+
+    outcome = precall_row.get("editing_outcome") or ""
+    if not outcome.startswith("unknown") or "ambiguous_genotype" not in outcome.split(";"):
+        return False
+    try:
+        entries = json.loads(precall_row.get("ambiguous_genotypes") or "[]")
+    except ValueError:
+        return False
+    ambiguous = {(str(e.get("chrom")), int(e.get("pos")))
+                 for e in entries if isinstance(e, dict) and e.get("reason") != "unresolved_allele"
+                 and e.get("pos") is not None}
+    for v in (precall_row.get("minor_allele_variants") or "").split(";"):
+        v = v.strip()
+        if "_to_" not in v:
+            continue
+        left = v.rsplit("_to_", 1)[0]
+        parts = left.rsplit("_", 2)
+        if len(parts) == 3 and parts[1].isdigit() and (parts[0], int(parts[1])) in ambiguous:
+            return True
+    return False
 
 
 def _agreement(precall_state: str, reconcile_state: str) -> str:

@@ -413,10 +413,12 @@ class WGSDonorPrecallConfig:
     """Rescue a reference-GT record whose AD-derived allele fraction clears this.
 
     NN 251 defect 1. `None` keeps the GT-only behaviour, which is what every existing
-    output was produced with. See `core/vcf_adapter.PLOIDY_CAVEAT` before setting it:
-    a rescued record reaches Stage 2 as a 100% call, so anything below
-    `vcf_adapter.DEFAULT_FULL_ALLELE_FRACTION` is flagged `MAG_MINOR` and listed in
-    `VcfSplitResult.minor_allele_variants`.
+    output was produced with. See `core/vcf_adapter.PLOIDY_CAVEAT` before setting it.
+    planning/268 §2e (Kevin 2026-10-24): a rescued record is written with GT `0/1`
+    (`vcf_adapter.RESCUED_GT`), with the caller's original kept in `MAG_RESCUED_GT`.
+    The pinned TRACE refuses that as `unknown;ambiguous_genotype`, and step_5 reports a
+    well whose ambiguous genotype is a `MAG_MINOR` allele as `mixture_signal`. A rescued
+    minority allele therefore never reads as unedited, and is never asserted installed.
 
     ⚠️ NN 255: this governs the RESCUE only. Annotating a minority allele is now
     unconditional, so a 10% `GT 0/1` on a diploid-default plate VCF is flagged whatever
@@ -553,7 +555,14 @@ class WGSReconcileConfig:
     refuses a malformed or conflicting row. A window with `intended_variants` is scored
     by TRACE per allele; one without is scored from its read evidence, gated at the
     designed base when `wt_seq` + `design_donor` give it and at the window minimum
-    otherwise, and flagged `WINDOW_EVIDENCE_NO_INTENDED_ALLELES` (planning/268)."""
+    otherwise, and flagged `WINDOW_EVIDENCE_NO_INTENDED_ALLELES` (planning/268).
+
+    The data that enables that (planning/268 §2g, agreed by Kevin 2026-10-24): the
+    cohort's Stage-2 donor table (`donor_precall.donor_table`) already carries `chrom`,
+    the donor coordinates, `wt_seq` and `design_donor` for every assigned oligo. Point
+    this key at that table, or at a copy with `intended_variants` added. That turns on
+    the frame check and the designed-base gate. The raw design table will not load: TRACE
+    refuses its unfilled coordinate rows."""
 
     oligo_assignments: Path | None = None
     """Per-sample oligo assignment (`sample` -> one or more `oligo_name`), the input that

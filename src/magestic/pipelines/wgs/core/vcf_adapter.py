@@ -22,6 +22,7 @@ __all__ = [
     "DEFAULT_FULL_ALLELE_FRACTION",
     "DEFAULT_MIN_ALT_READS",
     "MAG_AF_TAG",
+    "MAG_RESCUED_GT_TAG",
     "MAG_MINOR_TAG",
     "MPILEUP_CALL_ALL_SITES_COMMAND",
     "MPILEUP_CALL_COMMAND",
@@ -158,6 +159,15 @@ MPILEUP_CALL_WINDOWS_COMMAND = (
 #: INFO tags this adapter writes. Owned as constants so a consumer can grep for them.
 MAG_AF_TAG = "MAG_AF"
 MAG_MINOR_TAG = "MAG_MINOR"
+#: Set on a RESCUED record, whose GT is rewritten (planning/268 §2e, Kevin 2026-10-24).
+#: Its value is the caller's original GT, so the rewrite is never silent.
+MAG_RESCUED_GT_TAG = "MAG_RESCUED_GT"
+#: The genotype a rescued record is given: heterozygous, i.e. "more than one genotype in
+#: this well". The pinned TRACE selects alleles by GT, so a rescued record left at the
+#: caller's `GT 0` selects no ALT and a 10-30% mixture read `designed_variant_unedited`;
+#: `0/1` is refused as `unknown;ambiguous_genotype`, and step_5 turns that into
+#: `mixture_signal` when this record is tagged `MAG_MINOR`. It never asserts an edit.
+RESCUED_GT = "0/1"
 
 #: 🔴 A fraction threshold with no COUNT floor selects for low coverage, and the depth
 #: this program works at makes that decisive. Measured per-well depth, **named by
@@ -771,6 +781,10 @@ def split_plate_vcf(
                         continue
                     result.n_rescued_by_af += 1
                     rescued = True
+                    # planning/268 §2e: the caller's majority genotype is replaced by the
+                    # heterozygous one the read counts show, and the original is kept.
+                    original_gt = gt
+                    gt = values[format_keys.index("GT")] = RESCUED_GT
                 alleles = [int(a) for a in gt.replace("|", "/").split("/") if a != "."]
                 if any(a > len(cols[4].split(",")) for a in alleles):
                     raise VcfAdapterError(f"{vcf_path}: GT exceeds ALT allele count")
@@ -796,6 +810,8 @@ def split_plate_vcf(
                 # so the only outputs that move are the ones that were wrong.
                 if af is not None and (af < full_allele_fraction or rescued):
                     tags = [f"{MAG_AF_TAG}={af:.3f}"]
+                    if rescued:
+                        tags.append(f"{MAG_RESCUED_GT_TAG}={original_gt}")
                     if af < full_allele_fraction:
                         tags.append(MAG_MINOR_TAG)
                         result.n_flagged_minor += 1
