@@ -36,6 +36,7 @@ import itertools
 import logging
 import os
 import shutil
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -228,8 +229,14 @@ def publish(src: Path, dest: Path) -> Path:
     return dest
 
 
-@lru_cache(maxsize=256)
-def _content_hash(path: str, identity: tuple) -> str:
+#: A file whose mtime or ctime is this recent is "racily clean" (git's term) and is hashed
+#: afresh rather than from the memo. Oak stores WHOLE-SECOND timestamps (planning/284
+#: O-W03 measured a sub-second part of 0), so a same-size rewrite inside one second leaves
+#: the stat tuple, and hence the memo key, unchanged.
+RACY_WINDOW_NS = 3 * 10**9
+
+
+def _hash_file(path: str) -> str:
     value = hashlib.sha256()
     with open(path, 'rb') as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
@@ -237,12 +244,23 @@ def _content_hash(path: str, identity: tuple) -> str:
     return value.hexdigest()
 
 
+@lru_cache(maxsize=256)
+def _content_hash(path: str, identity: tuple) -> str:
+    return _hash_file(path)
+
+
 def _file_identity(path: Path) -> dict:
     """Content hashes for small inputs; filesystem identity for large data.
 
-    Size, inode, device, nanosecond mtime and ctime detect normal replacements and
-    in-place edits without rereading every multi-GB BAM on each resume. This is a
-    restart guard, not a cryptographic attestation for adversarial filesystems.
+    Size, inode, device, mtime and ctime detect normal replacements and in-place edits
+    without rereading every multi-GB BAM on each resume. This is a restart guard, not a
+    cryptographic attestation for adversarial filesystems.
+
+    Timestamps are whole seconds on Oak (planning/284 O-W03), so a small file touched
+    within `RACY_WINDOW_NS` is re-hashed rather than read from the in-process memo. The
+    residual blind spot: a file over 1 MiB (stat only) rewritten in place at the SAME
+    size within the same second as the previous stat. A BAM rewrite essentially never
+    keeps its size; this is recorded rather than paid for with a hash of every BAM.
     """
     path = Path(path).resolve()
     if not path.is_file():
@@ -251,7 +269,8 @@ def _file_identity(path: Path) -> dict:
     identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
     result = {'path': str(path), 'present': True, 'stat': list(identity)}
     if stat.st_size <= 1024 * 1024:
-        result['sha256'] = _content_hash(str(path), identity)
+        racy = max(stat.st_mtime_ns, stat.st_ctime_ns) >= time.time_ns() - RACY_WINDOW_NS
+        result['sha256'] = _hash_file(str(path)) if racy else _content_hash(str(path), identity)
     return result
 
 
