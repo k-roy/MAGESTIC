@@ -77,8 +77,10 @@ def test_an_exported_sha_is_verified_against_the_checkout(monkeypatch, exported,
     _checkout(monkeypatch, dirty=dirty)
     assert P.preflight_provenance("step_4_reconcile") == exported
     state = P.code_state()
-    assert (state["commit"], state["commit_verified"]) == (exported, verified)
+    # A verified abbreviation records the full sha it was verified against (arm F, 284 §10a).
+    assert (state["commit"], state["commit_verified"]) == (HEAD if verified else exported, verified)
     assert state["checkout_commit"] == HEAD
+    assert state.get("commit_exported") == (exported if verified and exported != HEAD else None)
 
 
 def test_an_unrelated_enclosing_repo_cannot_verify_or_refuse(monkeypatch, tmp_path):

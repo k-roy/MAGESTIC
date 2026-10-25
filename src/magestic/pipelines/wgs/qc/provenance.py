@@ -221,7 +221,11 @@ def code_state() -> dict[str, Any]:
         else:
             verified, reason = _verify_against_checkout(sha, state)
         state["checkout_commit"] = state.get("commit")
-        state["commit"] = sha
+        # A verified abbreviation is recorded as the full sha it was verified against, so
+        # the receipt stays unambiguous as the repository grows; the export is kept.
+        state["commit"] = state["checkout_commit"] if verified and source != "git_state" else sha
+        if state["commit"] != sha:
+            state["commit_exported"] = sha
         state["commit_source"] = source
         state["commit_verified"] = verified
         state["commit_verification"] = reason
