@@ -31,6 +31,7 @@ from trace_crispr.wgs import reconcile
 
 from ..config import RECONCILE_SUBDIR, WGSConfig
 from ..core.blacklist_adapter import reference_contig_lengths
+from ..core.edit_profile import FLAG_SINGLE_ALT_READ, FLAG_SV_ONE_SIDED_LOSS
 from ..core.emit import write_reconciliations
 from ..core.locus_config import build_tracks, validate_tracks
 from ..core.manifest import (
@@ -611,10 +612,18 @@ def _combine(config: WGSConfig) -> Path:
         )
 
     label_idx = reconcile.EMIT_COLUMNS.index("label")
+    flags_idx = reconcile.EMIT_COLUMNS.index("flags")
     labels: dict[str, int] = {}
+    # 2026-10-25 rulings (planning/268 §4): what the depth-conditional floor and the interim SV
+    # gate cost, counted so it shows. Cells, not sites; a cell is counted once per flag.
+    gated = {FLAG_SINGLE_ALT_READ: 0, FLAG_SV_ONE_SIDED_LOSS: 0}
     for row in rows:
-        label = row.split("\t")[label_idx]
+        fields = row.split("\t")
+        label = fields[label_idx]
         labels[label] = labels.get(label, 0) + 1
+        cell_flags = set(fields[flags_idx].split(",")) if len(fields) > flags_idx else set()
+        for flag in gated:
+            gated[flag] += flag in cell_flags
     logger.info(
         "step_4: %d cells — %s", n, ", ".join(f"{k}={v}" for k, v in sorted(labels.items()))
     )
@@ -663,6 +672,8 @@ def _combine(config: WGSConfig) -> Path:
                 1 for a in audits.values()
                 if a.get("reference_name_check") == "skipped_pg_unobserved"
             ),
+            "cells_partial_on_a_single_alt_read": gated[FLAG_SINGLE_ALT_READ],
+            "cells_sv_suspect_one_sided_loss": gated[FLAG_SV_ONE_SIDED_LOSS],
         },
     )
     return out

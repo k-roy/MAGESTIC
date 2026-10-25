@@ -180,7 +180,12 @@ RESCUED_GT = "0/1"
 #: allele is still 0.92. So a RESCUE also requires this many alt reads.
 #: (Project precedent: an |log2FC| threshold with no baseMean floor inverted a +0.765
 #: correlation to -0.076.)
-DEFAULT_MIN_ALT_READS = 2
+#:
+#: 🔴 2026-10-25, Kevin (planning/284 §8 ruling 1): the floor is DEPTH-CONDITIONAL and "even a
+#: single read is OK". `None` (the default) takes TRACE's `reconcile.min_alt_reads(depth)`: the
+#: smallest k >= 1 with P(Binom(depth, 1e-3) >= k) <= 0.05, i.e. 1 read up to 51x, 2 up to 355x.
+#: So AD 19,1 at 20x is rescued. An integer pins a fixed floor (the 2 above, for a legacy rerun).
+DEFAULT_MIN_ALT_READS = None
 
 #: Below this allele fraction a RESCUED record is flagged `MAG_MINOR`. It matters
 #: because TRACE's `_iter_vcf_records` reads only columns 0/1/3/4 — it never looks at
@@ -357,6 +362,20 @@ def allele_fraction(
     if total <= 0 or len(depths) < 2:
         return None
     return sum(depths[1:]) / total
+
+
+def _depth_floor(format_keys: Sequence[str], sample_fields: Sequence[str]) -> int:
+    """TRACE's depth-conditional alt-read floor at this record's AD depth (planning/268 §4)."""
+    from . import _trace
+
+    keys = list(format_keys)
+    depth = 0
+    if "AD" in keys and len(sample_fields) > keys.index("AD"):
+        try:
+            depth = sum(int(p) for p in sample_fields[keys.index("AD")].split(","))
+        except ValueError:
+            depth = 0
+    return _trace.reconcile().min_alt_reads(depth)
 
 
 def alt_depth(
@@ -595,7 +614,7 @@ def split_plate_vcf(
     sample_map: Mapping[str, str] | None = None,
     ad_slot: int = TRACE_AD_SLOT,
     min_allele_fraction: float | None = None,
-    min_alt_reads: int = DEFAULT_MIN_ALT_READS,
+    min_alt_reads: int | None = DEFAULT_MIN_ALT_READS,
     full_allele_fraction: float = DEFAULT_FULL_ALLELE_FRACTION,
 ) -> VcfSplitResult:
     """Split a multi-sample plate VCF into the per-sample `.fil.vcf` layout TRACE reads.
@@ -637,11 +656,10 @@ def split_plate_vcf(
 
         It governs the RESCUE only. **Annotation of a minority allele is unconditional**
         — see `min_alt_reads` and the F11b comment in the body.
-    min_alt_reads : int, default `DEFAULT_MIN_ALT_READS`
-        Minimum ALT read count for a RESCUE. A fraction floor with no count floor
-        selects for low coverage: at this cohort's 14.4x median depth a 5% fraction
-        rounds to one read, whose per-position false-positive rate from sequencing error
-        alone is ~1-2%.
+    min_alt_reads : int or None, default `DEFAULT_MIN_ALT_READS` (None)
+        Minimum ALT read count for a RESCUE. `None` is depth-conditional (TRACE's
+        `reconcile.min_alt_reads` at the record's AD depth; one read at ordinary WGS
+        depth, per Kevin's 2026-10-25 ruling); an integer pins a fixed floor.
     full_allele_fraction : float, default `DEFAULT_FULL_ALLELE_FRACTION`
         Below this, a record is flagged `MAG_MINOR` and listed in
         `VcfSplitResult.minor_allele_variants` — **whether or not its GT carried the
@@ -774,7 +792,9 @@ def split_plate_vcf(
                     if af < min_allele_fraction:
                         result.n_dropped_below_af += 1
                         continue
-                    if n_alt is not None and n_alt < min_alt_reads:
+                    floor = (min_alt_reads if min_alt_reads is not None
+                             else _depth_floor(format_keys, values))
+                    if n_alt is not None and n_alt < floor:
                         # A fraction floor with no COUNT floor selects for low coverage;
                         # see DEFAULT_MIN_ALT_READS for the measured false-positive rate.
                         result.n_dropped_below_min_alt_reads += 1

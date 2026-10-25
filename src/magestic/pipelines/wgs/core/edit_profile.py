@@ -69,6 +69,8 @@ __all__ = [
     "EVIDENCE_NO_SITES",
     "EVIDENCE_STRONG",
     "EVIDENCE_THIN",
+    "FLAG_SINGLE_ALT_READ",
+    "FLAG_SV_ONE_SIDED_LOSS",
     "FLAG_WINDOW_PARTIAL_COVERAGE",
     "PositionCount",
     "ScoredSite",
@@ -82,6 +84,7 @@ __all__ = [
     "WindowProfile",
     "classify_window",
     "edit_evidence",
+    "one_sided_coverage_loss",
     "window_edit_profile",
 ]
 
@@ -102,6 +105,12 @@ EVIDENCE_STRONG = "strong"
 #: other window position is not. Without it, gating on the designed position would
 #: *hide* the partial coverage that gating on the minimum would have surfaced.
 FLAG_WINDOW_PARTIAL_COVERAGE = "WINDOW_PARTIAL_COVERAGE"
+#: A `partial` call that rests on ONE alt read (the depth-conditional floor allows it, Kevin
+#: 2026-10-25). Raised so its cost shows: at 20x a sequencing error does this ~2% of the time.
+FLAG_SINGLE_ALT_READ = "PARTIAL_ON_A_SINGLE_ALT_READ"
+#: The interim SV gate (Kevin 2026-10-25, planning/284 §8 ruling 3): until rearrangements are
+#: detected, a one-sided loss of signal in the donor window EXCLUDES the site (`nocov`).
+FLAG_SV_ONE_SIDED_LOSS = "SV_SUSPECT_ONE_SIDED_COVERAGE_LOSS"
 
 
 class PositionOutsideWindowError(ValueError):
@@ -469,6 +478,9 @@ def classify_window(
         )
 
     if dpos:
+        # 2026-10-25 rulings (planning/268 §4): each designed base is classified from its COUNTS by
+        # TRACE's `classify_counts` -- presence from a single read up when the non-reference count
+        # beats sequencing error at that depth (FLOOR), absence only at `min_cov` reads (UNCALLABLE).
         depth_at_designed = min(profile.depth_at(p) for p in dpos)
         vaf_at_designed = max(profile.vaf_at(p) for p in dpos)
         vclass = next(
@@ -481,22 +493,22 @@ def classify_window(
         )
         if profile.min_depth < min_cov:
             flags.append(FLAG_WINDOW_PARTIAL_COVERAGE)
-        if depth_at_designed < min_cov:
-            return WindowCall(
-                status=tr.SITE_NOCOV,
-                reason="designed_position_depth_below_min_cov",
-                variant_class=vclass, vaf=vaf_at_designed, cov=depth_at_designed,
-                min_depth=profile.min_depth,
-                n_positions_uncovered=profile.n_positions_uncovered,
-                depth_at_designed=depth_at_designed, vaf_at_designed=vaf_at_designed,
-                designed_positions=dpos, flags=tuple(flags),
-            )
-        if vaf_at_designed >= tau_full:
+        counts = {p: next(c for c in profile.positions if c.pos == p) for p in dpos}
+        statuses = {p: tr.classify_counts(c.n_nonref, c.depth, tau_full=tau_full, min_cov=min_cov)
+                    for p, c in counts.items()}
+        values = set(statuses.values())
+        if tr.SITE_PARTIAL in values:
+            status, reason = tr.SITE_PARTIAL, "designed_position_minority_allele"
+            if any(counts[p].n_nonref == 1 for p, st in statuses.items() if st == tr.SITE_PARTIAL):
+                flags.append(FLAG_SINGLE_ALT_READ)
+        elif tr.SITE_NOCOV in values:
+            status, reason = tr.SITE_NOCOV, "designed_position_depth_below_min_cov"
+        elif values == {tr.SITE_FULL}:
             status, reason = tr.SITE_FULL, "designed_position_full_vaf"
-        elif vaf_at_designed <= tau_wt:
+        elif values == {tr.SITE_WT}:
             status, reason = tr.SITE_WT, "designed_position_wt_vaf"
         else:
-            status, reason = tr.SITE_PARTIAL, "designed_position_intermediate_vaf"
+            status, reason = tr.SITE_INCOMPLETE, "designed_positions_partly_installed"
         return WindowCall(
             status=status, reason=reason, variant_class=vclass, vaf=vaf_at_designed,
             cov=depth_at_designed, min_depth=profile.min_depth,
@@ -523,6 +535,49 @@ def classify_window(
         vaf=profile.max_vaf, cov=profile.cov_at_max, min_depth=profile.min_depth,
         n_positions_uncovered=profile.n_positions_uncovered, flags=tuple(flags),
     )
+
+
+def one_sided_coverage_loss(
+    bam: Any,
+    profile: WindowProfile,
+    *,
+    min_run: int = 5,
+    min_flank_depth: int = 3,
+    cluster_bp: int = 2,
+    min_mapq: int = MIN_MAPQ,
+) -> str | None:
+    """`"left"` / `"right"` when the donor window loses all signal on ONE side, else `None`.
+
+    The interim SV gate (Kevin 2026-10-25, planning/284 §8 ruling 3): until inversions and
+    translocations are detected, a site whose reads stop dead on one side is excluded rather
+    than read as `NO_EDIT`. All three must hold, so ordinary coverage noise is not flagged:
+    a zero-depth run of at least `min_run` bases touching that window edge (and not the other);
+    at least `min_flank_depth` reads at the last covered base; and at least half of those reads,
+    and at least 3, ENDING (or, for a left-side loss, starting) within `cluster_bp` of that base,
+    which is the pile-up a breakpoint leaves and random read ends do not. A designed deletion
+    inside the window does not touch an edge, so it is never flagged.
+    """
+    depths = [p.depth for p in profile.positions]
+    if not depths:
+        return None
+    lead = next((i for i, d in enumerate(depths) if d), len(depths))
+    trail = next((i for i, d in enumerate(reversed(depths)) if d), len(depths))
+    if lead == len(depths) or (lead >= min_run) == (trail >= min_run):
+        return None
+    side = "left" if lead >= min_run else "right"
+    edge_index = lead if side == "left" else len(depths) - 1 - trail
+    edge = profile.start + edge_index  # the last (right) or first (left) covered base, 1-based
+    flank = depths[edge_index]
+    if flank < min_flank_depth:
+        return None
+    clustered = 0
+    for read in bam.fetch(profile.chrom, max(edge - 1 - cluster_bp, 0), edge + cluster_bp):
+        if (read.flag & 0xF04 or read.mapping_quality == 255 or read.mapping_quality < min_mapq
+                or read.reference_end is None):
+            continue
+        tip = read.reference_end if side == "right" else read.reference_start + 1
+        clustered += abs(tip - edge) <= cluster_bp
+    return side if clustered >= max(3, flank / 2) else None
 
 
 def edit_evidence(sites: Iterable[Any]) -> str:

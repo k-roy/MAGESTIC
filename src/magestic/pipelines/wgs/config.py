@@ -428,8 +428,13 @@ class WGSDonorPrecallConfig:
     because at `--ploidy 1` every minority allele is `GT 0` and the rescue is the only
     thing that can see it."""
 
-    min_alt_reads: int = 2
-    """Minimum ALT read count for a rescued record. NN 255.
+    min_alt_reads: int | None = None
+    """Minimum ALT read count for a rescued record. NN 255; made depth-conditional by Kevin's
+    2026-10-25 ruling (planning/284 §8 ruling 1, "even a single read is OK"): `None` (the default)
+    takes TRACE's `reconcile.min_alt_reads(depth)` at the record's AD depth, which is one read up to
+    51x; an integer pins a fixed floor, e.g. `2` to reproduce an NN 255-era run.
+
+    The NN 255 reasoning for a fixed 2, kept for the record:
 
     A fraction threshold with no count floor selects for low coverage. Measured per-well
     depth, named by dataset: `spg_20240702_POST` median 20.1x / q25 9.1x (n=480);

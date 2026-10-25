@@ -431,11 +431,12 @@ def _prepare_vcf_inputs(config: WGSConfig, records: list[WGSSample], workdir: Pa
                 "step_2: %s allele fraction — %d of %d record(s) had a usable AD; "
                 "flagged MAG_MINOR %d (of which %d ALREADY CARRIED THE ALT IN GT, the "
                 "NN 252 F11b over-call class); rescued %d, below fraction %d, below "
-                "%d alt read(s) %d, no AD %d, no AD WITH an alt GT %d",
+                "%s alt read(s) %d, no AD %d, no AD WITH an alt GT %d",
                 Path(plate).name, result.n_af_computed, result.n_records_in,
                 result.n_flagged_minor, result.n_flagged_minor_carrying_alt,
                 result.n_rescued_by_af, result.n_dropped_below_af,
-                config.donor_precall.min_alt_reads,
+                config.donor_precall.min_alt_reads if config.donor_precall.min_alt_reads is not None
+                else "the depth-conditional",
                 result.n_dropped_below_min_alt_reads, result.n_no_ad,
                 result.n_no_ad_carrying_alt,
             )
@@ -511,7 +512,7 @@ def _require_recoverable_caller(config: WGSConfig, plate_vcf: Path) -> None:
             "allele-fraction rescue is the only thing that can see one, and with it "
             "disabled every partial edit is discarded while the run looks clean. Set "
             "`min_allele_fraction` (0.05 with the default "
-            f"min_alt_reads={config.donor_precall.min_alt_reads} floor), or re-call "
+            f"min_alt_reads={config.donor_precall.min_alt_reads or 'depth-conditional'} floor), or re-call "
             "the plate at the diploid default."
         )
     if prov.ploidy is None:

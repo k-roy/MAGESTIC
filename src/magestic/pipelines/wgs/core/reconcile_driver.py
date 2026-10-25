@@ -1,6 +1,7 @@
 """Compose TRACE's allele-specific reconciliation without a glob/CLI boundary."""
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 from . import _trace, edit_profile
@@ -15,6 +16,12 @@ BC_CONFIDENCE_HIGH_TIERS = ("high",)
 #: Raised on every site scored from window evidence because its oligo declares no
 #: intended allele. Provenance, not a penalty: it does not lower confidence.
 FLAG_WINDOW_EVIDENCE = "WINDOW_EVIDENCE_NO_INTENDED_ALLELES"
+
+
+class DesignedPositionsRequired(ValueError):
+    """A window with no declared intended allele reached the read-evidence route without its
+    designed base(s). Kevin 2026-10-25 (planning/284 §8 ruling 4): REFUSE, never score at the
+    window maximum, where a background SNP becomes `SINGLE_EDIT/high` (the W07 regression)."""
 
 
 def _only_set(**kwargs: Any) -> dict[str, Any]:
@@ -44,38 +51,61 @@ def score_sites(bam: pysam.AlignmentFile, fasta: pysam.FastaFile,
     🔴 A window without them is NOT left `unassessed` (Kevin, 2026-10-24: "we should
     not require an intended edit in order to be able to assign confidence to variant
     calls from the WGS"; planning/268). It is classified from its read evidence by
-    `core.edit_profile`, gating `min_cov` at the designed base when
-    `designed_positions` supplies it (from `wt_seq` vs `design_donor`, frame-verified
-    by step_4) and at the window MINIMUM otherwise, never at the window maximum (NN 251
-    defects 6 and 11). The site's `trace_status` records what TRACE would have said
-    (`unassessed`), and `FLAG_WINDOW_EVIDENCE` names the route.
+    `core.edit_profile` at its designed base(s), which `designed_positions` supplies (from
+    `wt_seq` vs `design_donor`, frame-verified by step_4). Without them it REFUSES
+    (`DesignedPositionsRequired`; Kevin 2026-10-25, ruling 4), never reading the window
+    maximum (NN 251 defects 6 and 11, the W07 regression). The site's `trace_status`
+    records what TRACE would have said (`unassessed`), and `FLAG_WINDOW_EVIDENCE` names
+    the route.
+
+    Both routes classify from read COUNTS (ruling 1): presence from a single read up,
+    absence (`wt`) only at `min_cov` reads; a `partial` resting on one alt read is flagged
+    `PARTIAL_ON_A_SINGLE_ALT_READ`. Both pass the interim SV gate (ruling 3): a one-sided
+    loss of signal in the window makes the site `nocov`, flagged
+    `SV_SUSPECT_ONE_SIDED_COVERAGE_LOSS`.
 
     Missing candidate windows raise rather than silently changing the denominator.
     """
     tr = _trace.reconcile()
     kwargs = _only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov,
                        min_base_qual=min_base_qual, min_mapq=min_mapq)
+    profile_kwargs = _only_set(min_base_qual=min_base_qual, min_mapq=min_mapq, min_cov=min_cov)
     calls = []
     for site in tr.build_edit_sites(list(oligos), oligo_windows, fasta=fasta):
-        if site.intended_alleles:
-            calls.append(tr.score_edit_site(bam, fasta, site, **kwargs))
-            continue
         profile = edit_profile.window_edit_profile(
-            bam, fasta, site.chrom, site.start, site.end,
-            **_only_set(min_base_qual=min_base_qual, min_mapq=min_mapq, min_cov=min_cov),
-        )
-        dpos = tuple((designed_positions or {}).get(site.oligo or "", ()) or ())
-        call = edit_profile.classify_window(
-            profile, designed_positions=dpos,
-            **_only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov),
-        )
-        calls.append(edit_profile.ScoredSite(
-            site=site, vaf=profile.max_vaf, cov=profile.cov_at_max, status=call.status,
-            reason=call.reason, variant_class=call.variant_class,
-            min_depth=profile.min_depth, n_positions_uncovered=profile.n_positions_uncovered,
-            depth_at_designed=call.depth_at_designed, trace_status=tr.SITE_UNASSESSED,
-            flags=tuple(call.flags) + (FLAG_WINDOW_EVIDENCE,),
-        ))
+            bam, fasta, site.chrom, site.start, site.end, **profile_kwargs)
+        if site.intended_alleles:
+            call = tr.score_edit_site(bam, fasta, site, **kwargs)
+            if call.status == tr.SITE_PARTIAL and any(e.alt_count == 1 for e in call.allele_evidence):
+                call = dataclasses.replace(call, flags=tuple(call.flags) + (edit_profile.FLAG_SINGLE_ALT_READ,))
+        else:
+            dpos = tuple((designed_positions or {}).get(site.oligo or "", ()) or ())
+            if not dpos:
+                raise DesignedPositionsRequired(
+                    f"{site.oligo or '?'} @ {site.chrom}:{site.start}-{site.end} declares no intended allele "
+                    "and has no designed position (no frame-verified wt_seq + design_donor), so the window "
+                    "cannot be scored. Declare `intended_variants`, or give the window table wt_seq and "
+                    "design_donor; it is never scored at the window maximum (planning/268 §4).")
+            wcall = edit_profile.classify_window(
+                profile, designed_positions=dpos,
+                **_only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov),
+            )
+            call = edit_profile.ScoredSite(
+                site=site, vaf=profile.max_vaf, cov=profile.cov_at_max, status=wcall.status,
+                reason=wcall.reason, variant_class=wcall.variant_class,
+                min_depth=profile.min_depth, n_positions_uncovered=profile.n_positions_uncovered,
+                depth_at_designed=wcall.depth_at_designed, trace_status=tr.SITE_UNASSESSED,
+                flags=tuple(wcall.flags) + (FLAG_WINDOW_EVIDENCE,),
+            )
+        # 🔴 Interim SV gate on BOTH routes (planning/284 §8 ruling 3): a one-sided loss of signal
+        # in the donor window excludes the site; it is never read as an edit or as NO_EDIT.
+        side = edit_profile.one_sided_coverage_loss(
+            bam, profile, **_only_set(min_mapq=min_mapq))
+        if side is not None:
+            extra = {"reason": f"sv_suspect_one_sided_loss_{side}"} if isinstance(call, edit_profile.ScoredSite) else {}
+            call = dataclasses.replace(call, status=tr.SITE_NOCOV,
+                                       flags=tuple(call.flags) + (edit_profile.FLAG_SV_ONE_SIDED_LOSS,), **extra)
+        calls.append(call)
     return calls
 
 
