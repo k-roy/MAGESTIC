@@ -119,6 +119,30 @@ def build_sha() -> str:
     return (git_state().get("commit") or "").strip()
 
 
+#: Shortest exported sha compared against a checkout HEAD; a shorter one is never verified.
+MIN_SHA_PREFIX = 7
+
+
+def _checkout_holds_package(state: Mapping[str, Any]) -> bool:
+    """Whether `git_state()`'s repo is the checkout the running `magestic` came from.
+
+    `git rev-parse --show-toplevel` from the package directory also answers for an
+    UNRELATED enclosing repo, e.g. a non-editable install into a venv that sits inside
+    some other working tree. Only a toplevel whose `src/magestic` IS the imported
+    package can verify a sha.
+    """
+    top = state.get("repo")
+    if not top:
+        return False
+    try:
+        import magestic
+
+        pkg = Path(magestic.__file__).resolve().parent
+        return (Path(top) / "src" / "magestic").resolve() == pkg
+    except Exception:  # pragma: no cover - magestic is importable by construction here
+        return False
+
+
 def _verify_against_checkout(sha: str, state: Mapping[str, Any]) -> tuple[bool, str]:
     """`(verified, reason)` for a sha taken from `$MAGESTIC_BUILD_SHA` or `BUILD_SHA`.
 
@@ -129,10 +153,12 @@ def _verify_against_checkout(sha: str, state: Mapping[str, Any]) -> tuple[bool, 
     receipt would name code that did not run.
     """
     head = (state.get("commit") or "").strip()
-    if not head:
+    if not head or not _checkout_holds_package(state):
         return False, ("no git checkout holds the package, so the exported sha cannot be "
                        "checked; magestic_wgs_source_sha256 identifies the code that ran")
-    if not (head.startswith(sha) or sha.startswith(head)):
+    if len(sha) < MIN_SHA_PREFIX:
+        return False, f"the exported sha is shorter than {MIN_SHA_PREFIX} characters"
+    if not head.startswith(sha):
         raise ProvenanceError(
             f"the exported code sha {sha} is not the checkout's HEAD {head} "
             f"({state.get('repo')}). A receipt would name code that did not run "
@@ -185,7 +211,10 @@ def code_state() -> dict[str, Any]:
             if os.environ.get(BUILD_SHA_ENV, "").strip()
             else (BUILD_SHA_FILE if _sha_from_file() else "git_state")
         )
-        if source == "git_state":
+        if source == "git_state" and not _checkout_holds_package(state):
+            verified, reason = False, ("the enclosing git checkout does not hold the "
+                                       "imported package, so its HEAD names other code")
+        elif source == "git_state":
             verified, reason = not state.get("dirty"), (
                 "clean checkout" if not state.get("dirty") else
                 "the checkout has uncommitted changes (dirty_files)")

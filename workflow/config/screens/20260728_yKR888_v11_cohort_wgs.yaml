@@ -142,6 +142,10 @@ sv_plasmid:
 # thresholds, and a threshold in this file would be the orchestration layer
 # quietly owning an algorithm decision.
 reconcile:
+  # The window table needs `intended_variants`, or `wt_seq` + `design_donor`: a window with
+  # neither is REFUSED (planning/284 §8 ruling 4), and so is the whole table without `wt_seq`
+  # under the default `require_frame_check`. The cohort's Stage-2 donor table
+  # (`donor_precall.donor_table`) carries both columns; point this key at it (planning/268 §2g).
   oligo_windows:     "/path/to/common/annotation_files/<oligo_windows>.tsv"
   oligo_assignments: "/path/to/keyfiles/<per_sample_oligo_assignment>.tsv"
   # Kevin's D1 for Stage 4 too (planning/284 §8 ruling 2): intended-allele evidence at

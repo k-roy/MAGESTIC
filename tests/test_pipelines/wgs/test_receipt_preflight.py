@@ -8,9 +8,11 @@ trees ran, and nothing checked it. Every `run_step_N` now calls `preflight_prove
 before it computes, and a receipt says whether its commit was verified.
 """
 import json
+from pathlib import Path
 
 import pytest
 
+import magestic
 from magestic.pipelines.wgs.pipeline import step_1_bc1_call as s1
 from magestic.pipelines.wgs.qc import provenance as P
 
@@ -19,10 +21,12 @@ from . import test_reconcile_functional as rf
 fixture_factory = rf.fixture_factory  # the 205 lane's synthetic molecule builder
 
 HEAD = "a" * 40
+#: The checkout the running package came from (src/magestic -> repo root).
+REPO = str(Path(magestic.__file__).resolve().parents[2])
 
 
-def _checkout(monkeypatch, *, commit=HEAD, dirty=False):
-    monkeypatch.setattr(P, "git_state", lambda: {"repo": "/x/magestic", "commit": commit,
+def _checkout(monkeypatch, *, commit=HEAD, dirty=False, repo=REPO):
+    monkeypatch.setattr(P, "git_state", lambda: {"repo": repo, "commit": commit,
                                                  "dirty": dirty, "dirty_files": []})
 
 
@@ -75,6 +79,24 @@ def test_an_exported_sha_is_verified_against_the_checkout(monkeypatch, exported,
     state = P.code_state()
     assert (state["commit"], state["commit_verified"]) == (exported, verified)
     assert state["checkout_commit"] == HEAD
+
+
+def test_an_unrelated_enclosing_repo_cannot_verify_or_refuse(monkeypatch, tmp_path):
+    """A non-editable install inside some other working tree: its HEAD names other code."""
+    monkeypatch.setenv(P.BUILD_SHA_ENV, "9d654b8")
+    _checkout(monkeypatch, repo=str(tmp_path))
+    assert P.preflight_provenance("step_1_bc1_call") == "9d654b8"
+    assert P.code_state()["commit_verified"] is False
+    monkeypatch.delenv(P.BUILD_SHA_ENV)
+    monkeypatch.setattr(P, "_sha_from_file", lambda: "")
+    state = P.code_state()
+    assert (state["commit_source"], state["commit_verified"]) == ("git_state", False)
+
+
+def test_a_too_short_exported_sha_is_not_verified(monkeypatch):
+    monkeypatch.setenv(P.BUILD_SHA_ENV, HEAD[:3])
+    _checkout(monkeypatch)
+    assert P.code_state()["commit_verified"] is False
 
 
 def test_a_checkout_sha_records_its_own_dirty_state(monkeypatch):
