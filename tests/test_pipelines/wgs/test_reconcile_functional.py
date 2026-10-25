@@ -262,8 +262,10 @@ def test_explicit_two_donor_assignments_reach_multi_edit(fixture_factory):
     assignments=f['root']/'assigned.tsv'
     assignments.write_text('sample\toligo_name\nwell_A1\toligo_1\nwell_A1\toligo_2\n')
     cfg=replace(f['config'],reconcile=replace(f['config'].reconcile,oligo_assignments=assignments))
-    write_bam(f['bam'],f['refs'],f['records']+[read(f'left{i}','C',start=300) for i in range(4)]+
-              [read(f'right{i}','G',start=400) for i in range(4)])
+    # planning/268 §4: the reads span their windows. One-base reads at the first window base are, by
+    # Kevin's 2026-10-25 interim SV gate, a one-sided loss of signal across the window (excluded).
+    write_bam(f['bam'],f['refs'],f['records']+[read(f'left{i}','C'+'A'*19,start=300) for i in range(4)]+
+              [read(f'right{i}','G'+'A'*9,start=400) for i in range(4)])
     row=read_rows(s4.run_step_4(cfg))[0]
     assert (row['label'],row['n_full'],row['n_partial'])==('MULTI_EDIT','2','0')
     assert [(e['alt_count'],e['depth']) for e in json.loads(row['allele_counts'])]==[(4,4),(4,4)]

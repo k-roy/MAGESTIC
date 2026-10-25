@@ -3,10 +3,11 @@
 Kevin, 2026-10-24: "we should not require an intended edit in order to be able to
 assign confidence to variant calls from the WGS". So a window without
 `intended_variants` is scored from its read evidence (`core.edit_profile`), gated at
-the designed base that frame-verified `wt_seq` + `design_donor` give, and at the window
-minimum otherwise. These tests drive that route through `run_step_4`, so the
-designed-position wiring, the provenance flag in the shipped shard and the conditional
-frame-check refusal are all exercised on the path the pipeline takes.
+the designed base that frame-verified `wt_seq` + `design_donor` give. With no designed
+base the window is REFUSED (Kevin 2026-10-25, ruling 4 of planning/284 §8; WITHDRAWN:
+"and at the window minimum otherwise"). These tests drive that route through
+`run_step_4`, so the designed-position wiring, the provenance flag in the shipped shard
+and both refusals are exercised on the path the pipeline takes.
 
 Fixtures come from the 205 lane's `test_reconcile_functional` (synthetic molecules, no
 external data). Reference chrII:301-320 is `A`; the design is A>C at 301.
@@ -15,7 +16,10 @@ from dataclasses import replace
 
 import pytest
 
-from magestic.pipelines.wgs.core.reconcile_driver import FLAG_WINDOW_EVIDENCE
+from magestic.pipelines.wgs.core.reconcile_driver import (
+    FLAG_WINDOW_EVIDENCE,
+    DesignedPositionsRequired,
+)
 from magestic.pipelines.wgs.pipeline import step_1_bc1_call as s1
 from magestic.pipelines.wgs.pipeline import step_4_reconcile as s4
 from magestic.pipelines.wgs.pipeline._common import StepIncompleteError
@@ -71,10 +75,12 @@ def test_a_hole_at_the_designed_base_is_low_conf_not_no_edit(fixture_factory):
     assert row["edits"].endswith(":nocov") and row["n_nocov"] == "1"
 
 
-def test_no_wt_seq_is_refused_by_default_and_recorded_when_accepted(fixture_factory):
+def test_no_wt_seq_is_refused_by_default_and_by_score_sites_when_accepted(fixture_factory):
     """A wrong frame inverts read-evidence calls, so `require_frame_check` refuses a table
-    with no `wt_seq` while any window declares no allele; `False` runs, gated at the
-    window minimum, and records the gap in the audit sidecar."""
+    with no `wt_seq` while any window declares no allele. `False` passes that check and
+    records the gap in the audit sidecar, but the scorer then refuses the window, because
+    no designed base can be derived (ruling 4). WITHDRAWN: "`False` runs, gated at the
+    window minimum"."""
     f = fixture_factory(bridge=False, plasmid=False)
     edits = [read(f"r{i}", "C" + "A" * 19) for i in range(4)]
     config = _case(f, edits, wt_seq=False)
@@ -82,8 +88,7 @@ def test_no_wt_seq_is_refused_by_default_and_recorded_when_accepted(fixture_fact
         s4.run_step_4(config)
     g = fixture_factory(bridge=False, plasmid=False)
     accepted = _case(g, edits, wt_seq=False, require_frame_check=False)
-    row = read_rows(s4.run_step_4(accepted))[0]
-    assert row["label"] == "SINGLE_EDIT"
-    assert FLAG_WINDOW_EVIDENCE in row["flags"].split(",")
+    with pytest.raises(DesignedPositionsRequired, match="oligo_1"):
+        s4.run_step_4(accepted)
     sidecar = s4.audit_sidecar_path(accepted, "well_A1").read_text()
     assert '"status": "no_wt_seq_column"' in sidecar

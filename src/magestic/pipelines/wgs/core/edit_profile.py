@@ -444,7 +444,9 @@ def classify_window(
        `window_table.designed_positions`, i.e. from `wt_seq` vs the design — defect
        10). This is the quantity that decides whether the edit was observable.
     2. **At the window minimum** otherwise. This is the drop-in that needs no new
-       input and still closes defect 11.
+       input and still closes defect 11. Stage 4 never takes this branch:
+       `reconcile_driver.score_sites` refuses a window with no designed position
+       (Kevin 2026-10-25, planning/284 §8 ruling 4).
 
     When (1) is used, a window position below `min_cov` elsewhere does not change the
     status but DOES raise `FLAG_WINDOW_PARTIAL_COVERAGE`, so the partial coverage the

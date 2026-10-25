@@ -922,7 +922,8 @@ class TestDefects6And11EditProfile:
             with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
                 str(fasta)
             ) as fa:
-                window = score_sites(bam, fa, ["O1"], bare)[0]
+                # planning/268 §4 ruling 4: the read-evidence route needs the designed base.
+                window = score_sites(bam, fa, ["O1"], bare, designed_positions={"O1": (3030,)})[0]
                 got[name] = score_sites(bam, fa, ["O1"], declared)[0]
             assert window.variant_class == expect, (name, window.variant_class)
             assert window.reason, "no status without a reason"
@@ -1075,10 +1076,11 @@ class TestDefects6And11EditProfile:
         """🔴 Defect 11 on the path Stage 4 ACTUALLY TAKES.
 
         Both `score_sites` routes must turn that confident `NO_EDIT` into `LOW_CONF`
-        (planning/268). Undeclared window: gated at the window minimum, with the
-        reclassification recorded (TRACE alone would call it `unassessed`). Declared
-        allele: TRACE counts fragments AT the allele, so the hole is `nocov`. The window
-        route's headline `(vaf, cov)` stays TRACE's `window_edit_vaf`, so no number moves.
+        (planning/268). Undeclared window: gated at the frame-verified designed base
+        (planning/268 §4 ruling 4 refuses a bare window; WITHDRAWN: "gated at the window
+        minimum"). Declared allele: TRACE counts fragments AT the allele, so the hole is
+        `nocov`. The window route's headline `(vaf, cov)` stays TRACE's `window_edit_vaf`,
+        so no number moves.
         """
         from magestic.pipelines.wgs.core.reconcile_driver import (
             load_oligo_windows,
@@ -1093,15 +1095,21 @@ class TestDefects6And11EditProfile:
             str(write_window_table(tmp_path / "w.tsv", [("O1", CONTIG, ws, we)]))
         )
         declared = load_oligo_windows(str(self._allele_table(tmp_path / "a.tsv", ws, we, ref)))
+        from magestic.pipelines.wgs.core.reconcile_driver import DesignedPositionsRequired
+
         with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
             str(fasta)
         ) as fa:
-            calls = score_sites(bam, fa, ["O1"], bare)
+            # planning/268 §4 ruling 4: without the designed base the window route refuses
+            # (WITHDRAWN: "gated at the window minimum"); with it, the hole is gated there.
+            with pytest.raises(DesignedPositionsRequired):
+                score_sites(bam, fa, ["O1"], bare)
+            calls = score_sites(bam, fa, ["O1"], bare, designed_positions={"O1": (3030,)})
             allele = score_sites(bam, fa, ["O1"], declared)
             vaf, cov = TR.window_edit_vaf(bam, fa, CONTIG, ws, we)
         cell = TR.reconcile_cell("S1", calls, n_genome_bc=1, bc_confidence="high")
         assert calls[0].status == TR.SITE_NOCOV
-        assert calls[0].reason == "window_min_depth_below_min_cov"
+        assert calls[0].reason == "designed_position_depth_below_min_cov"
         assert calls[0].min_depth == 0
         assert calls[0].n_positions_uncovered >= 6
         assert calls[0].trace_status == TR.SITE_UNASSESSED
@@ -1377,12 +1385,15 @@ class TestDefect8DistalDiscards:
 class TestDefect10FrameVerification:
     WIN = (3001, 3060)
 
-    @defect_persists("10 / NN243 A11 (Stage 4 never sees the design's wt_seq)",
-                     closed_by="window_table.verify_window_frame")
     def test_repro_an_inverted_reference_frame_is_undetectable(self, tmp_path):
         """REPRODUCTION (A11): reads that are WT against the TRUE genome score as a
         full edit against a reference that already carries the design's ALT — and
-        nothing in Stage 4 can tell, because it never sees `wt_seq`."""
+        nothing in Stage 4 can tell, because it never sees `wt_seq`.
+
+        CLOSED (planning/268 §4, Kevin 2026-10-25 ruling 4): a window with no declared
+        allele and no frame-verified designed base is REFUSED by `score_sites`, so the
+        silent inversion cannot be produced; `defect_persists` is removed. A declared
+        allele has its REF validated by TRACE instead."""
         from magestic.pipelines.wgs.core.reconcile_driver import (
             load_oligo_windows,
             score_sites,
@@ -1396,17 +1407,13 @@ class TestDefect10FrameVerification:
         bam_path = write_bam(tmp_path / "wt.bam", truth, spans=(self.WIN,))
         wt_tab = write_window_table(tmp_path / "w.tsv", [("O1", CONTIG, ws, we)])
         ow = load_oligo_windows(str(wt_tab))
+        from magestic.pipelines.wgs.core.reconcile_driver import DesignedPositionsRequired
+
         with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
             str(fasta)
         ) as fa:
-            calls = score_sites(bam, fa, ["O1"], ow)
-            cell = TR.reconcile_cell("S1", calls, n_genome_bc=1, bc_confidence="high")
-        # Unedited reads, yet a confident SINGLE_EDIT: the inversion.
-        assert cell.label == TR.SINGLE_EDIT and calls[0].vaf > 0.9
-        assert "FRAME" in " ".join(cell.flags) or False, (
-            f"unedited reads scored {cell.label} vaf={calls[0].vaf:.2f} against a "
-            "reference carrying the design's ALT, with no flag of any kind"
-        )
+            with pytest.raises(DesignedPositionsRequired):
+                score_sites(bam, fa, ["O1"], ow)
 
     def test_fixed_wt_seq_detects_the_inverted_frame(self, tmp_path):
         from magestic.pipelines.wgs.core.window_table import (
@@ -1827,7 +1834,7 @@ class TestDefect16EndToEndOnABam:
                 got[name] = TR.reconcile_cell(
                     name, calls, n_genome_bc=1, bc_confidence="high"
                 ).label
-                undeclared = score_sites(bam, fa, ["O1"], bare)
+                undeclared = score_sites(bam, fa, ["O1"], bare, designed_positions={"O1": (3030,)})
                 assert TR.reconcile_cell(
                     name, undeclared, n_genome_bc=1, bc_confidence="high"
                 ).label == got[name]

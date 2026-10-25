@@ -440,14 +440,16 @@ def test_f11b_rescue_needs_a_READ_COUNT_floor_not_only_a_fraction(tmp_path):
         # 0.05 fraction floor; only `two` clears a 2-read count floor.
         fh.write("chrXV\t100\t.\tT\tG\t50\t.\t.\tGT:AD"
                  "\t0:13,1\t0:12,2\n")
+    # Kevin 2026-10-25 (planning/284 §8 ruling 1): the floor is DEPTH-CONDITIONAL and "even a
+    # single read is OK". WITHDRAWN: "a fixed 2-read floor drops the 1-of-14 record by default".
+    # The default is TRACE's min_alt_reads(14) = 1, so both are rescued.
     res = split_plate_vcf(p, tmp_path / "wd", min_allele_fraction=0.05)
-    assert res.n_rescued_by_af == 1, "only the 2-read record may be rescued"
-    assert res.n_dropped_below_min_alt_reads == 1
-    assert res.n_records_out["one"] == 0 and res.n_records_out["two"] == 1
-    # POSITIVE control: lowering the floor to 1 read admits it, so the floor is the
-    # thing doing the work and not an unrelated filter.
-    res1 = split_plate_vcf(p, tmp_path / "wd1", min_allele_fraction=0.05, min_alt_reads=1)
-    assert res1.n_rescued_by_af == 2 and res1.n_dropped_below_min_alt_reads == 0
+    assert res.n_rescued_by_af == 2 and res.n_dropped_below_min_alt_reads == 0
+    # The count floor is still the thing doing the work when pinned: 2 reads, as NN 255 had it.
+    res2 = split_plate_vcf(p, tmp_path / "wd2", min_allele_fraction=0.05, min_alt_reads=2)
+    assert res2.n_rescued_by_af == 1, "only the 2-read record may be rescued"
+    assert res2.n_dropped_below_min_alt_reads == 1
+    assert res2.n_records_out["one"] == 0 and res2.n_records_out["two"] == 1
 
 
 @_needs_bcftools

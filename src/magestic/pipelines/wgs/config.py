@@ -559,8 +559,9 @@ class WGSReconcileConfig:
     reference frame, optional `wt_seq` / `design_donor`). TRACE's `load_oligo_windows`
     refuses a malformed or conflicting row. A window with `intended_variants` is scored
     by TRACE per allele; one without is scored from its read evidence, gated at the
-    designed base when `wt_seq` + `design_donor` give it and at the window minimum
-    otherwise, and flagged `WINDOW_EVIDENCE_NO_INTENDED_ALLELES` (planning/268).
+    designed base that `wt_seq` + `design_donor` give, and flagged
+    `WINDOW_EVIDENCE_NO_INTENDED_ALLELES` (planning/268). A window with neither is
+    REFUSED (`DesignedPositionsRequired`; Kevin 2026-10-25, planning/284 §8 ruling 4).
 
     The data that enables that (planning/268 §2g, agreed by Kevin 2026-10-24): the
     cohort's Stage-2 donor table (`donor_precall.donor_table`) already carries `chrom`,

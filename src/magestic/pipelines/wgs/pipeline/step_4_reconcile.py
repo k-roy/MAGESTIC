@@ -245,8 +245,8 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
     _check_reference_consistency(config, record)
     _write_audit_sidecar(config, sample)
     # 🔴 NN 251 defects 6 + 11 for windows that declare no intended allele: they are
-    # scored from read evidence, gated at the designed base when the frame-verified
-    # `wt_seq` + `design_donor` give it, else at the window minimum (planning/268).
+    # scored from read evidence, gated at the designed base the frame-verified
+    # `wt_seq` + `design_donor` give; without one, `score_sites` refuses (planning/268 §4).
     designed = (designed_positions_by_oligo(inputs.audit, orientations=orientations)
                 if inputs.audit is not None else {})
 
