@@ -72,13 +72,14 @@ redi = [
 # The TRACE pin is the head of the PUBLIC branch `integrate/june-main-and-205-wgs`
 # (k-roy/TRACE PR #4, planning/268): GitHub's June modules + the September reconcile line +
 # the 205 lane's repairs, the only TRACE that defines `score_edit_site` / `bc_confidence_from`
-# / `build_edit_sites(fasta=)`, which Stage 4 calls. It resolves for pip from that pushed ref
+# / `build_edit_sites(fasta=)`, which Stage 4 calls, plus Kevin's 2026-10-25 depth-conditional
+# floor (`min_alt_reads` / `classify_counts`, planning/284 section 8). It resolves for pip from that pushed ref
 # before the PR merges; merge the PR with a merge commit (not squash or rebase) so the sha
 # stays on `main`. Never pin a sha that exists only in a local clone: it cannot resolve.
 wgs = [
     "pysam>=0.21",
     "rapidfuzz>=3.0",
-    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@8f2592b8da1afc2b9f49e4addc70a2587318d6a3",
+    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@12b35c533688e2c0b9c62dafa3903dd098891d6e",
 ]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [
