@@ -67,6 +67,10 @@ bc1:
   bridge_oligo_col: "oligo_name"
   bridge_count_col: null
   bridge_table_revcomp: false
+  # Kevin's D1, ruled into this template 2026-10-25 (planning/284 §8 ruling 2): count
+  # barcode reads at every MAPQ. Measured on plate 5031: 67/71 at 0 vs 64/71 at the
+  # default 20 (planning/284 §2c).
+  min_mapq: 0
 
 # --- Barcode tracks ----------------------------------------------------------
 # core/locus_config.py renders this block as the FLAT key/value sidecar TRACE's
@@ -140,6 +144,9 @@ sv_plasmid:
 reconcile:
   oligo_windows:     "/path/to/common/annotation_files/<oligo_windows>.tsv"
   oligo_assignments: "/path/to/keyfiles/<per_sample_oligo_assignment>.tsv"
+  # Kevin's D1 for Stage 4 too (planning/284 §8 ruling 2): intended-allele evidence at
+  # every MAPQ. MAPQ 255 (unknown) is still always rejected.
+  min_mapq: 0
 
 # --- Cluster resources -------------------------------------------------------
 # Scheduling only — never an analysis parameter, and never rendered into a rule's

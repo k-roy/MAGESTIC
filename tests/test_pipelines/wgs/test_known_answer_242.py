@@ -59,13 +59,18 @@ def _cell(sites, **kw):
     return reconcile_cell("s", list(sites), **kw)
 
 
-def _write_vcf(path: Path, records, *, gvcf: bool = False, chrom="chrXV", window=(1000, 1010)):
+def _write_vcf(path: Path, records, *, gvcf: bool = False, chrom="chrXV", window=(1000, 1010),
+               ref_seq: str | None = None):
     """Minimal VCF/gVCF in the FORMAT layout TRACE's positional parser assumes
     (`GT:AD:...`, i.e. AD in slot 2 — what `core/vcf_adapter.py` remaps 4 -> 2 to produce).
 
     `records` are (pos, ref, alt, ad_ref, ad_alt). When `gvcf` is set, a <NON_REF>
     reference block is emitted for every position in `window`, which is what gives
     `precall_sample` the `flag_covered` evidence that the `unedited` branch requires.
+
+    `ref_seq` (1-based: `ref_seq[pos - 1]`) supplies each block's REF. planning/268: the
+    pinned TRACE validates every gVCF REF against the reference, so the former constant
+    `A` made a fixture that no real caller could write.
     """
     lines = [
         "##fileformat=VCFv4.2",
@@ -76,7 +81,8 @@ def _write_vcf(path: Path, records, *, gvcf: bool = False, chrom="chrXV", window
     ]
     if gvcf:
         for p in range(window[0], window[1] + 1):
-            lines.append(f"{chrom}\t{p}\t.\tA\t<NON_REF>\t.\t.\t.\tGT:AD\t0/0:30,0")
+            ref = ref_seq[p - 1] if ref_seq else "A"
+            lines.append(f"{chrom}\t{p}\t.\t{ref}\t<NON_REF>\t.\t.\t.\tGT:AD\t0/0:30,0")
     for pos, ref, alt, adr, ada in records:
         lines.append(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\tGT:AD\t0/1:{adr},{ada}")
     path.write_text("\n".join(lines) + "\n")
@@ -199,7 +205,8 @@ def test_unedited_requires_a_gvcf_and_is_otherwise_unknown(tmp_path):
     empty_g = _write_vcf(tmp_path / "empty.g.vcf", [])      # a gVCF with NO ref blocks
     out_no_gvcf = precall_sample(spec, plain, empty_g, chrom_seq)
 
-    full_g = _write_vcf(tmp_path / "full.g.vcf", [], gvcf=True, window=(1000, 1020))
+    full_g = _write_vcf(tmp_path / "full.g.vcf", [], gvcf=True, window=(1000, 1020),
+                        ref_seq=chrom_seq)
     out_with_gvcf = precall_sample(spec, plain, full_g, chrom_seq)
 
     assert out_no_gvcf.editing_outcome == "unknown", (
@@ -233,49 +240,42 @@ def test_unknown_should_record_why_it_is_unknown(tmp_path):
 # =========================================================================== #
 # DEFECT 3 — split("_") crashes on an underscore-bearing contig                #
 # =========================================================================== #
-def test_precall_sample_crashes_on_an_underscore_bearing_contig(tmp_path):
-    """REPRODUCTION. `precall_sample` builds its own variant id as
-    `f"{chrom}_{pos}_{ref}_to_{alt}"` (donor_outcome.py:271, :311) and then
-    re-parses it with `split("_")` and POSITIONAL indices sp[1]/sp[2]/sp[4]
-    (donor_outcome.py:326-336, 338-347).
+def test_precall_sample_handles_an_underscore_bearing_contig(tmp_path):
+    """FORMER REPRODUCTION, now the closed state (planning/268).
 
-    `chrXV` has no underscore, so sp[1] is the position and it works. Every
-    composite reference the WGS reference-mapping policy mandates carries
-    `plasmid_<oligo>` and `integrated_plasmid_<oligo>` contigs, for which sp[1]
-    is a NAME FRAGMENT and `int()` raises ValueError mid-loop -- after some
-    samples have been written.
+    TRACE `7c4c10f` re-parsed its own `f"{chrom}_{pos}_{ref}_to_{alt}"` id with a
+    positional `split("_")`, so every mandated composite contig (`plasmid_<oligo>`,
+    `integrated_plasmid_<oligo>`, ...) raised `ValueError` mid-loop. The pinned TRACE
+    builds ids from structured fields. WITHDRAWN: "precall_sample crashes on an
+    underscore-bearing contig". Asserted instead: the SAME evidence gives the SAME
+    outcome under either name, and the shipped ids carry the real contig name.
     """
     wt = "ACGTACGTACGTACGTACGTA"
     design = wt[:10] + "T" + wt[11:]
     chrom_seq = "N" * 999 + wt + "N" * 100
 
-    # CONTROL: a contig with no underscore parses fine.
-    ok_spec = DonorSpec("S1", "chrXV", 1000, 1020, wt, design, design)
-    ok_vcf = _write_vcf(tmp_path / "ok.vcf", [(1010, "C", "T", 0, 30)], chrom="chrXV")
-    ok_g = _write_vcf(tmp_path / "ok.g.vcf", [], chrom="chrXV")
-    out = precall_sample(ok_spec, ok_vcf, ok_g, chrom_seq)
-    assert out.editing_outcome  # it returned something, no crash
-
-    # DEFECT: the same call on `integrated_plasmid_o1` raises ValueError.
-    bad_spec = DonorSpec("S2", "integrated_plasmid_o1", 1000, 1020, wt, design, design)
-    bad_vcf = _write_vcf(
-        tmp_path / "bad.vcf", [(1010, "C", "T", 0, 30)], chrom="integrated_plasmid_o1"
-    )
-    bad_g = _write_vcf(tmp_path / "bad.g.vcf", [], chrom="integrated_plasmid_o1")
-    with pytest.raises(ValueError, match="invalid literal for int"):
-        precall_sample(bad_spec, bad_vcf, bad_g, chrom_seq)
+    outs = {}
+    for name in ("chrXV", "integrated_plasmid_o1"):
+        spec = DonorSpec("S1", name, 1000, 1020, wt, design, design)
+        vcf = _write_vcf(tmp_path / f"{name}.vcf", [(1010, "G", "T", 0, 30)], chrom=name)
+        g = _write_vcf(tmp_path / f"{name}.g.vcf", [], chrom=name)
+        outs[name] = precall_sample(spec, vcf, g, chrom_seq)
+    assert outs["chrXV"].editing_outcome == outs["integrated_plasmid_o1"].editing_outcome
+    for name, out in outs.items():
+        assert all(v.startswith(name + "_") for v in out.designed_variants), out
 
 
-def test_single_underscore_contig_also_crashes(tmp_path):
-    """One underscore is enough: `plasmid_o1_1010_C_to_T` -> sp[1] == 'o1'."""
+def test_single_underscore_contig_is_also_handled(tmp_path):
+    """One underscore was enough to crash TRACE `7c4c10f` (`plasmid_o1_1010_C_to_T` ->
+    sp[1] == 'o1'). WITHDRAWN with the defect, which the pinned TRACE closes."""
     wt = "ACGTACGTACGTACGTACGTA"
     design = wt[:10] + "T" + wt[11:]
     chrom_seq = "N" * 999 + wt + "N" * 100
     spec = DonorSpec("S3", "plasmid_o1", 1000, 1020, wt, design, design)
-    vcf = _write_vcf(tmp_path / "p.vcf", [(1010, "C", "T", 0, 30)], chrom="plasmid_o1")
+    vcf = _write_vcf(tmp_path / "p.vcf", [(1010, "G", "T", 0, 30)], chrom="plasmid_o1")
     g = _write_vcf(tmp_path / "p.g.vcf", [], chrom="plasmid_o1")
-    with pytest.raises(ValueError, match="invalid literal for int"):
-        precall_sample(spec, vcf, g, chrom_seq)
+    out = precall_sample(spec, vcf, g, chrom_seq)
+    assert all(v.startswith("plasmid_o1_") for v in out.designed_variants), out
 
 
 def test_pipeline_qc_guard_for_the_underscore_contig_exists_and_fires():
@@ -399,15 +399,19 @@ def _s2(chrom="chrXV"):
     return DonorSpec("S", chrom, _DS, _DE, _WT21, _DESIGN21, _DESIGN21)
 
 
-def _s2_vcf(path: Path, records, *, chrom="chrXV", ref_blocks=None, end_block=None):
+def _s2_vcf(path: Path, records, *, chrom="chrXV", ref_blocks=None, end_block=None, gt="0/1"):
+    # Block REF from `_CHROMSEQ`: the pinned TRACE validates every gVCF REF (planning/268).
+    # The callers' variant records were written C>T at 1010, where `_WT21` carries G (the
+    # design is G>T); TRACE `7c4c10f` never checked. They now state the real REF base.
     out = ["##fileformat=VCFv4.2", f"##contig=<ID={chrom}>",
            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1"]
     if end_block:
-        out.append(f"{chrom}\t{end_block[0]}\t.\tA\t<NON_REF>\t.\t.\tEND={end_block[1]}\tGT:AD\t0/0:30,0")
+        out.append(f"{chrom}\t{end_block[0]}\t.\t{_CHROMSEQ[end_block[0] - 1]}\t<NON_REF>\t.\t.\t"
+                   f"END={end_block[1]}\tGT:AD\t0/0:30,0")
     for p, adr in ref_blocks or []:
-        out.append(f"{chrom}\t{p}\t.\tA\t<NON_REF>\t.\t.\t.\tGT:AD\t0/0:{adr},0")
+        out.append(f"{chrom}\t{p}\t.\t{_CHROMSEQ[p - 1]}\t<NON_REF>\t.\t.\t.\tGT:AD\t0/0:{adr},0")
     for pos, ref, alt, adr, ada in records:
-        out.append(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\tGT:AD\t0/1:{adr},{ada}")
+        out.append(f"{chrom}\t{pos}\t.\t{ref}\t{alt}\t.\t.\t.\tGT:AD\t{gt}:{adr},{ada}")
     path.write_text("\n".join(out) + "\n")
     return path
 
@@ -417,19 +421,22 @@ _FULLCOV = [(p, 30) for p in range(_DS, _DE + 1)]
 
 @pytest.mark.parametrize("ad_ref,ad_alt", [(0, 30), (15, 15), (21, 9), (27, 3), (29, 1)])
 def test_stage2_has_no_allele_fraction_threshold_at_all(tmp_path, ad_ref, ad_alt):
-    """🔴 THE STAGE-2 FINDING. `precall_sample`'s VCF pass bucket-sorts purely on the
-    REF/ALT strings (donor_outcome.py:263-277); AD is read only for the gVCF
-    `flag_covered` count. So a well with ONE alt read in thirty (3%) is called
-    `designed_variant_installed`, byte-identical to a clean 30/30 clone.
+    """🔴 THE STAGE-2 FINDING, as it stands on the pinned TRACE (planning/268).
 
-    Consequence: the real cohort's 73.4% "correct edit" is an UPPER bound that
-    absorbs mixtures at any allele fraction. The controlling sensitivity threshold is
-    the UPSTREAM variant caller's ploidy/min-AF, which lives outside this repo
-    (`donor_precall.plate_vcfs` are supplied pre-made).
+    TRACE `7c4c10f` bucket-sorted purely on the REF/ALT strings, so a well with ONE alt
+    read in thirty (3%) was `designed_variant_installed`, byte-identical to a clean
+    30/30 clone. WITHDRAWN: "a 3% heterozygous call ships as installed". The pinned
+    TRACE selects alleles by GT: a heterozygous genotype in a clonal donor is refused as
+    `unknown;ambiguous_genotype` at every fraction, and a homozygous-alt genotype is
+    installed at every fraction. What survives, and is pinned: Stage 2 still has NO
+    allele-fraction threshold of its own. AD never changes the call, so the upstream
+    caller's genotype is the controlling threshold (`268_rescue_probe_results.tsv`).
     """
-    v = _s2_vcf(tmp_path / "v.vcf", [(_EDIT, "C", "T", ad_ref, ad_alt)])
     g = _s2_vcf(tmp_path / "g.vcf", [], ref_blocks=_FULLCOV)
-    assert precall_sample(_s2(), v, g, _CHROMSEQ).editing_outcome == "designed_variant_installed"
+    het = _s2_vcf(tmp_path / "het.vcf", [(_EDIT, "G", "T", ad_ref, ad_alt)])
+    hom = _s2_vcf(tmp_path / "hom.vcf", [(_EDIT, "G", "T", ad_ref, ad_alt)], gt="1")
+    assert precall_sample(_s2(), het, g, _CHROMSEQ).editing_outcome == "unknown;ambiguous_genotype"
+    assert precall_sample(_s2(), hom, g, _CHROMSEQ).editing_outcome == "designed_variant_installed"
 
 
 def test_stage2_calls_unedited_at_gvcf_reference_depth_one(tmp_path):
@@ -453,12 +460,14 @@ def test_stage2_separates_an_indel_and_an_imprecise_repair_from_a_correct_edit(t
     This is why imprecise repairs and indels are NOT hidden inside the real 22.6%:
     all 115 raw NE rows are bare `designed_variant_unedited` with no suffix."""
     g = _s2_vcf(tmp_path / "g.vcf", [], ref_blocks=_FULLCOV)
+    # A clonal haploid lesion is GT `1`; the pinned TRACE refuses a heterozygous
+    # genotype in a clonal donor as ambiguous (planning/268), so the fixture states it.
     for label, rec in (
-        ("imprecise", (_EDIT, "C", "A", 0, 30)),
-        ("insertion", (_EDIT, "C", "CGG", 0, 30)),
-        ("deletion", (_EDIT - 1, "GC", "G", 0, 30)),
+        ("imprecise", (_EDIT, "G", "A", 0, 30)),
+        ("insertion", (_EDIT, "G", "GAA", 0, 30)),
+        ("deletion", (_EDIT - 1, "CG", "C", 0, 30)),
     ):
-        v = _s2_vcf(tmp_path / f"{label}.vcf", [rec])
+        v = _s2_vcf(tmp_path / f"{label}.vcf", [rec], gt="1")
         out = precall_sample(_s2(), v, g, _CHROMSEQ)
         assert out.editing_outcome == "designed_variant_unedited;spontaneous_mutations", label
         assert len(out.spontaneous_variants) == 1, label
@@ -567,56 +576,41 @@ def test_the_upstream_caller_is_recorded_and_is_variants_only_and_now_haploid():
     ["plasmid_o1", "integrated_plasmid_o1", "native_2micron",
      "blank_MAGESTIC3_pF835_guide_donor_plasmid", "unplaced_contig_34"],
 )
-def test_gate3_crashes_on_every_mandated_composite_contig(tmp_path, chrom):
+def test_gate3_is_closed_on_every_mandated_composite_contig(tmp_path, chrom):
     """GATE 3 across the full set of underscore-bearing contig names that
-    `core/contig_alias.py` itself lists as mandated by the reference standard."""
-    v = _s2_vcf(tmp_path / "v.vcf", [(_EDIT, "C", "T", 0, 30)], chrom=chrom)
-    g = _s2_vcf(tmp_path / "g.vcf", [], chrom=chrom,
-                ref_blocks=[(p, 30) for p in range(_DS, _DE + 1)])
-    with pytest.raises(ValueError, match="invalid literal for int"):
-        precall_sample(_s2(chrom), v, g, _CHROMSEQ)
+    `core/contig_alias.py` itself lists as mandated by the reference standard.
+
+    planning/268: WITHDRAWN "every mandated composite contig crashes Stage 2". Under the
+    pinned TRACE each one gives exactly the outcome the underscore-free `chrXV` gives
+    for the same evidence, with its real name in every shipped id."""
+    def run(name):
+        v = _s2_vcf(tmp_path / f"{name}.v.vcf", [(_EDIT, "G", "T", 0, 30)], chrom=name)
+        g = _s2_vcf(tmp_path / f"{name}.g.vcf", [], chrom=name,
+                    ref_blocks=[(p, 30) for p in range(_DS, _DE + 1)])
+        return precall_sample(_s2(name), v, g, _CHROMSEQ)
+
+    control, out = run("chrXV"), run(chrom)
+    assert out.editing_outcome == control.editing_outcome
+    ids = list(out.designed_variants) + list(out.spontaneous_variants)
+    assert all(v.startswith(chrom + "_") for v in ids), ids
 
 
-def test_contig_alias_mitigation_is_now_wired_into_stage_2_with_a_decode():
-    """🔴 **UPDATED by NN 251 (defect 3) -- this test's tripwire fired as designed.**
+def test_stage_2_needs_no_contig_alias_now_that_gate_3_is_closed():
+    """🔴 **UPDATED by planning/268 -- this test's tripwire fired as designed, again.**
 
-    The original asserted `callers == []`: `core/contig_alias.py` was a complete,
-    correct, right-anchored fix for GATE 3 that nothing imported, so GATE 3 was live
-    in every stage. Its docstring said "it fails the day someone wires the mitigation
-    into a stage, which is the signal that GATE 3 has closed. Update it then."
-
-    GATE 3 has closed, and the test now pins the two halves that make the wiring
-    SAFE rather than merely present. Wiring the alias without the second half would
-    have been a regression, not a fix: it would ship `ctg0003_131_A_to_G` into a
-    shipped table, replacing a loud `ValueError` with a silent wrong contig name --
-    which is why the peer who wrote the module deliberately stopped short of wiring it.
-
-      1. `step_2` encodes every name TRACE reads (samplesheet `chrom`, FASTA headers,
-         `.fil.vcf` CHROM, `.g.vcf` CHROM) and asserts the encoding was applied
-         consistently, because `precall_sample` skips a record whose `v_chr != chrom`
-         SILENTLY.
-      2. `step_2` DECODES the variant ids before the shard is published, so no
-         aliased name reaches a shipped table.
+    NN 251 wired `core/contig_alias.py` into step_2 (encode every name TRACE reads,
+    decode the ids before publishing) because TRACE `7c4c10f` crashed on underscores.
+    The pinned TRACE builds ids from structured fields
+    (`test_gate3_is_closed_on_every_mandated_composite_contig`), so the 205 lane dropped
+    GATE 3 and the merge retired the alias wiring. Re-aliasing would rewrite per-sample
+    VCFs after their producer receipts were written. WITHDRAWN: "the mitigation is wired
+    into Stage 2". Pinned instead: step_2 neither aliases nor gates, and the module
+    survives unchanged for anyone who needs the bijection.
     """
-    import subprocess
-
-    root = Path(__import__("magestic.pipelines.wgs", fromlist=["x"]).__file__).parent
-    hits = subprocess.run(
-        ["grep", "-rn", "-e", "contig_alias", "-e", "ContigAlias", "-e", "alias_rows", str(root)],
-        capture_output=True, text=True,
-    ).stdout.splitlines()
-    callers = [h for h in hits if "core/contig_alias.py" not in h and "__pycache__" not in h]
-    assert callers, "GATE 3's mitigation must be wired into a stage, not merely exist"
-    assert any("step_2_donor_precall.py" in h for h in callers)
-
+    from magestic.pipelines.wgs.core import contig_alias
     from magestic.pipelines.wgs.pipeline import step_2_donor_precall as s2
 
-    # The decode half, and the consistency guard that keeps the wiring honest.
-    assert hasattr(s2, "_decode_outcome_table")
-    assert hasattr(s2, "_require_alias_consistency")
-    assert hasattr(s2, "_gate_3_alias")
-    # The gate still refuses when the remedy is switched off, so the old behaviour
-    # remains reachable and the fix is auditable against it.
     src = Path(s2.__file__).read_text()
-    assert "resolve_underscore_contigs" in src
-    assert "GATE_3" in src
+    assert "core.contig_alias import" not in src and "alias_vcf_contigs(" not in src
+    assert not hasattr(s2, "GATE_3") and not hasattr(s2, "_gate_3_alias")
+    assert hasattr(contig_alias, "ContigAlias")

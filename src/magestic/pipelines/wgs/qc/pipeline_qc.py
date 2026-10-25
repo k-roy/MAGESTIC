@@ -57,13 +57,12 @@ def require_nonempty_output(path: str | Path, *, label: str, comment_prefix: str
     p = Path(path)
     if not p.exists():
         raise QCFailure(f"{label}: {p} was not written")
-    rows = [
-        ln
-        for ln in p.read_text().splitlines()
-        if ln.strip() and not ln.startswith(comment_prefix)
-    ]
-    # The first non-comment line is the header when TRACE did not comment it out.
-    n = max(len(rows) - 1, 0) if rows else 0
+    # One counting rule for the package: the header is found by content, so a commented
+    # TRACE header is not subtracted a second time (audit W14a). Imported here to keep this
+    # module free of package imports at load time.
+    from ..core.emit import count_data_rows
+
+    n = count_data_rows(p, comment_prefix=comment_prefix)
     if n == 0:
         raise QCFailure(
             f"{label}: {p} has a header but ZERO data rows. Exit code 0 over zero "

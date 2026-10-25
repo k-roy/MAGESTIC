@@ -1,56 +1,38 @@
+"""Stage 4: per-window edit reconciliation with measured bc1 multiplicity.
+
+Windows with intended variants are scored per allele by TRACE; windows without them
+are scored from their read evidence. Explicit sample assignments take precedence over
+bridge-derived candidate sites. Shared windows, assignments and the bridge are loaded
+once per direct cohort run.
+
+Merged in planning/268 with the 222 lane (NN 251/255). Kept from it: the window-table
+denominators (defect 12), logged before TRACE's loader refuses a bad row; the reference-
+frame check against `wt_seq` when the table carries one (defect 10); the BAM/reference
+consistency check (defect 14 / F3b); and the per-sample audit sidecars that make a check
+that did not run countable (F10). Scoring is per window (`core.reconcile_driver.score_sites`):
+TRACE's allele-specific `score_edit_site` where the window declares `intended_variants`, and
+the 222 lane's depth-gated `core.edit_profile` classifier on the read evidence where it does
+not, because an intended edit is not required to assign confidence to a WGS call (Kevin,
+2026-10-24). Retired: the `bc_confidence`-renamed writer; the shard is TRACE's schema.
 """
-Step 4 — per-cell edit reconciliation (bc1 multiplicity x designed-site edit VAF).
-
-Orchestration over TRACE's `trace_crispr.wgs.reconcile`, reached through
-`core/reconcile_driver.py`. The driver exists because `reconcile.run` is the one
-TRACE entry point that is not library-callable with keyword arguments — it takes
-an `argparse.Namespace` — and synthesizing a Namespace to call a library would
-re-create the inverted dependency `ARCHITECTURE_POLICY` §11 forbids, through the
-back door. No threshold is re-implemented here or there: `tau_full` / `tau_wt` /
-`min_cov` / `min_base_qual` stay in TRACE, which is why this step passes none of
-them.
-
-**Stage 1 -> Stage 4 is the pipeline's one hard dependency, and TRACE's defaults
-are not neutral.** `reconcile_cell(..., n_genome_bc=0, n_plasmid_bc=0,
-bc_confidence="high")` defaults to a *wrong* answer rather than an absent one:
->=2 genome-track bc1 is the primary contamination signal, so a cell scored with
-`n_genome_bc=0` can never report contamination, and `bc_confidence="high"` marks
-every call trustworthy. `core.reconcile_driver.reconcile_sample` derives all three
-from this sample's own BAM, so this step does NOT read Stage 1's numbers — it
-only requires Stage 1's per-track shard to exist, which is the ordering edge the
-Snakemake rule declares as `bc1_tracks=BC1_DIR/{sample}.bc1_tracks.tsv`.
-
-🔴 **KNOWN LIMITATION, driver-side, and it moves a number that will be read as a
-result.** `reconcile_sample` computes `bc_confidence` unconditionally from
-`BarcodeCall.confidence`, which is the COMBINED caller x bridge label. Measured on
-the cluster: `_combine_confidence("high", BRIDGE_NONE) == "low"`. So in a
-BRIDGE-LESS cohort — the configuration the §7 acceptance smoke uses — every
-barcode is `"low"`, `bc_confidence` is therefore `"low"` for every cell, and
-`reconcile_cell` stamps `confidence="low"` on the whole cohort because no bridge
-was supplied, NOT because the barcode evidence was weak. The fix is a
-`bc_confidence=` parameter on `reconcile_sample` (defaulting to today's behavior)
-so a caller can pass `caller_confidence` instead; re-deriving the rule here would
-put a classification rule in the orchestration layer, which spec D3 forbids. Until
-that lands, read a bridge-less Stage-4 `confidence` column as "bridge absent",
-never as "call unreliable".
-
-Author: Kevin R. Roy
-"""
-
 from __future__ import annotations
 
+import csv
 import json
 import logging
 from collections.abc import Sequence
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pysam
 from trace_crispr.wgs import reconcile
 
 from ..config import RECONCILE_SUBDIR, WGSConfig
 from ..core.blacklist_adapter import reference_contig_lengths
-from ..core.edit_profile import edit_evidence
-from ..core.emit import write_reconciliations_audited
+from ..core.edit_profile import FLAG_SINGLE_ALT_READ, FLAG_SV_ONE_SIDED_LOSS
+from ..core.emit import write_reconciliations
 from ..core.locus_config import build_tracks, validate_tracks
 from ..core.manifest import (
     ReferenceUnobservedError,
@@ -58,18 +40,20 @@ from ..core.manifest import (
     incomparable_contigs,
     require_reference_consistency,
 )
-from ..core.reconcile_driver import reconcile_sample
+from ..core.reconcile_driver import load_oligo_windows, reconcile_sample
 from ..core.window_table import (
     FrameMismatchError,
     WindowAudit,
     designed_positions_by_oligo,
     load_windows_audited,
-    unwindowed_oligos,
     verify_window_frame,
 )
-from . import step_1_bc1_call
+from . import step_1_bc1_call, step_3_sv_plasmid
 from ._common import (
     StepIncompleteError,
+    cache_key,
+    cache_valid,
+    cache_commit,
     atomic,
     cohort_table,
     collect_shards,
@@ -77,6 +61,7 @@ from ._common import (
     record_for,
     require_indexed_bam,
     require_row_count,
+    read_table,
     shard_dir,
     write_provenance,
     write_tsv,
@@ -87,6 +72,7 @@ logger = logging.getLogger(__name__)
 STEP = "step_4_reconcile"
 SHARD_SUFFIX = ".reconcile.tsv"
 TABLE_NAME = "reconcile_calls.tsv"
+
 
 #: Per-sample audit of the two checks whose SKIPPING must not read as PASSING: the
 #: reference-frame check (NN 255 F10) and the manifest/BAM reference-NAME check (F3b).
@@ -157,36 +143,21 @@ def table_path(config: WGSConfig) -> Path:
     return cohort_table(config, TABLE_NAME)
 
 
-def run_step_4(config: WGSConfig, sample: str | None = None) -> Path:
-    """Reconcile edits. With `sample`, one cell; without, every cell + the table."""
-    if sample is not None:
-        return _run_one_sample(config, sample)
-    return _combine(config)
+@dataclass
+class _Inputs:
+    windows: dict[str, Any]
+    assignments: dict[str, list[str]] | None
+    bridge: Any
+    audit: WindowAudit | None = None
 
 
-def _run_one_sample(config: WGSConfig, sample: str) -> Path:
-    """One cell. Idempotent: the shard is written atomically."""
-    out = shard_path(config, sample)
-    if out.exists():
-        logger.info("step_4: %s already complete — skipping", sample)
-        return out
-
-    record = record_for(config, sample)
-    bam_path = require_indexed_bam(record)
-    _require_stage_1(config, sample)
-
+def _load_inputs(config: WGSConfig) -> _Inputs:
     if config.reconcile.oligo_windows is None:
-        raise StepIncompleteError(
-            "step_4: reconcile.oligo_windows is required — without a donor-window table "
-            "no site is scored, and a cell with zero scored sites classifies LOW_CONF. "
-            "That is 'not measured', which must never be written as 'no edit'."
-        )
-    # 🔴 NN 251 defect 12. `load_oligo_windows` silently drops a row whose
-    # coordinates are not bare integers and keeps the FIRST row per oligo, reporting
-    # neither — and the real design table is only 50.2% filled on coordinates. Each
-    # lost window makes an edit at that site INVISIBLE, which reads downstream as
-    # MULTI_EDIT -> SINGLE_EDIT with no flag, i.e. a confident undercount.
-    window_audit = load_windows_audited(
+        raise StepIncompleteError("step_4: reconcile.oligo_windows is required; unmeasured sites are not no-edit results")
+    # 🔴 NN 251 defect 12: every denominator of the window table, logged BEFORE TRACE's
+    # loader below, which refuses a malformed or conflicting row outright. A refusal of
+    # the real design table (50.2% filled on coordinates) then arrives with its counts.
+    audit = load_windows_audited(
         str(config.reconcile.oligo_windows),
         oligo_col=config.columns.oligo_col,
         chrom_col=config.columns.chrom_col,
@@ -194,80 +165,146 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
         end_col=config.columns.end_col,
         strict=config.reconcile.strict_window_table,
     )
-    if window_audit.n_dropped or window_audit.n_duplicate_oligos:
-        logger.warning("step_4: window table has silent losses — %s", window_audit.summary())
+    if audit.n_dropped or audit.n_duplicate_oligos:
+        logger.warning("step_4: window table has rows TRACE will not accept — %s", audit.summary())
     else:
-        logger.info("step_4: window table — %s", window_audit.summary())
-    oligo_windows = window_audit.windows
+        logger.info("step_4: window table — %s", audit.summary())
+    windows = load_oligo_windows(str(config.reconcile.oligo_windows),
+        oligo_col=config.columns.oligo_col, chrom_col=config.columns.chrom_col,
+        start_col=config.columns.start_col, end_col=config.columns.end_col)
+    assignments = None
+    if config.reconcile.oligo_assignments is not None:
+        assignments = {}
+        path = config.reconcile.oligo_assignments
+        with open(path, newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            if (not reader.fieldnames or not {"sample", "oligo_name"}.issubset(reader.fieldnames)
+                    or len(reader.fieldnames) != len(set(reader.fieldnames))):
+                raise ValueError(f"{path}: assignment header requires unique sample and oligo_name columns")
+            for lineno, row in enumerate(reader, 2):
+                if None in row or not row.get("sample") or not row.get("oligo_name"):
+                    raise ValueError(f"{path}:{lineno}: malformed assignment")
+                sample, oligo = row["sample"].strip(), row["oligo_name"].strip()
+                if not sample or not oligo:
+                    raise ValueError(f"{path}:{lineno}: empty assignment")
+                if oligo not in windows:
+                    raise ValueError(f"{path}:{lineno}: no donor window for assigned oligo {oligo!r}")
+                if oligo not in assignments.setdefault(sample, []):
+                    assignments[sample].append(oligo)
+        expected = {r.sample for r in manifest_samples(config)}
+        if set(assignments) != expected:
+            raise ValueError(f"{path}: assignment samples do not match manifest; missing={sorted(expected-set(assignments))}, unexpected={sorted(set(assignments)-expected)}")
+    return _Inputs(windows, assignments, step_1_bc1_call.load_bridge(config), audit)
 
-    orientations = _check_reference_frame(config, record, window_audit)
+
+def run_step_4(config: WGSConfig, sample: str | None = None) -> Path:
+    """One sample shard or complete cohort, using the same scoring code path."""
+    if sample is not None:
+        return _run_one_sample(config, sample)
+    return _combine(config)
+
+
+def uses_cleaned_reads(config: WGSConfig) -> bool:
+    """One policy shared by direct execution and the workflow DAG."""
+    source = config.reconcile.read_source
+    return source == "donor_cleaned" or (source == "auto" and
+        config.sv_plasmid.blacklist is not None and
+        config.reconcile.oligo_assignments is not None and
+        config.reconcile.oligo_windows is not None)
+
+
+def _allele_bam_path(config: WGSConfig, sample: str, raw: Path) -> Path:
+    if not uses_cleaned_reads(config):
+        return raw
+    step_3_sv_plasmid.run_step_3(config, sample)
+    rows = list(read_table(step_3_sv_plasmid.shard_path(config, sample)))
+    if len(rows) != 1 or rows[0].get("half_b_status") != step_3_sv_plasmid.HALF_B_RUN:
+        raise StepIncompleteError(f"step_4: {sample}: donor-cleaned evidence requires measured Stage 3 Half B")
+    return step_3_sv_plasmid.cleaned_bam_path(config, sample)
+
+
+def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = None) -> Path:
+    out = shard_path(config, sample)
+    record = record_for(config, sample)
+    bam_path = require_indexed_bam(record)
+    _require_stage_1(config, sample)
+
+    inputs = inputs if inputs is not None else _load_inputs(config)
+    allele_path = _allele_bam_path(config, sample, bam_path)
+    dependencies = {"bc1_tracks": step_1_bc1_call.tracks_shard_path(config, sample)}
+    if uses_cleaned_reads(config):
+        dependencies.update(allele_bam=allele_path,
+            allele_index=step_3_sv_plasmid.cleaned_bam_index_path(config, sample, record=record),
+            filtering=step_3_sv_plasmid.shard_path(config, sample))
+    key = cache_key(config, STEP, record, inputs=dependencies)
+    if cache_valid([out], key):
+        logger.info("step_4: %s verified complete — skipping", sample)
+        return out
+    undeclared = {o for o, w in inputs.windows.items() if not getattr(w, "intended_alleles", ())}
+    orientations = _check_reference_frame(config, record, inputs.audit, undeclared=undeclared)
     _check_reference_consistency(config, record)
     _write_audit_sidecar(config, sample)
+    # 🔴 NN 251 defects 6 + 11 for windows that declare no intended allele: they are
+    # scored from read evidence, gated at the designed base the frame-verified
+    # `wt_seq` + `design_donor` give; without one, `score_sites` refuses (planning/268 §4).
+    designed = (designed_positions_by_oligo(inputs.audit, orientations=orientations)
+                if inputs.audit is not None else {})
 
     sidecar = step_1_bc1_call.ensure_locus_sidecar(config)
     genome_track, plasmid_track = build_tracks(
         sidecar,
         amplicon_left_window=config.locus.amplicon_left_window,
         amplicon_right_window=config.locus.amplicon_right_window,
+        min_mapq=config.bc1.min_mapq,
+        use_plasmid=config.bc1.use_plasmid,
     )
     use_plasmid = config.bc1.use_plasmid and config.locus.has_plasmid_track
     validate_tracks([genome_track, plasmid_track] if use_plasmid else [genome_track],
-                    record.reference)
-    bridge = step_1_bc1_call.load_bridge(config)
+                    record.reference, amplicon_window_sequences=(
+                        config.locus.amplicon_left_window_sequence,
+                        config.locus.amplicon_right_window_sequence))
 
-    with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
-        str(record.reference)
-    ) as fasta:
-        # 🔴 NN 251 defects 6 + 11 reach the pipeline HERE. `depth_gate=True` makes
-        # `score_sites` classify from the per-position profile instead of the window
-        # MAXIMUM depth, and `designed_positions` narrows the gate to the base the
-        # edit actually touches when the window table carries `wt_seq` + the design.
+    with ExitStack() as handles:
+        bam = handles.enter_context(pysam.AlignmentFile(str(bam_path), "rb"))
+        fasta = handles.enter_context(pysam.FastaFile(str(record.reference)))
+        allele_bam = handles.enter_context(pysam.AlignmentFile(str(allele_path), "rb")) if allele_path != bam_path else bam
+        allele_bam.check_index()
         cell = reconcile_sample(
             bam,
             fasta,
             sample,
             genome_track=genome_track,
             plasmid_track=plasmid_track if use_plasmid else None,
-            oligo_windows=oligo_windows,
-            bridge=bridge,
-            depth_gate=config.reconcile.depth_gate,
-            designed_positions=designed_positions_by_oligo(
-                window_audit, orientations=orientations
-            ),
+            oligo_windows=inputs.windows,
+            bridge=inputs.bridge,
+            min_mapq=getattr(config.reconcile, "min_mapq", None),
+            assigned_oligos=inputs.assignments[sample] if inputs.assignments is not None else None,
+            allele_bam=allele_bam,
+            read_source_flags=("DONOR_CLEANED_READS" if uses_cleaned_reads(config) else "RAW_DONOR_READS",),
+            designed_positions=designed,
         )
 
-    # 🔴 NN 251 defect 15: the AUDITED writer, so the shipped table names TRACE's
-    # `confidence` as `bc_confidence` (it reflects the barcode call, never the edit)
-    # and carries `edit_evidence` beside it. `write_reconciliations` remains the
-    # parity writer for TRACE's exact schema and is unchanged.
     with atomic(out) as tmp:
-        write_reconciliations_audited([cell], tmp)
-
-    # 🔴 NN 251 defect 12: an oligo this cell carries but the window table could not
-    # place is scored by NOTHING, which shrinks the denominator silently and turns a
-    # MULTI_EDIT into a SINGLE_EDIT. Name them, so they read as "not measured".
-    scored = {s.site.oligo for s in cell.sites if s.site.oligo}
-    missing = unwindowed_oligos(scored, window_audit)
+        write_reconciliations([cell], tmp)
+    cache_commit([out], key)
     logger.info(
-        "step_4: %s label=%s bc_confidence=%s edit_evidence=%s n_full=%d n_partial=%d "
-        "n_nocov=%d n_genome_bc=%d n_plasmid_bc=%d; %d oligo(s) had no window%s",
+        "step_4: %s label=%s confidence=%s n_full=%d n_partial=%d n_nocov=%d "
+        "n_genome_bc=%d n_plasmid_bc=%d",
         sample,
         cell.label,
         cell.confidence,
-        edit_evidence(cell.sites),
         cell.n_full,
         cell.n_partial,
         cell.n_nocov,
         cell.n_genome_bc,
         cell.n_plasmid_bc,
-        len(missing),
-        f" ({', '.join(missing[:5])}) — those sites are NOT MEASURED, not WT" if missing else "",
     )
     return out
 
 
 def _check_reference_frame(
-    config: WGSConfig, record: WGSSample, audit: WindowAudit
+    config: WGSConfig, record: WGSSample, audit: WindowAudit | None,
+    *, undeclared: set[str] | None = None,
 ) -> dict[str, str]:
     """Verify every scored window against the design's `wt_seq` (NN 251 defect 10).
 
@@ -290,27 +327,42 @@ def _check_reference_frame(
     rather than passing. A guard that silently does not run is the failure mode this
     whole exercise is about.
 
+    Merge note (planning/268): a window that declares `intended_variants` has every REF
+    validated against the FASTA by TRACE, so a wrong frame cannot invert it. A window
+    that declares none is scored from read evidence against `fasta.fetch`, where it can.
+    So a table with no `wt_seq` column is refused under `require_frame_check` only when
+    `undeclared` (the oligos with no intended allele) is non-empty, and is recorded
+    otherwise. `undeclared=None` means "assume every window is undeclared".
+
     Returns
     -------
     dict
-        `{oligo: "plus" | "minus"}` for every window whose frame was VERIFIED. This
-        is handed to `designed_positions_by_oligo`, which omits any oligo absent from
-        it rather than assuming the plus strand — on the minus strand a plus-strand
-        assumption gates the mirror base, which is the A11 failure again.
+        `{oligo: "plus" | "minus"}` for every window whose frame was VERIFIED.
     """
     orientations: dict[str, str] = {}
+    if audit is None:
+        _FRAME_AUDIT[record.sample] = {"status": "no_window_audit"}
+        logger.warning("step_4: NOT VERIFIED: no window audit was supplied for %s, so the "
+                       "reference frame was not checked", record.sample)
+        return orientations
     if not audit.has_wt_seq:
+        exposed = sorted(undeclared) if undeclared is not None else sorted(audit.windows)
         message = (
             f"step_4: the window table {audit.path.name} has no `wt_seq` column, so "
-            f"the reference frame CANNOT be verified ({audit.frame_status}). A wrong "
-            "frame inverts every per-cell call while leaving the aggregate rate on "
-            "top of truth, so the rate cannot detect it. Add `wt_seq` to the window "
+            f"the reference frame CANNOT be verified ({audit.frame_status}), and "
+            f"{len(exposed)} window(s) declare no intended allele and are scored from "
+            "read evidence against the reference. A wrong frame inverts every such "
+            "per-cell call while leaving the aggregate rate on top of truth, so the rate "
+            "cannot detect it. Add `wt_seq` (or `intended_variants`) to the window "
             "table, or set reconcile.require_frame_check=False to accept unverified "
             "calls and have the refusal recorded instead."
         )
-        if config.reconcile.require_frame_check:
+        if config.reconcile.require_frame_check and exposed:
             raise StepIncompleteError(message)
-        logger.warning("%s", message)
+        logger.warning("%s", message if exposed else (
+            f"step_4: the window table {audit.path.name} has no `wt_seq` column; every "
+            "window declares REF-validated intended alleles, so the frame is checked by "
+            "TRACE instead. Recorded as frame_unverified_no_wt_seq."))
         # 🔴 This branch is the REAL COHORT's case (the design table has no `wt_seq`),
         # and the first NN 255 attempt returned here BEFORE recording anything — so
         # `frame_unverified_no_wt_seq` would have shipped 0 for a run in which not one
@@ -355,18 +407,14 @@ def _check_reference_frame(
                 if config.reconcile.require_frame_check:
                     raise
                 # Accepted, but NOT silently and NOT as if verified: the oligo is left
-                # OUT of `orientations`, so `designed_positions_by_oligo` omits it and
-                # `score_sites` falls back to the conservative window-minimum gate
-                # rather than gating at a base whose frame is known to be wrong.
+                # OUT of `orientations` and named in the audit sidecar.
                 mismatched[oligo] = str(exc).split(". ")[0]
                 logger.warning(
                     "step_4: NOT VERIFIED: oligo %s FAILED the frame check and "
-                    "`reconcile.require_frame_check=False` accepted it — %s. Its "
-                    "designed positions are DISCARDED (the gate falls back to the "
-                    "window minimum), because a known-wrong frame must not be used to "
-                    "pick the base to gate on. 🔴 The aggregate edit rate cannot detect "
-                    "this: NN 243 measured a wrong frame flipping every per-cell call "
-                    "while the apparent rate landed on exactly truth.",
+                    "`reconcile.require_frame_check=False` accepted it — %s. 🔴 The "
+                    "aggregate edit rate cannot detect this: NN 243 measured a wrong "
+                    "frame flipping every per-cell call while the apparent rate landed "
+                    "on exactly truth.",
                     oligo, mismatched[oligo],
                 )
                 continue
@@ -532,29 +580,21 @@ def _pg_positional_reference(tokens: Sequence[str]) -> str | None:
 
 
 def _require_stage_1(config: WGSConfig, sample: str) -> Path:
-    """Assert Stage 1 ran for this sample, checking the same shard the rule declares.
-
-    `core.reconcile_driver.reconcile_sample` re-derives the barcode calls from the
-    BAM, so this is an ORDERING guard rather than a data read: it keeps path (A)
-    honest about the edge `wgs_step_4_reconcile` declares as
-    `bc1_tracks=BC1_DIR/{sample}.bc1_tracks.tsv`, and it means a cohort whose
-    Stage 1 failed cannot quietly produce a full Stage 4 table.
-    """
+    """Verify or refresh Stage 1 through its input/output cache contract."""
+    step_1_bc1_call.run_step_1(config, sample)
     tracks = step_1_bc1_call.tracks_shard_path(config, sample)
     if not tracks.exists():
-        raise StepIncompleteError(
-            f"step_4: {sample} has no Stage-1 per-track output ({tracks}). Run step 1 "
-            "first — reconcile_cell's n_genome_bc=0 / bc_confidence='high' defaults are "
-            "a wrong answer, not a missing one."
-        )
+        raise StepIncompleteError(f"step_4: {sample} has no verified Stage-1 per-track output ({tracks})")
     return tracks
 
 
 def _combine(config: WGSConfig) -> Path:
     """Fan-in: every cell, then the cohort table."""
     records = manifest_samples(config)
+    inputs = _load_inputs(config)
+    step_1_bc1_call.run_step_1(config)
     for record in records:
-        _run_one_sample(config, record.sample)
+        _run_one_sample(config, record.sample, inputs=inputs)
 
     header, rows = collect_shards(
         records, lambda r: shard_path(config, r.sample), label="step_4 reconcile"
@@ -567,16 +607,23 @@ def _combine(config: WGSConfig) -> Path:
         logger.warning(
             "step_4: NOT VERIFIED: %d of %d sample(s) have no audit sidecar (%s...), so "
             "the frame-check and reference-name counts below are LOWER BOUNDS, not "
-            "totals. A shard written before the sidecar existed is the usual cause; "
-            "delete it to re-run that sample.",
+            "totals. A shard written before the sidecar existed is the usual cause.",
             len(missing_audits), len(records), ", ".join(missing_audits[:3]),
         )
 
     label_idx = reconcile.EMIT_COLUMNS.index("label")
+    flags_idx = reconcile.EMIT_COLUMNS.index("flags")
     labels: dict[str, int] = {}
+    # 2026-10-25 rulings (planning/268 §4): what the depth-conditional floor and the interim SV
+    # gate cost, counted so it shows. Cells, not sites; a cell is counted once per flag.
+    gated = {FLAG_SINGLE_ALT_READ: 0, FLAG_SV_ONE_SIDED_LOSS: 0}
     for row in rows:
-        label = row.split("\t")[label_idx]
+        fields = row.split("\t")
+        label = fields[label_idx]
         labels[label] = labels.get(label, 0) + 1
+        cell_flags = set(fields[flags_idx].split(",")) if len(fields) > flags_idx else set()
+        for flag in gated:
+            gated[flag] += flag in cell_flags
     logger.info(
         "step_4: %d cells — %s", n, ", ".join(f"{k}={v}" for k, v in sorted(labels.items()))
     )
@@ -588,11 +635,18 @@ def _combine(config: WGSConfig) -> Path:
             "manifest": Path(config.paths.manifest),
             "oligo_windows": Path(config.reconcile.oligo_windows),
             "bc1_tracks": step_1_bc1_call.tracks_table_path(config),
+            **({"oligo_assignments": Path(config.reconcile.oligo_assignments)}
+               if config.reconcile.oligo_assignments else {}),
         },
         parameters={
             "thresholds": "TRACE defaults (classify_site tau_full/tau_wt/min_cov "
-            "and window_edit_vaf min_base_qual are the algorithm's, not ours)",
+            "and score_edit_site min_base_qual are the algorithm's, not ours)",
             "bridge_table": str(config.bc1.bridge_table) if config.bc1.bridge_table else None,
+            "allele_read_source_policy": config.reconcile.read_source,
+            "allele_reads": "Stage 3 donor-cleaned BAM" if uses_cleaned_reads(config) else "original BAM; donor origin unresolved when plasmid bc1 observed",
+            "barcode_reads": "original BAM",
+            "variant_min_mapq": (config.reconcile.min_mapq if getattr(config.reconcile, "min_mapq", None) is not None
+                                  else "TRACE default 20; MAPQ 255 always rejected"),
             "require_frame_check": config.reconcile.require_frame_check,
             "frame_check": {
                 s: audits[s].get("frame_check", {}) for s in sorted(audits)
@@ -603,10 +657,8 @@ def _combine(config: WGSConfig) -> Path:
             **labels,
             # 🔴 NN 255 F10 / F3b, read from the per-sample SIDECARS on disk rather than
             # from a module global, because the fan-out runs each sample in its own
-            # process and `_run_one_sample` short-circuits on an existing shard — either
-            # of which would have made these counts a confident zero.
-            # `audit_samples_missing` IS the denominator caveat: a non-zero value means
-            # these sums are lower bounds, not totals.
+            # process and a cache-valid sample returns before any check. A non-zero
+            # `audit_samples_missing` means these sums are lower bounds, not totals.
             "audit_samples_recorded": len(audits),
             "audit_samples_missing": len(missing_audits),
             "frame_mismatch_accepted": sum(
@@ -620,6 +672,8 @@ def _combine(config: WGSConfig) -> Path:
                 1 for a in audits.values()
                 if a.get("reference_name_check") == "skipped_pg_unobserved"
             ),
+            "cells_partial_on_a_single_alt_read": gated[FLAG_SINGLE_ALT_READ],
+            "cells_sv_suspect_one_sided_loss": gated[FLAG_SV_ONE_SIDED_LOSS],
         },
     )
     return out

@@ -179,11 +179,18 @@ def write_vcf(path: Path, records, *, contig=CONTIG) -> Path:
     return path
 
 
-def write_gvcf(path: Path, blocks, *, contig=CONTIG) -> Path:
+def write_gvcf(path: Path, blocks, *, contig=CONTIG, ref: str | None = None,
+               min_dp: bool = True) -> Path:
     """gVCF reference blocks as `(pos, end_or_None, ref_depth)`.
 
     `end_or_None` writes `INFO END=<end>`, which is exactly how GATK/`bcftools -g`
     emit a *compressed* reference block — the shape defect 5 is about.
+
+    `ref` (the contig sequence) supplies each block's REF base. planning/268: the pinned
+    TRACE validates every gVCF REF against the reference, and the former constant `A`
+    was a fixture no caller could write. An END block also carries `MIN_DP` unless
+    `min_dp=False`, as `bcftools --gvcf` and GATK write it: the pinned TRACE counts a
+    block's interior only from `MIN_DP`, its lower bound over the interval.
     """
     with path.open("w") as fh:
         fh.write("##fileformat=VCFv4.2\n")
@@ -191,9 +198,10 @@ def write_gvcf(path: Path, blocks, *, contig=CONTIG) -> Path:
         fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n")
         for pos, end, depth in blocks:
             info = f"END={end}" if end is not None else "."
-            fh.write(
-                f"{contig}\t{pos}\t.\tA\t<NON_REF>\t.\t.\t{info}\tGT:AD\t0/0:{depth},0\n"
-            )
+            base = ref[pos - 1] if ref else "A"
+            fmt, val = ("GT:AD:MIN_DP", f"0/0:{depth},0:{depth}") if end is not None and min_dp \
+                else ("GT:AD", f"0/0:{depth},0")
+            fh.write(f"{contig}\t{pos}\t.\t{base}\t<NON_REF>\t.\t.\t{info}\t{fmt}\t{val}\n")
     return path
 
 
@@ -305,7 +313,13 @@ class TestDefect2Blacklist:
     def test_repro_all_names_absent_parses_clean(self, tmp_path):
         """REPRODUCTION: TRACE's loader accepts a 100%-inert blacklist without a word."""
         sv = _trace.sv_plasmid()
-        bl = sv.load_blacklist(str(self._blacklist(tmp_path)))
+        # planning/268: the pinned TRACE refuses the space-separated row in its standard
+        # mode, which closes that half of the defect upstream. The Perl-port parity mode
+        # still parses it, and two well-formed rows naming absent contigs parse in either
+        # mode, so the magestic guard below is still the only refusal of an inert list.
+        with pytest.raises(ValueError, match="expected chrom<TAB>start<TAB>end"):
+            sv.load_blacklist(str(self._blacklist(tmp_path)))
+        bl = sv.load_blacklist(str(self._blacklist(tmp_path)), mode="parity")
         reference_contigs = {"chrXV": 10000, "chrI": 5000}
         present = [c for c in bl if c in reference_contigs]
         assert len(bl) == 3  # parsed happily
@@ -390,15 +404,18 @@ class TestDefect3UnderscoreContigs:
                         contig=contig)
         qs, qe = qwin(dstart, dend)
         gvcf = write_gvcf(
-            tmp_path / "s.g.vcf", [(p, None, 30) for p in range(qs, qe + 1)], contig=contig
+            tmp_path / "s.g.vcf", [(p, None, 30) for p in range(qs, qe + 1)], contig=contig,
+            ref=ref,
         )
         spec = TR and None
         return ref, dstart, dend, wt, design, fasta, vcf, gvcf, contig
 
-    @defect_persists("3 (positional split('_') on contig names)",
-                     closed_by="donor_precall.precall_sample_aliased + ContigAlias")
     def test_repro_precall_raises_on_every_policy_contig(self, tmp_path):
-        """REPRODUCTION: all four underscore-bearing mandated contigs crash Stage 2."""
+        """REPRODUCTION: all four underscore-bearing mandated contigs crash Stage 2.
+
+        CLOSED UPSTREAM (planning/268): it XPASSed strictly against the pinned TRACE,
+        which builds variant ids from structured fields, so `defect_persists` is
+        removed and the correct result (no contig crashes) is asserted outright."""
         do = _trace.donor_outcome()
         broken = []
         for contig in POLICY_CONTIGS:
@@ -522,16 +539,18 @@ class TestDefects4And5CoverageAndReason:
         vcf = write_vcf(tmp_path / "s.fil.vcf", [])  # no called variants: a true WT cell
         return ref, dstart, dend, wt, design, vcf
 
-    @defect_persists("5 (flag_covered ignores the gVCF END key)",
-                     closed_by="gvcf_adapter.expand_reference_blocks")
     def test_repro_compressed_gvcf_block_yields_unknown(self, tmp_path):
         """REPRODUCTION (defect 5): ONE reference block spanning the whole
-        quantification window still gives `unknown`, because only POS is compared."""
+        quantification window still gives `unknown`, because only POS is compared.
+
+        CLOSED UPSTREAM (planning/268): the pinned TRACE reads `END` with `MIN_DP`, so the
+        correct result is asserted outright and `defect_persists` is removed. A block with
+        no `MIN_DP` stays uncovered there by design (see the reason test below)."""
         do = _trace.donor_outcome()
         ref, dstart, dend, wt, design, vcf = self._unedited_case(tmp_path)
         qs, qe = qwin(dstart, dend)
         assert qs > dstart, "the block must start before the window for this to bite"
-        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, dend, 30)])  # END spans qwin
+        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, dend, 30)], ref=ref)  # END spans qwin
         spec = do.DonorSpec(
             sample="S1", chrom=CONTIG, donor_start=dstart, donor_end=dend,
             donor_wt=wt, donor_design=design, donor_step2=design,
@@ -542,22 +561,26 @@ class TestDefects4And5CoverageAndReason:
             f"quantification window [{qs},{qe}] still reports {out.editing_outcome!r}"
         )
 
-    def test_fixed_end_expansion_makes_the_block_count(self, tmp_path):
-        from magestic.pipelines.wgs.core.gvcf_adapter import expand_reference_blocks
-
+    def test_fixed_the_compressed_block_counts_without_expansion(self, tmp_path):
+        """WITHDRAWN (planning/268): "`expand_reference_blocks` makes the block count".
+        The expander copies the block's first REF into every position, which the pinned
+        TRACE refuses (`gVCF REF does not match reference`), so step_2 no longer calls it.
+        The defect-5 claim it served holds on the raw block, and is asserted here."""
         do = _trace.donor_outcome()
         ref, dstart, dend, wt, design, vcf = self._unedited_case(tmp_path)
-        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, dend, 30)])
-        out_gvcf = tmp_path / "s.expanded.g.vcf"
-        res = expand_reference_blocks(gvcf, out_gvcf)
-        assert res.n_blocks_expanded == 1
-        assert res.n_records_out == dend - dstart + 1
+        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, dend, 30)], ref=ref)
         spec = do.DonorSpec(
             sample="S1", chrom=CONTIG, donor_start=dstart, donor_end=dend,
             donor_wt=wt, donor_design=design, donor_step2=design,
         )
-        out = do.precall_sample(spec, vcf, out_gvcf, ref)
+        out = do.precall_sample(spec, vcf, gvcf, ref)
         assert out.editing_outcome == "designed_variant_unedited"
+        from magestic.pipelines.wgs.core.gvcf_adapter import expand_reference_blocks
+
+        expanded = tmp_path / "s.expanded.g.vcf"
+        expand_reference_blocks(gvcf, expanded)
+        with pytest.raises(ValueError, match="gVCF REF does not match reference"):
+            do.precall_sample(spec, vcf, expanded, ref)
 
     def test_fixed_expansion_is_a_noop_on_an_uncompressed_gvcf(self, tmp_path):
         """Parity: a per-position gVCF passes through byte-equivalently."""
@@ -577,7 +600,7 @@ class TestDefects4And5CoverageAndReason:
         load-bearing distinction in the analysis — uncallable vs unedited — is lost."""
         do = _trace.donor_outcome()
         ref, dstart, dend, wt, design, vcf = self._unedited_case(tmp_path)
-        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, None, 30)])  # 1 position only
+        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, None, 30)], ref=ref)  # 1 position only
         spec = do.DonorSpec(
             sample="S1", chrom=CONTIG, donor_start=dstart, donor_end=dend,
             donor_wt=wt, donor_design=design, donor_step2=design,
@@ -598,7 +621,7 @@ class TestDefects4And5CoverageAndReason:
         )
 
         ref, dstart, dend, wt, design, vcf = self._unedited_case(tmp_path)
-        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, None, 30)])
+        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(dstart, None, 30)], ref=ref)
         ex = explain_outcome(
             "unknown", gvcf_path=gvcf, chrom=CONTIG, donor_start=dstart, donor_end=dend
         )
@@ -614,7 +637,7 @@ class TestDefects4And5CoverageAndReason:
         assert ex2.reason == REASON_GVCF_ABSENT
         assert ex2.callable_ is False
         # ...and an `unedited` is positively marked CALLABLE, so the two never collide.
-        gvcf2 = write_gvcf(tmp_path / "ok.g.vcf", [(dstart, dend, 30)])
+        gvcf2 = write_gvcf(tmp_path / "ok.g.vcf", [(dstart, dend, 30)], ref=ref)
         ex3 = explain_outcome(
             "designed_variant_unedited", gvcf_path=gvcf2, chrom=CONTIG,
             donor_start=dstart, donor_end=dend,
@@ -631,7 +654,6 @@ class TestDefects4And5CoverageAndReason:
         `test_fixed_reason_names_the_unexpanded_block_case` pins the one case where
         the two genuinely diverge, which is what proves the derivation is independent.
         """
-        from magestic.pipelines.wgs.core.gvcf_adapter import expand_reference_blocks
         from magestic.pipelines.wgs.core.outcome_reason import explain_outcome
 
         do = _trace.donor_outcome()
@@ -641,9 +663,8 @@ class TestDefects4And5CoverageAndReason:
             ([(dstart, None, 30)], False),
             ([], False),
         ):
-            g = write_gvcf(tmp_path / f"g{len(blocks)}{expect_callable}.g.vcf", blocks)
-            ge = g.with_suffix(".exp.vcf")
-            expand_reference_blocks(g, ge)
+            # planning/268: read as written; the pinned TRACE honours END itself.
+            ge = write_gvcf(tmp_path / f"g{len(blocks)}{expect_callable}.g.vcf", blocks, ref=ref)
             spec = do.DonorSpec(
                 sample="S1", chrom=CONTIG, donor_start=dstart, donor_end=dend,
                 donor_wt=wt, donor_design=design, donor_step2=design,
@@ -659,14 +680,13 @@ class TestDefects4And5CoverageAndReason:
                 expect_callable
             )
 
-    def test_fixed_reason_names_the_unexpanded_block_case(self, tmp_path):
-        """🔴 The one case where the reason and TRACE's flag legitimately diverge.
-
-        On an UNEXPANDED compressed gVCF, TRACE says `unknown` (it compares only POS)
-        while the END-aware count says the window is fully covered. A reason copied
-        from the flag would print "quantification window uncovered" next to
-        "covered 10/10" — arguing with its own evidence. It must instead name the
-        actual cause, which is that the blocks were never expanded.
+    def test_fixed_a_block_without_min_dp_is_uncovered_on_both_sides(self, tmp_path):
+        """WITHDRAWN (planning/268): "TRACE says `unknown` on a covered compressed block,
+        so the reason must say the blocks were not expanded". The pinned TRACE reads
+        `END`; it counts a block's interior only from `MIN_DP`, and
+        `gvcf_adapter.window_reference_coverage` now follows that rule. So a block
+        without `MIN_DP` is uncovered on BOTH sides and the reason says so, without
+        arguing with its own numbers; `REASON_BLOCKS_NOT_EXPANDED` is no longer emitted.
         """
         from magestic.pipelines.wgs.core.outcome_reason import (
             REASON_BLOCKS_NOT_EXPANDED,
@@ -676,21 +696,19 @@ class TestDefects4And5CoverageAndReason:
 
         do = _trace.donor_outcome()
         ref, dstart, dend, wt, design, vcf = self._unedited_case(tmp_path)
-        raw = write_gvcf(tmp_path / "raw.g.vcf", [(dstart, dend, 30)])  # NOT expanded
+        raw = write_gvcf(tmp_path / "raw.g.vcf", [(dstart, dend, 30)], ref=ref, min_dp=False)
         spec = do.DonorSpec(
             sample="S1", chrom=CONTIG, donor_start=dstart, donor_end=dend,
             donor_wt=wt, donor_design=design, donor_step2=design,
         )
         flag = do.precall_sample(spec, vcf, raw, ref).editing_outcome
-        assert flag == "unknown"  # TRACE, counting POS only
+        assert flag == "unknown"
         ex = explain_outcome(
             flag, gvcf_path=raw, chrom=CONTIG, donor_start=dstart, donor_end=dend
         )
-        assert ex.n_window_positions_covered == ex.n_window_positions == 10
-        assert ex.reason == REASON_BLOCKS_NOT_EXPANDED
-        assert ex.reason != REASON_QWIN_UNCOVERED
-        assert ex.callable_ is False  # TRACE's flag still governs callability
-        assert "expand" in ex.reason
+        assert ex.n_window_positions_covered == 0
+        assert ex.reason == REASON_QWIN_UNCOVERED != REASON_BLOCKS_NOT_EXPANDED
+        assert ex.callable_ is False
 
     def test_fixed_the_reason_reaches_the_shipped_shard_not_only_the_log(self, tmp_path):
         """🔴 Defect 4 is only fixed if the reason is in the TABLE.
@@ -740,7 +758,9 @@ class TestDefects4And5CoverageAndReason:
         from magestic.pipelines.wgs.pipeline import step_2_donor_precall as s2
 
         src = Path(s2.__file__).read_text()
-        assert "expand_reference_blocks(" in src  # defect 5, before precall reads it
+        # WITHDRAWN (planning/268): "step_2 expands gVCF blocks" (defect 5 is closed in
+        # the pinned TRACE, and the expander's copied REF is refused by it).
+        assert "expand_reference_blocks(" not in src
         assert "explain_outcome(" in src  # defect 4
         assert "audit_vcf_window(" in src  # defect 8
         assert "n_multiallelic" in src  # defect 14
@@ -749,7 +769,8 @@ class TestDefects4And5CoverageAndReason:
         # TRACE reads only VCF columns 0/1/3/4, so a rescued 10% allele is treated as a
         # 100% call; without this column a mixture ships as `designed_variant_installed`.
         assert "minor_allele_variants" in src
-        assert "minor_alleles=minor_alleles" in src
+        # planning/268: the ids are read back from the split VCF's MAG_MINOR tags.
+        assert "minor_alleles=_minor_alleles_from_vcf(" in src
         from magestic.pipelines.wgs.pipeline.step_2_donor_precall import (
             OUTCOME_REASON_COLUMNS,
         )
@@ -781,12 +802,15 @@ class TestDefects4And5CoverageAndReason:
         src = Path(s4.__file__).read_text()
         assert "verify_window_frame(" in src  # defect 10
         assert "load_windows_audited(" in src  # defect 12
-        assert "designed_positions_by_oligo(" in src  # defect 11
-        assert "depth_gate=config.reconcile.depth_gate" in src  # defects 6 + 11
         assert "incomparable_contigs(" in src  # defect 14
         assert "require_reference_consistency(" in src  # defect 14
-        assert "write_reconciliations_audited(" in src  # defect 15
-        assert "unwindowed_oligos(" in src  # defect 12
+        assert "designed_positions_by_oligo(" in src  # defect 11, for undeclared windows
+        # WITHDRAWN (planning/268): the `depth_gate` switch (the read-evidence route is
+        # always gated now), the `bc_confidence`-renamed writer (15) and
+        # `unwindowed_oligos` (12): `build_edit_sites` raises for an oligo with no window,
+        # so none can be dropped in silence.
+        assert "depth_gate" not in src
+        assert "write_reconciliations(" in src
 
     def test_fixed_a_sample_with_no_gvcf_still_gets_a_row(self, tmp_path):
         """TRACE drops such a sample with no row at all — the worst `uncallable`."""
@@ -812,9 +836,10 @@ class TestDefects6And11EditProfile:
         ref = _seq(21, 4000)
         return ref, write_fasta(tmp_path / "g.fa", {CONTIG: ref})
 
-    @defect_persists("6 (SNV/indel/SV collapse to one number)",
-                     closed_by="edit_profile.window_edit_profile.variant_class, "
-                               "wired through reconcile_driver.score_sites")
+    @defect_persists("6 (SNV/indel/SV collapse to one number) in TRACE's LEGACY "
+                     "window_edit_vaf",
+                     closed_by="TRACE score_edit_site (allele-specific evidence), which "
+                               "reconcile_driver.score_sites calls since planning/268")
     def test_repro_trace_collapses_a_deletion_and_a_substitution(self, tmp_path):
         """REPRODUCTION (defect 6), driving **TRACE's own functions** directly.
 
@@ -848,44 +873,66 @@ class TestDefects6And11EditProfile:
             "collapse to SINGLE_EDIT and an SV reads as a substitution"
         )
 
-    def test_fixed_score_sites_records_the_variant_class(self, tmp_path):
-        """🔴 Defect 6 on the path Stage 4 ACTUALLY TAKES, not just in a module.
+    @staticmethod
+    def _allele_table(path: Path, ws: int, we: int, ref: str, *, pos: int = 3030) -> Path:
+        """One window declaring one intended SNV at `pos` (planning/268: the pinned TRACE
+        scores only declared `intended_variants`; an undeclared window is `unassessed`)."""
+        import json
 
-        `step_4` calls `reconcile_sample` -> `score_sites`, so the fix only counts if
-        it is visible there. A deletion must never come back as a substitution.
+        allele = json.dumps([{"pos": pos, "ref": ref[pos - 1], "alt": _other(ref[pos - 1])}])
+        return write_window_table(
+            path, [("O1", CONTIG, ws, we, allele)],
+            header=("oligo_name", "chrom", "donor_start_coord", "donor_end_coord",
+                    "intended_variants"),
+        )
+
+    def test_fixed_score_sites_records_the_variant_class(self, tmp_path):
+        """🔴 Defect 6 on the path Stage 4 ACTUALLY TAKES: a deletion must never come back
+        as a substitution.
+
+        planning/268: `score_sites` has two routes and both are pinned. A window with NO
+        declared allele is classified from read evidence by `core.edit_profile` and
+        records `variant_class` (Kevin 2026-10-24: an intended edit is not required to
+        assign confidence). A window that declares the SNV is scored by TRACE per allele:
+        FULL on the SNV's own fragments, never FULL from a 6 bp deletion over that base.
+        WITHDRAWN: the `depth_gate=False` parity switch, removed with that config key.
         """
         from magestic.pipelines.wgs.core.edit_profile import (
             VARIANT_DELETION,
             VARIANT_SUBSTITUTION,
         )
         from magestic.pipelines.wgs.core.reconcile_driver import (
+            FLAG_WINDOW_EVIDENCE,
             load_oligo_windows,
             score_sites,
         )
 
         ref, fasta = self._genome(tmp_path)
         ws, we = self.WIN
-        ow = load_oligo_windows(
+        bare = load_oligo_windows(
             str(write_window_table(tmp_path / "w.tsv", [("O1", CONTIG, ws, we)]))
         )
-        for name, bam_path, expect in (
-            ("del", write_bam(tmp_path / "d.bam", ref, spans=(self.WIN,),
-                              deletion=(3030, 6)), VARIANT_DELETION),
-            ("snv", write_bam(tmp_path / "s.bam", ref, spans=(self.WIN,),
-                              edits={3030: _other(ref[3029])}), VARIANT_SUBSTITUTION),
-        ):
+        declared = load_oligo_windows(str(self._allele_table(tmp_path / "a.tsv", ws, we, ref)))
+        snv = write_bam(tmp_path / "s.bam", ref, spans=(self.WIN,),
+                        edits={3030: _other(ref[3029])})
+        dele = write_bam(tmp_path / "d.bam", ref, spans=(self.WIN,), deletion=(3030, 6))
+        got = {}
+        for name, bam_path, expect in (("del", dele, VARIANT_DELETION),
+                                       ("snv", snv, VARIANT_SUBSTITUTION)):
             with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
                 str(fasta)
             ) as fa:
-                calls = score_sites(bam, fa, ["O1"], ow)
-            assert calls[0].variant_class == expect, (name, calls[0].variant_class)
-            assert calls[0].reason, "no status without a reason"
-        # And `depth_gate=False` still gives TRACE's bare SiteCall, for a parity run.
-        with pysam.AlignmentFile(
-            str(tmp_path / "s.bam"), "rb"
-        ) as bam, pysam.FastaFile(str(fasta)) as fa:
-            parity = score_sites(bam, fa, ["O1"], ow, depth_gate=False)
-        assert not hasattr(parity[0], "variant_class")
+                # planning/268 §4 ruling 4: the read-evidence route needs the designed base.
+                window = score_sites(bam, fa, ["O1"], bare, designed_positions={"O1": (3030,)})[0]
+                got[name] = score_sites(bam, fa, ["O1"], declared)[0]
+            assert window.variant_class == expect, (name, window.variant_class)
+            assert window.reason, "no status without a reason"
+            assert FLAG_WINDOW_EVIDENCE in window.flags
+            assert window.trace_status == TR.SITE_UNASSESSED
+        assert got["snv"].status == TR.SITE_FULL
+        assert got["snv"].allele_evidence[0].alt_count == got["snv"].allele_evidence[0].depth > 0
+        assert got["del"].status != TR.SITE_FULL
+        assert all(e.alt_count == 0 for e in got["del"].allele_evidence)
 
     def test_fixed_profile_classifies_the_variant_type(self, tmp_path):
         from magestic.pipelines.wgs.core.edit_profile import (
@@ -992,9 +1039,10 @@ class TestDefects6And11EditProfile:
             assert p.n_nonref <= p.depth, (p.pos, p.n_nonref, p.depth)
         assert prof.variant_class_at(3030) == VARIANT_INSERTION
 
-    @defect_persists("11 (min_cov gated on the window MAXIMUM depth)",
-                     closed_by="edit_profile.classify_window, wired through "
-                               "reconcile_driver.score_sites(depth_gate=True)")
+    @defect_persists("11 (min_cov gated on the window MAXIMUM depth) in TRACE's LEGACY "
+                     "window_edit_vaf",
+                     closed_by="TRACE score_edit_site (depth AT each intended allele), which "
+                               "reconcile_driver.score_sites calls since planning/268")
     def test_repro_trace_reports_a_confident_no_edit_over_a_hole(self, tmp_path):
         """REPRODUCTION (defect 11 / A10 / A12), driving **TRACE's own functions**.
 
@@ -1027,9 +1075,12 @@ class TestDefects6And11EditProfile:
     def test_fixed_score_sites_gates_depth_at_the_hole(self, tmp_path):
         """🔴 Defect 11 on the path Stage 4 ACTUALLY TAKES.
 
-        `score_sites(depth_gate=True)` — step_4's default — must turn that confident
-        `NO_EDIT` into `LOW_CONF`, with the reclassification recorded rather than
-        silent, and with the headline `(vaf, cov)` unchanged so no number moves.
+        Both `score_sites` routes must turn that confident `NO_EDIT` into `LOW_CONF`
+        (planning/268). Undeclared window: gated at the frame-verified designed base
+        (planning/268 §4 ruling 4 refuses a bare window; WITHDRAWN: "gated at the window
+        minimum"). Declared allele: TRACE counts fragments AT the allele, so the hole is
+        `nocov`. The window route's headline `(vaf, cov)` stays TRACE's `window_edit_vaf`,
+        so no number moves.
         """
         from magestic.pipelines.wgs.core.reconcile_driver import (
             load_oligo_windows,
@@ -1040,31 +1091,39 @@ class TestDefects6And11EditProfile:
         ws, we = self.WIN
         bam_path = write_bam(tmp_path / "hole.bam", ref, spans=(self.WIN,),
                              skip_positions=tuple(range(3028, 3034)))
-        ow = load_oligo_windows(
+        bare = load_oligo_windows(
             str(write_window_table(tmp_path / "w.tsv", [("O1", CONTIG, ws, we)]))
         )
+        declared = load_oligo_windows(str(self._allele_table(tmp_path / "a.tsv", ws, we, ref)))
+        from magestic.pipelines.wgs.core.reconcile_driver import DesignedPositionsRequired
+
         with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
             str(fasta)
         ) as fa:
-            calls = score_sites(bam, fa, ["O1"], ow)
-            parity = score_sites(bam, fa, ["O1"], ow, depth_gate=False)
-            cell = TR.reconcile_cell("S1", calls, n_genome_bc=1, bc_confidence="high")
+            # planning/268 §4 ruling 4: without the designed base the window route refuses
+            # (WITHDRAWN: "gated at the window minimum"); with it, the hole is gated there.
+            with pytest.raises(DesignedPositionsRequired):
+                score_sites(bam, fa, ["O1"], bare)
+            calls = score_sites(bam, fa, ["O1"], bare, designed_positions={"O1": (3030,)})
+            allele = score_sites(bam, fa, ["O1"], declared)
+            vaf, cov = TR.window_edit_vaf(bam, fa, CONTIG, ws, we)
+        cell = TR.reconcile_cell("S1", calls, n_genome_bc=1, bc_confidence="high")
         assert calls[0].status == TR.SITE_NOCOV
-        assert calls[0].reason == "window_min_depth_below_min_cov"
+        assert calls[0].reason == "designed_position_depth_below_min_cov"
         assert calls[0].min_depth == 0
         assert calls[0].n_positions_uncovered >= 6
-        # The reclassification is explicit, never silent.
-        assert calls[0].trace_status == TR.SITE_WT
-        assert calls[0].status_changed_from_trace is True
-        # The cell no longer claims a no-edit it cannot see.
+        assert calls[0].trace_status == TR.SITE_UNASSESSED
         assert cell.label == TR.LOW_CONF and cell.n_nocov == 1
-        # ...and the headline numbers did not move.
-        assert (round(calls[0].vaf, 9), calls[0].cov) == (
-            round(parity[0].vaf, 9), parity[0].cov
-        )
+        assert (round(calls[0].vaf, 9), calls[0].cov) == (round(vaf, 9), cov)
+        assert allele[0].status == TR.SITE_NOCOV
+        assert allele[0].allele_evidence[0].depth == 0
+        assert "UNCOVERED_ALLELES" in allele[0].flags
+        other = TR.reconcile_cell("S1", allele, n_genome_bc=1, bc_confidence="high")
+        assert other.label == TR.LOW_CONF and other.confidence == "low"
 
     def test_fixed_designed_position_gate_reaches_score_sites(self, tmp_path):
-        """With `wt_seq` + `design_donor` in the table, the gate narrows to the edit."""
+        """With `wt_seq` + `design_donor` in the table, the gate narrows to the edit;
+        with the allele declared, TRACE gates at it too (planning/268)."""
         from magestic.pipelines.wgs.core.reconcile_driver import (
             load_oligo_windows,
             score_sites,
@@ -1096,15 +1155,19 @@ class TestDefects6And11EditProfile:
         # A hole at the DESIGNED base only.
         bam_path = write_bam(tmp_path / "h.bam", ref, spans=(self.WIN,),
                              skip_positions=(3030,))
+        declared = load_oligo_windows(str(self._allele_table(tmp_path / "a.tsv", ws, we, ref)))
         with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
             str(fasta)
         ) as fa:
             calls = score_sites(
                 bam, fa, ["O1"], load_oligo_windows(str(tab)), designed_positions=dpos
             )
+            allele = score_sites(bam, fa, ["O1"], declared)
         assert calls[0].status == TR.SITE_NOCOV
         assert calls[0].reason == "designed_position_depth_below_min_cov"
         assert calls[0].depth_at_designed == 0
+        assert allele[0].status == TR.SITE_NOCOV
+        assert allele[0].allele_evidence[0].depth == 0
 
     def test_fixed_min_depth_gates_the_call(self, tmp_path):
         from magestic.pipelines.wgs.core.edit_profile import (
@@ -1223,7 +1286,8 @@ class TestDefect7SvRefusal:
         old = ("sample", "upstream_count", "downstream_count", "total_count",
                "n_integrated_contigs", "half_b_status", "read_count_mid_point",
                "frags_genome", "frags_plasmid", "frags_chimeric")
-        assert len(old) == 10 and len(SHARD_COLUMNS) == 12
+        # planning/268 adds the 205 lane's `half_a_status`: 13 columns.
+        assert len(old) == 10 and len(SHARD_COLUMNS) == 13
         stale = tmp_path / "S1.sv_plasmid.tsv"
         stale.write_text("\t".join(old) + "\n" + "\t".join(["x"] * 10) + "\n")
         with pytest.raises(StepIncompleteError) as exc:
@@ -1275,7 +1339,7 @@ class TestDefect8DistalDiscards:
             ],
         )
         qs, qe = qwin(dstart, dend)
-        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(p, None, 30) for p in range(qs, qe + 1)])
+        gvcf = write_gvcf(tmp_path / "s.g.vcf", [(p, None, 30) for p in range(qs, qe + 1)], ref=ref)
         spec = do.DonorSpec(
             sample="S1", chrom=CONTIG, donor_start=dstart, donor_end=dend,
             donor_wt=wt, donor_design=design, donor_step2=design,
@@ -1321,12 +1385,15 @@ class TestDefect8DistalDiscards:
 class TestDefect10FrameVerification:
     WIN = (3001, 3060)
 
-    @defect_persists("10 / NN243 A11 (Stage 4 never sees the design's wt_seq)",
-                     closed_by="window_table.verify_window_frame")
     def test_repro_an_inverted_reference_frame_is_undetectable(self, tmp_path):
         """REPRODUCTION (A11): reads that are WT against the TRUE genome score as a
         full edit against a reference that already carries the design's ALT — and
-        nothing in Stage 4 can tell, because it never sees `wt_seq`."""
+        nothing in Stage 4 can tell, because it never sees `wt_seq`.
+
+        CLOSED (planning/268 §4, Kevin 2026-10-25 ruling 4): a window with no declared
+        allele and no frame-verified designed base is REFUSED by `score_sites`, so the
+        silent inversion cannot be produced; `defect_persists` is removed. A declared
+        allele has its REF validated by TRACE instead."""
         from magestic.pipelines.wgs.core.reconcile_driver import (
             load_oligo_windows,
             score_sites,
@@ -1340,17 +1407,13 @@ class TestDefect10FrameVerification:
         bam_path = write_bam(tmp_path / "wt.bam", truth, spans=(self.WIN,))
         wt_tab = write_window_table(tmp_path / "w.tsv", [("O1", CONTIG, ws, we)])
         ow = load_oligo_windows(str(wt_tab))
+        from magestic.pipelines.wgs.core.reconcile_driver import DesignedPositionsRequired
+
         with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
             str(fasta)
         ) as fa:
-            calls = score_sites(bam, fa, ["O1"], ow)
-            cell = TR.reconcile_cell("S1", calls, n_genome_bc=1, bc_confidence="high")
-        # Unedited reads, yet a confident SINGLE_EDIT: the inversion.
-        assert cell.label == TR.SINGLE_EDIT and calls[0].vaf > 0.9
-        assert "FRAME" in " ".join(cell.flags) or False, (
-            f"unedited reads scored {cell.label} vaf={calls[0].vaf:.2f} against a "
-            "reference carrying the design's ALT, with no flag of any kind"
-        )
+            with pytest.raises(DesignedPositionsRequired):
+                score_sites(bam, fa, ["O1"], ow)
 
     def test_fixed_wt_seq_detects_the_inverted_frame(self, tmp_path):
         from magestic.pipelines.wgs.core.window_table import (
@@ -1476,19 +1539,18 @@ class TestDefect12WindowTableDenominators:
         ("O1", CONTIG, 9001, 9060),  # duplicate oligo: FIRST wins, silently
     ]
 
-    @defect_persists("12 (load_oligo_windows reports no denominator)",
-                     closed_by="window_table.load_windows_audited")
     def test_repro_rows_vanish_with_no_denominator(self, tmp_path):
-        """REPRODUCTION: 5 rows in, 1 window out, nothing reported."""
+        """REPRODUCTION: 5 rows in, 1 window out, nothing reported.
+
+        CLOSED UPSTREAM (planning/268): the pinned TRACE's loader REFUSES the table at the
+        first malformed row, so no row can vanish in silence. `defect_persists` removed;
+        `load_windows_audited` (below) still supplies the denominators for the refusal.
+        """
         from magestic.pipelines.wgs.core.reconcile_driver import load_oligo_windows
 
         p = write_window_table(tmp_path / "w.tsv", self.ROWS)
-        ow = load_oligo_windows(str(p))
-        assert len(ow) == 1  # O2/O3/O4 dropped, second O1 swallowed
-        assert hasattr(ow, "n_rows_read"), (
-            "load_oligo_windows returns a bare dict: 4 of 5 rows disappeared with no "
-            "count, so MULTI_EDIT silently becomes SINGLE_EDIT"
-        )
+        with pytest.raises(ValueError, match="w.tsv:3: invalid window"):
+            load_oligo_windows(str(p))
 
     def test_fixed_audited_loader_returns_every_denominator(self, tmp_path):
         from magestic.pipelines.wgs.core.window_table import load_windows_audited
@@ -1552,26 +1614,18 @@ class TestDefect12WindowTableDenominators:
 class TestDefect13StageThreeNotMeasured:
     def test_repro_zero_is_indistinguishable_from_unmeasured(self, tmp_path):
         """REPRODUCTION: a BAM with no `integrated_plasmid_` contig returns 0/0, the
-        same numbers a measured-and-negative sample returns."""
+        same numbers a measured-and-negative sample returns.
+
+        CLOSED UPSTREAM (planning/268): the pinned TRACE now REFUSES to measure a BAM with
+        no integrated contig, so it cannot return that 0/0. The magestic-side guard
+        below is kept, and reports the unmeasured state without making the call."""
         sv = _trace.sv_plasmid()
         ref = _seq(51, 2000)
         bam = write_bam(tmp_path / "noplasmid.bam", ref, spans=((101, 400),))
-        # No `integrated_plasmid_` contig exists, so NOTHING was measured...
         with pysam.AlignmentFile(str(bam), "rb") as b:
             assert [r for r in b.references if r.startswith("integrated_plasmid_")] == []
-        counts = sv.detect_plasmid_integration(str(bam))
-        # ...yet the return is numerically identical to a measured-and-negative sample.
-        assert counts == {"upstream_count": 0, "downstream_count": 0}
-        ref2 = _seq(52, 2000)
-        bam2 = write_bam(
-            tmp_path / "measured.bam", ref2, contig="integrated_plasmid_o1",
-            spans=((101, 400),),
-        )
-        assert sv.detect_plasmid_integration(str(bam2)) == counts, (
-            "an unmeasured sample and a measured-zero sample return the same 0/0, so "
-            "`_combine` can print a 0% cohort integration rate that is an absence of "
-            "measurement"
-        )
+        with pytest.raises(ValueError, match="integration is unmeasured"):
+            sv.detect_plasmid_integration(str(bam))
         from magestic.pipelines.wgs.core.sv_status import integration_measurement
 
         m = integration_measurement(str(bam))
@@ -1582,7 +1636,9 @@ class TestDefect13StageThreeNotMeasured:
     def test_fixed_a_measured_sample_is_marked_measured(self, tmp_path):
         from magestic.pipelines.wgs.core.sv_status import integration_measurement
 
-        ref = _seq(52, 2000)
+        # planning/268: the pinned TRACE requires a geometrically possible contig, i.e.
+        # one longer than both junction arms (2 x 1129), so the fixture is 3000 bp.
+        ref = _seq(52, 3000)
         bam = write_bam(
             tmp_path / "withplasmid.bam", ref, contig="integrated_plasmid_o1",
             spans=((101, 400),),
@@ -1739,7 +1795,15 @@ class TestDefect16EndToEndOnABam:
     WIN = (3001, 3060)
 
     def test_end_to_end_clean_edit_and_clean_wt(self, tmp_path):
-        """The one test that would have caught A1, A10 and A1c: the caller, on a BAM."""
+        """The one test that would have caught A1, A10 and A1c: the caller, on a BAM.
+
+        planning/268: run twice, once with the intended allele declared (TRACE's
+        allele-specific route) and once without it (the read-evidence route, because an
+        intended edit is not required to assign confidence, Kevin 2026-10-24). Both must
+        give the same labels.
+        """
+        import json
+
         from magestic.pipelines.wgs.core.reconcile_driver import (
             load_oligo_windows,
             score_sites,
@@ -1748,8 +1812,16 @@ class TestDefect16EndToEndOnABam:
         ref = _seq(61, 4000)
         fasta = write_fasta(tmp_path / "g.fa", {CONTIG: ref})
         ws, we = self.WIN
-        tab = write_window_table(tmp_path / "w.tsv", [("O1", CONTIG, ws, we)])
+        allele = json.dumps([{"pos": 3030, "ref": ref[3029], "alt": _other(ref[3029])}])
+        tab = write_window_table(
+            tmp_path / "w.tsv", [("O1", CONTIG, ws, we, allele)],
+            header=("oligo_name", "chrom", "donor_start_coord", "donor_end_coord",
+                    "intended_variants"),
+        )
         ow = load_oligo_windows(str(tab))
+        bare = load_oligo_windows(
+            str(write_window_table(tmp_path / "bare.tsv", [("O1", CONTIG, ws, we)]))
+        )
         edited = write_bam(tmp_path / "e.bam", ref, spans=(self.WIN,),
                            edits={3030: _other(ref[3029])})
         wt = write_bam(tmp_path / "w.bam", ref, spans=(self.WIN,))
@@ -1762,6 +1834,10 @@ class TestDefect16EndToEndOnABam:
                 got[name] = TR.reconcile_cell(
                     name, calls, n_genome_bc=1, bc_confidence="high"
                 ).label
+                undeclared = score_sites(bam, fa, ["O1"], bare, designed_positions={"O1": (3030,)})
+                assert TR.reconcile_cell(
+                    name, undeclared, n_genome_bc=1, bc_confidence="high"
+                ).label == got[name]
         assert got == {"edited": TR.SINGLE_EDIT, "wt": TR.NO_EDIT}
 
     def test_end_to_end_audited_path_agrees_and_adds_the_guards(self, tmp_path):

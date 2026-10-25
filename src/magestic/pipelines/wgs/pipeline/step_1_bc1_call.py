@@ -54,6 +54,9 @@ from ..core.locus_config import (
 from ..core.manifest import WGSSample
 from ._common import (
     atomic,
+    cache_key,
+    cache_valid,
+    cache_commit,
     cohort_table,
     collect_shards,
     manifest_samples,
@@ -93,6 +96,8 @@ TRACKS_COLUMNS = (
     "caller_confidence",
     "confidence",
     "oligos",
+    "genome_ambiguous_reads",
+    "plasmid_ambiguous_reads",
 )
 
 
@@ -183,16 +188,18 @@ def run_step_1(config: WGSConfig, sample: str | None = None) -> Path:
     return _combine(config)
 
 
-def _run_one_sample(config: WGSConfig, sample: str) -> Path:
+def _run_one_sample(config: WGSConfig, sample: str, *, record: WGSSample | None = None,
+                    context: dict | None = None) -> Path:
     """One sample. Idempotent: every artifact is written atomically, so a file that
     exists is complete and this skip-check is safe under a requeued array task."""
     out = shard_path(config, sample)
     tracks_out = tracks_shard_path(config, sample)
-    if out.exists() and tracks_out.exists():
+    record = record if record is not None else record_for(config, sample)
+    key = cache_key(config, STEP, record)
+    if cache_valid([out, tracks_out], key):
         logger.info("step_1: %s already complete — skipping", sample)
         return out
 
-    record = record_for(config, sample)
     bam_path = require_indexed_bam(record)
 
     sidecar = ensure_locus_sidecar(config)
@@ -200,18 +207,22 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
         sidecar,
         amplicon_left_window=config.locus.amplicon_left_window,
         amplicon_right_window=config.locus.amplicon_right_window,
+        use_plasmid=config.bc1.use_plasmid,
+        min_mapq=config.bc1.min_mapq,
     )
     use_plasmid = config.bc1.use_plasmid and config.locus.has_plasmid_track
     tracks = [genome_track, plasmid_track] if use_plasmid else [genome_track]
-    validate_tracks(tracks, record.reference)
+    validate_tracks(tracks, record.reference, amplicon_window_sequences=(
+        config.locus.amplicon_left_window_sequence, config.locus.amplicon_right_window_sequence))
 
-    bridge = load_bridge(config)
+    context = context if context is not None else {}
+    if 'bridge' not in context:
+        context['bridge'] = load_bridge(config)
+    bridge = context['bridge']
     with pysam.AlignmentFile(str(bam_path), "rb") as bam:
-        call = bc1_consensus.call_sample(
-            bam, sample, genome_track, plasmid_track if use_plasmid else None, bridge
-        )
         genome_call = bc1_consensus.extract_track(bam, genome_track)
         plasmid_call = bc1_consensus.extract_track(bam, plasmid_track) if use_plasmid else None
+        call = bc1_consensus.call_from_tracks(sample, genome_call, plasmid_call, bridge)
 
     genome_top = bc1_consensus.top_barcode(genome_call)
     plasmid_top = bc1_consensus.top_barcode(plasmid_call) if plasmid_call is not None else None
@@ -225,8 +236,10 @@ def _run_one_sample(config: WGSConfig, sample: str) -> Path:
     write_tsv(
         tracks_out,
         "\t".join(TRACKS_COLUMNS),
-        ["\t".join(_tracks_row(sample, call, genome_top, plasmid_top, genome_bcs, plasmid_bcs))],
+        ["\t".join(_tracks_row(sample, call, genome_top, plasmid_top, genome_bcs, plasmid_bcs)
+                   + [str(genome_call.n_ambiguous), str(plasmid_call.n_ambiguous if plasmid_call else 0)])],
     )
+    cache_commit([out, tracks_out], key)
     logger.info(
         "step_1: %s track=%s barcode=%r support=%d n_genome_bc=%d n_plasmid_bc=%d",
         sample,
@@ -290,8 +303,9 @@ def _combine(config: WGSConfig) -> Path:
     §4 byte-identity structural rather than a convention.
     """
     records = manifest_samples(config)
+    context: dict = {}
     for record in records:
-        _run_one_sample(config, record.sample)
+        _run_one_sample(config, record.sample, record=record, context=context)
 
     header, rows = collect_shards(
         records, lambda r: shard_path(config, r.sample), label="step_1 bc1 emit"

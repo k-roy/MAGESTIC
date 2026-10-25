@@ -69,6 +69,8 @@ __all__ = [
     "EVIDENCE_NO_SITES",
     "EVIDENCE_STRONG",
     "EVIDENCE_THIN",
+    "FLAG_SINGLE_ALT_READ",
+    "FLAG_SV_ONE_SIDED_LOSS",
     "FLAG_WINDOW_PARTIAL_COVERAGE",
     "PositionCount",
     "ScoredSite",
@@ -82,6 +84,7 @@ __all__ = [
     "WindowProfile",
     "classify_window",
     "edit_evidence",
+    "one_sided_coverage_loss",
     "window_edit_profile",
 ]
 
@@ -102,6 +105,12 @@ EVIDENCE_STRONG = "strong"
 #: other window position is not. Without it, gating on the designed position would
 #: *hide* the partial coverage that gating on the minimum would have surfaced.
 FLAG_WINDOW_PARTIAL_COVERAGE = "WINDOW_PARTIAL_COVERAGE"
+#: A `partial` call that rests on ONE alt read (the depth-conditional floor allows it, Kevin
+#: 2026-10-25). Raised so its cost shows: at 20x a sequencing error does this ~2% of the time.
+FLAG_SINGLE_ALT_READ = "PARTIAL_ON_A_SINGLE_ALT_READ"
+#: The interim SV gate (Kevin 2026-10-25, planning/284 §8 ruling 3): until rearrangements are
+#: detected, a one-sided loss of signal in the donor window EXCLUDES the site (`nocov`).
+FLAG_SV_ONE_SIDED_LOSS = "SV_SUSPECT_ONE_SIDED_COVERAGE_LOSS"
 
 
 class PositionOutsideWindowError(ValueError):
@@ -117,6 +126,7 @@ TAU_FULL = 0.85
 TAU_WT = 0.15
 MIN_COV = 4
 MIN_BASE_QUAL = 13
+MIN_MAPQ = 20  # the pinned TRACE's `window_edit_vaf` default; MAPQ 255 is always rejected
 
 #: Evidence tiers. Depth boundaries, nothing cleverer, and stated so a reader of the
 #: shipped column knows exactly what it means.
@@ -128,10 +138,13 @@ EVIDENCE_MODERATE_DEPTH = 20
 class PositionCount:
     """Non-reference evidence at one window position.
 
-    `depth` is `len(col.pileups)` as TRACE counts it (every read in the column,
-    including deletions and ref-skips), so `n_nonref / depth` reproduces TRACE's VAF
-    exactly. A position the pileup never visited is present with `depth=0` rather
-    than absent, which is what makes `min_depth` meaningful.
+    `depth` counts reads as the pinned TRACE's `window_edit_vaf` does (planning/268):
+    primary, mapped, non-duplicate, QC-passing reads with 20 <= MAPQ < 255, deletions
+    included, ref-skips and non-ACGT bases excluded. So `n_nonref / depth` reproduces
+    TRACE's VAF exactly. A ref-skip is a MISSING observation, never an alternate
+    allele: it is counted in `n_ref_skip` and nowhere else. A position the pileup never
+    visited is present with `depth=0` rather than absent, which is what makes
+    `min_depth` meaningful.
     """
 
     pos: int
@@ -144,7 +157,7 @@ class PositionCount:
 
     @property
     def n_nonref(self) -> int:
-        return self.n_substitution + self.n_deletion + self.n_insertion + self.n_ref_skip
+        return self.n_substitution + self.n_deletion + self.n_insertion
 
     @property
     def vaf(self) -> float:
@@ -161,7 +174,6 @@ class PositionCount:
             VARIANT_SUBSTITUTION: self.n_substitution,
             VARIANT_DELETION: self.n_deletion,
             VARIANT_INSERTION: self.n_insertion,
-            VARIANT_REF_SKIP: self.n_ref_skip,
         }
         top = max(parts.values())
         if top == 0:
@@ -292,10 +304,11 @@ class ScoredSite:
     """A `SiteCall` that also records WHY, and WHAT KIND of variant.
 
     🔴 **Duck-compatible with `trace_crispr.wgs.reconcile.SiteCall` on purpose.**
-    `reconcile_cell` reads only `.status`; `reconciliation_to_row` reads `.site`,
-    `.vaf`, `.cov` and `.status`. Carrying the same four attributes means this can be
-    handed straight to TRACE's own aggregation and emit code, so the extra fields are
-    additive and nothing in TRACE needs to change.
+    `reconcile_cell` reads `.status`, `.flags` and `.allele_evidence`;
+    `reconciliation_to_row` reads `.site`, `.vaf`, `.cov`, `.status` and
+    `.allele_evidence`. Carrying the same attributes means this can be handed straight
+    to TRACE's own aggregation and emit code, so the extra fields are additive and
+    nothing in TRACE needs to change.
 
     `vaf` and `cov` are TRACE's `window_edit_vaf` values unchanged, so the headline
     numbers in an existing table do not move. `status` MAY differ from
@@ -313,6 +326,10 @@ class ScoredSite:
     depth_at_designed: int | None = None
     trace_status: str = ""
     flags: tuple[str, ...] = field(default_factory=tuple)
+    #: Per-allele REF/ALT counts; empty here, because a window scored by this module has
+    #: no declared intended allele. The pinned TRACE's `reconcile_cell` and
+    #: `reconciliation_to_row` read it from every site (planning/268).
+    allele_evidence: tuple[Any, ...] = field(default_factory=tuple)
 
     @property
     def status_changed_from_trace(self) -> bool:
@@ -328,20 +345,24 @@ def window_edit_profile(
     end: int,
     *,
     min_base_qual: int = MIN_BASE_QUAL,
+    min_mapq: int = MIN_MAPQ,
+    min_cov: int = MIN_COV,
 ) -> WindowProfile:
     """Measure every position of `[start, end]` (1-based inclusive) in one pass.
 
-    The pileup call, the `stepper`, the `min_base_quality` and the non-reference
-    predicate are TRACE's, character for character, so `max_vaf`/`cov_at_max` are
-    `window_edit_vaf`'s return values. Everything else is what TRACE discarded.
+    The pileup call, the read filter, the `min_base_quality`, the non-reference
+    predicate and the choice of the reported position are the pinned TRACE's
+    `window_edit_vaf`, so `max_vaf`/`cov_at_max` are its return values (planning/268
+    re-aligned them when the pin moved). Everything else is what TRACE discards.
     """
     ref = fasta.fetch(chrom, start - 1, end).upper()
     counts: dict[int, dict[str, int]] = {}
     best_vaf, best_cov, best_pos = 0.0, 0, start
+    covered = False
 
     for col in bam.pileup(
         chrom, start - 1, end, truncate=True, stepper="samtools",
-        min_base_quality=min_base_qual,
+        min_base_quality=min_base_qual, flag_filter=0xF04,
     ):
         i = col.reference_pos - (start - 1)
         if i < 0 or i >= len(ref):
@@ -350,33 +371,43 @@ def window_edit_profile(
         sub = dele = ins = skip = 0
         total = 0
         for pr in col.pileups:
-            total += 1
-            if pr.is_del:
-                dele += 1
+            mapq = pr.alignment.mapping_quality
+            if mapq == 255 or mapq < min_mapq:
                 continue
             if pr.is_refskip:
-                skip += 1
+                skip += 1  # a missing observation, never depth or an alternate allele
+                continue
+            if pr.is_del:
+                total += 1
+                dele += 1
                 continue
             qpos = pr.query_position
             if qpos is None:
                 continue
-            mismatch = pr.alignment.query_sequence[qpos].upper() != refbase
+            base = pr.alignment.query_sequence[qpos].upper()
+            if base not in "ACGT":
+                continue
+            total += 1
             if pr.indel > 0:
                 # An insertion is scored at its anchor base, as TRACE does. When the
                 # anchor ALSO mismatches, the read is counted once, as an insertion:
                 # TRACE's `or` counts it once too, so the VAF is identical.
                 ins += 1
-            elif mismatch:
+            elif base != refbase:
                 sub += 1
         counts[col.reference_pos + 1] = {
             "depth": total, "sub": sub, "del": dele, "ins": ins, "skip": skip,
         }
         if total == 0:
             continue
-        nonref = sub + dele + ins + skip
-        vaf = nonref / total
-        # TRACE's exact tie-break, so the argmax is the same position.
-        if vaf > best_vaf or (vaf == best_vaf and total > best_cov):
+        vaf = (sub + dele + ins) / total
+        # TRACE's exact choice: the highest (vaf, depth) among positions reaching
+        # `min_cov`, else the deepest observed position, so low coverage stays explicit.
+        if total >= min_cov:
+            if not covered or (vaf, total) > (best_vaf, best_cov):
+                best_vaf, best_cov, best_pos = vaf, total, col.reference_pos + 1
+            covered = True
+        elif not covered and (total, vaf) > (best_cov, best_vaf):
             best_vaf, best_cov, best_pos = vaf, total, col.reference_pos + 1
 
     positions = tuple(
@@ -413,7 +444,9 @@ def classify_window(
        `window_table.designed_positions`, i.e. from `wt_seq` vs the design — defect
        10). This is the quantity that decides whether the edit was observable.
     2. **At the window minimum** otherwise. This is the drop-in that needs no new
-       input and still closes defect 11.
+       input and still closes defect 11. Stage 4 never takes this branch:
+       `reconcile_driver.score_sites` refuses a window with no designed position
+       (Kevin 2026-10-25, planning/284 §8 ruling 4).
 
     When (1) is used, a window position below `min_cov` elsewhere does not change the
     status but DOES raise `FLAG_WINDOW_PARTIAL_COVERAGE`, so the partial coverage the
@@ -447,6 +480,9 @@ def classify_window(
         )
 
     if dpos:
+        # 2026-10-25 rulings (planning/268 §4): each designed base is classified from its COUNTS by
+        # TRACE's `classify_counts` -- presence from a single read up when the non-reference count
+        # beats sequencing error at that depth (FLOOR), absence only at `min_cov` reads (UNCALLABLE).
         depth_at_designed = min(profile.depth_at(p) for p in dpos)
         vaf_at_designed = max(profile.vaf_at(p) for p in dpos)
         vclass = next(
@@ -459,22 +495,22 @@ def classify_window(
         )
         if profile.min_depth < min_cov:
             flags.append(FLAG_WINDOW_PARTIAL_COVERAGE)
-        if depth_at_designed < min_cov:
-            return WindowCall(
-                status=tr.SITE_NOCOV,
-                reason="designed_position_depth_below_min_cov",
-                variant_class=vclass, vaf=vaf_at_designed, cov=depth_at_designed,
-                min_depth=profile.min_depth,
-                n_positions_uncovered=profile.n_positions_uncovered,
-                depth_at_designed=depth_at_designed, vaf_at_designed=vaf_at_designed,
-                designed_positions=dpos, flags=tuple(flags),
-            )
-        if vaf_at_designed >= tau_full:
+        counts = {p: next(c for c in profile.positions if c.pos == p) for p in dpos}
+        statuses = {p: tr.classify_counts(c.n_nonref, c.depth, tau_full=tau_full, min_cov=min_cov)
+                    for p, c in counts.items()}
+        values = set(statuses.values())
+        if tr.SITE_PARTIAL in values:
+            status, reason = tr.SITE_PARTIAL, "designed_position_minority_allele"
+            if any(counts[p].n_nonref == 1 for p, st in statuses.items() if st == tr.SITE_PARTIAL):
+                flags.append(FLAG_SINGLE_ALT_READ)
+        elif tr.SITE_NOCOV in values:
+            status, reason = tr.SITE_NOCOV, "designed_position_depth_below_min_cov"
+        elif values == {tr.SITE_FULL}:
             status, reason = tr.SITE_FULL, "designed_position_full_vaf"
-        elif vaf_at_designed <= tau_wt:
+        elif values == {tr.SITE_WT}:
             status, reason = tr.SITE_WT, "designed_position_wt_vaf"
         else:
-            status, reason = tr.SITE_PARTIAL, "designed_position_intermediate_vaf"
+            status, reason = tr.SITE_INCOMPLETE, "designed_positions_partly_installed"
         return WindowCall(
             status=status, reason=reason, variant_class=vclass, vaf=vaf_at_designed,
             cov=depth_at_designed, min_depth=profile.min_depth,
@@ -503,6 +539,49 @@ def classify_window(
     )
 
 
+def one_sided_coverage_loss(
+    bam: Any,
+    profile: WindowProfile,
+    *,
+    min_run: int = 5,
+    min_flank_depth: int = 3,
+    cluster_bp: int = 2,
+    min_mapq: int = MIN_MAPQ,
+) -> str | None:
+    """`"left"` / `"right"` when the donor window loses all signal on ONE side, else `None`.
+
+    The interim SV gate (Kevin 2026-10-25, planning/284 §8 ruling 3): until inversions and
+    translocations are detected, a site whose reads stop dead on one side is excluded rather
+    than read as `NO_EDIT`. All three must hold, so ordinary coverage noise is not flagged:
+    a zero-depth run of at least `min_run` bases touching that window edge (and not the other);
+    at least `min_flank_depth` reads at the last covered base; and at least half of those reads,
+    and at least 3, ENDING (or, for a left-side loss, starting) within `cluster_bp` of that base,
+    which is the pile-up a breakpoint leaves and random read ends do not. A designed deletion
+    inside the window does not touch an edge, so it is never flagged.
+    """
+    depths = [p.depth for p in profile.positions]
+    if not depths:
+        return None
+    lead = next((i for i, d in enumerate(depths) if d), len(depths))
+    trail = next((i for i, d in enumerate(reversed(depths)) if d), len(depths))
+    if lead == len(depths) or (lead >= min_run) == (trail >= min_run):
+        return None
+    side = "left" if lead >= min_run else "right"
+    edge_index = lead if side == "left" else len(depths) - 1 - trail
+    edge = profile.start + edge_index  # the last (right) or first (left) covered base, 1-based
+    flank = depths[edge_index]
+    if flank < min_flank_depth:
+        return None
+    clustered = 0
+    for read in bam.fetch(profile.chrom, max(edge - 1 - cluster_bp, 0), edge + cluster_bp):
+        if (read.flag & 0xF04 or read.mapping_quality == 255 or read.mapping_quality < min_mapq
+                or read.reference_end is None):
+            continue
+        tip = read.reference_end if side == "right" else read.reference_start + 1
+        clustered += abs(tip - edge) <= cluster_bp
+    return side if clustered >= max(3, flank / 2) else None
+
+
 def edit_evidence(sites: Iterable[Any]) -> str:
     """A depth-derived evidence tier for a cell's scored sites (defect 15).
 
@@ -521,7 +600,10 @@ def edit_evidence(sites: Iterable[Any]) -> str:
     if not sites:
         return EVIDENCE_NO_SITES
     tr = _trace.reconcile()
-    covered = [s for s in sites if getattr(s, "status", None) != tr.SITE_NOCOV]
+    # An `unassessed` site (no declared intended alleles, pinned TRACE) has a depth but
+    # measured no edit, so it is evidence of nothing here, exactly like `nocov`.
+    unmeasured = {tr.SITE_NOCOV, getattr(tr, "SITE_UNASSESSED", tr.SITE_NOCOV)}
+    covered = [s for s in sites if getattr(s, "status", None) not in unmeasured]
     if not covered:
         return EVIDENCE_NONE
     best = max(int(getattr(s, "cov", 0) or 0) for s in covered)

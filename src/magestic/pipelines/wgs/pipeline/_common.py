@@ -27,6 +27,11 @@ Author: Kevin R. Roy
 from __future__ import annotations
 
 import csv
+import errno
+import hashlib
+import json
+from dataclasses import asdict, is_dataclass
+from functools import lru_cache
 import itertools
 import logging
 import os
@@ -97,7 +102,7 @@ def cohort_table(config: WGSConfig, name: str) -> Path:
 
 def manifest_samples(config: WGSConfig) -> list[WGSSample]:
     """Every manifest row, in manifest order."""
-    return list(load_manifest(config.paths.manifest))
+    return list(load_manifest(config.paths.manifest, reference_root=config.paths.reference_root))
 
 
 def record_for(config: WGSConfig, sample: str) -> WGSSample:
@@ -124,22 +129,13 @@ def require_indexed_bam(record: WGSSample) -> Path:
     minimal precondition a step must not run without; see the integration note in
     the module report.
     """
-    bam = Path(record.bam)
-    if not bam.exists():
-        raise StepIncompleteError(f"{record.sample}: BAM not found: {bam}")
-    # htslib resolves `<bam>.bai` / `<bam>.csi`, not the picard-style `<stem>.bai`,
-    # so accepting the latter here would pass this check and then fail inside fetch.
-    if not any(bam.with_suffix(bam.suffix + ext).exists() for ext in (".bai", ".csi")):
-        raise StepIncompleteError(
-            f"{record.sample}: no {bam.name}.bai or .csi beside {bam}. "
-            "Stages 1, 3 and 4 all fetch, and htslib will not find a <stem>.bai."
-        )
-    if not Path(record.reference).exists():
-        raise StepIncompleteError(
-            f"{record.sample}: reference not found: {record.reference} "
-            "(reference is a per-sample attribute — decision D1)"
-        )
-    return bam
+    from ..readers.bam_inventory import BamInventoryError, require_indexed, validate_bam_reference
+    try:
+        bam = require_indexed([record])[0]
+        validate_bam_reference(record)
+        return bam
+    except BamInventoryError as exc:
+        raise StepIncompleteError(str(exc)) from exc
 
 
 def require_binary(name: str) -> str:
@@ -221,11 +217,109 @@ def publish(src: Path, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if src.resolve() == dest.resolve():
         return dest
-    if src.parent == dest.parent:
+    try:
         os.replace(src, dest)
-    else:
-        shutil.move(str(src), str(dest))
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        with atomic(dest) as tmp:
+            shutil.copy2(src, tmp)
+        src.unlink()
     return dest
+
+
+@lru_cache(maxsize=256)
+def _content_hash(path: str, identity: tuple) -> str:
+    value = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def _file_identity(path: Path) -> dict:
+    """Content hashes for small inputs; filesystem identity for large data.
+
+    Size, inode, device, nanosecond mtime and ctime detect normal replacements and
+    in-place edits without rereading every multi-GB BAM on each resume. This is a
+    restart guard, not a cryptographic attestation for adversarial filesystems.
+    """
+    path = Path(path).resolve()
+    if not path.is_file():
+        return {'path': str(path), 'present': False}
+    stat = path.stat()
+    identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    result = {'path': str(path), 'present': True, 'stat': list(identity)}
+    if stat.st_size <= 1024 * 1024:
+        result['sha256'] = _content_hash(str(path), identity)
+    return result
+
+
+def _configured_paths(value):
+    if isinstance(value, Path):
+        if not value.is_dir():
+            yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _configured_paths(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _configured_paths(item)
+
+
+def cache_key(config: WGSConfig, step: str, record: WGSSample | None = None,
+              *, inputs: dict[str, Path] | None = None) -> dict:
+    """Pin current code, configuration and all declared input dependencies."""
+    from trace_crispr import wgs as trace_wgs
+    from ..readers.bam_inventory import index_path
+    configuration = asdict(config)
+    configured_inputs = {k: v for k, v in configuration.items() if k != 'paths'}
+    configured_inputs['manifest'] = config.paths.manifest
+    paths = set(_configured_paths(configured_inputs))
+    paths.update(Path(p) for p in (inputs or {}).values() if p is not None)
+    if record is not None:
+        paths.update((Path(record.bam), Path(record.reference), Path(str(record.reference)+'.fai')))
+        index = index_path(record.bam)
+        if index:
+            paths.add(index)
+    sources = sorted(Path(__file__).resolve().parents[1].rglob('*.py'))
+    sources += sorted(Path(trace_wgs.__file__).resolve().parent.rglob('*.py'))
+    source_hash = hashlib.sha256()
+    for source in sources:
+        source_hash.update(str(source).encode())
+        source_hash.update(_file_identity(source)['sha256'].encode())
+    return {'schema': 1, 'stage': step, 'sample': record.sample if record else None,
+            'configuration': json.loads(json.dumps(configuration, default=str, sort_keys=True)),
+            'record': json.loads(json.dumps(asdict(record), default=str)) if record else None,
+            'source_sha256': source_hash.hexdigest(),
+            'inputs': [_file_identity(p) for p in sorted(paths, key=str)]}
+
+
+def _cache_path(outputs: Sequence[Path]) -> Path:
+    if not outputs:
+        raise ValueError('Cache requires at least one declared output')
+    return Path(str(outputs[0])+'.cache.json')
+
+
+def cache_valid(outputs: Sequence[Path], key: dict) -> bool:
+    """Reuse only a complete output set recorded for this exact input key."""
+    try:
+        saved = json.loads(_cache_path(outputs).read_text())
+        return (saved['key'] == key and all(Path(p).is_file() for p in outputs)
+                and saved['outputs'] == [_file_identity(p) for p in outputs])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def cache_commit(outputs: Sequence[Path], key: dict) -> None:
+    """Publish the completion record last, after every stage output exists."""
+    if not all(Path(p).is_file() for p in outputs):
+        raise StepIncompleteError('Cannot record completion with missing stage outputs')
+    if key['inputs'] != [_file_identity(Path(row['path'])) for row in key['inputs']]:
+        raise StepIncompleteError('Input changed during execution; stage completion is not recorded')
+    payload = {'key': key, 'outputs': [_file_identity(p) for p in outputs]}
+    with atomic(_cache_path(outputs)) as tmp:
+        tmp.write_text(json.dumps(payload, sort_keys=True, indent=2)+'\n')
 
 
 # --------------------------------------------------------------------------- #
@@ -274,7 +368,12 @@ def read_table(path: Path) -> list[dict[str, str]]:
         start = i
         break
     columns = [c.lstrip("#") for c in rows[start]]
-    return [dict(zip(columns, r, strict=False)) for r in rows[start + 1 :]]
+    if any(not c for c in columns) or len(set(columns)) != len(columns):
+        raise StepIncompleteError(f"{path}: blank or duplicate table columns")
+    for n, row in enumerate(rows[start + 1:], start=start+2):
+        if len(row) != len(columns):
+            raise StepIncompleteError(f"{path}:{n}: {len(row)} fields for {len(columns)} columns")
+    return [dict(zip(columns, r)) for r in rows[start + 1 :]]
 
 
 # --------------------------------------------------------------------------- #
@@ -303,6 +402,13 @@ def collect_shards(
             missing.append(record.sample)
             continue
         shard_header, shard_rows = read_tsv(path)
+        columns = shard_header.splitlines()[-1].lstrip('#').split('\t')
+        identity = 'sample' if 'sample' in columns else 'sample_name' if 'sample_name' in columns else None
+        if len(shard_rows) != 1:
+            raise StepIncompleteError(f"{label}: {path} has {len(shard_rows)} rows, expected 1")
+        fields = shard_rows[0].split('\t')
+        if len(fields) != len(columns) or (identity and fields[columns.index(identity)] != record.sample):
+            raise StepIncompleteError(f"{label}: {path} has wrong row shape or sample identity")
         if header is None:
             header = shard_header
         elif shard_header != header:
@@ -346,6 +452,7 @@ def write_provenance(
     inputs: dict[str, Path] | None = None,
     parameters: dict[str, object] | None = None,
     counts: dict[str, object] | None = None,
+    input_md5: dict[str, str] | None = None,
 ) -> Path | None:
     """Write the §8 `PROVENANCE.json` sidecar beside a cohort table.
 
@@ -363,6 +470,7 @@ def write_provenance(
         inputs=inputs or {},
         parameters=parameters or {},
         counts=counts or {},
+        input_md5=input_md5,
     )
 
     # Refresh the RUN-level `PROVENANCE.json` indexing every step sidecar in this

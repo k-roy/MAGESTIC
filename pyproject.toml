@@ -69,14 +69,16 @@ redi = [
 # requires both paths provably use one implementation.
 # NOTE: `samtools` must also be on PATH — sv_plasmid shells out to it three times. That is
 # not expressible as a Python dependency; step_3 preflights the binary instead.
-# ⚠️ The TRACE pin is INERT until trace `main` is pushed: the sha exists only on a local
-# branch, so `pip install 'magestic[wgs]'` (and hence `[full]`) will FAIL TO RESOLVE today.
-# That loud failure is deliberate — the previous TRACE HEAD silently ships 1 of the 4 wgs
-# modules (a 9-name `trace_crispr.wgs.__all__`), and a quiet 1-of-4 API is worse.
+# The TRACE pin is the head of the PUBLIC branch `integrate/june-main-and-205-wgs`
+# (k-roy/TRACE PR #4, planning/268): GitHub's June modules + the September reconcile line +
+# the 205 lane's repairs, the only TRACE that defines `score_edit_site` / `bc_confidence_from`
+# / `build_edit_sites(fasta=)`, which Stage 4 calls. It resolves for pip from that pushed ref
+# before the PR merges; merge the PR with a merge commit (not squash or rebase) so the sha
+# stays on `main`. Never pin a sha that exists only in a local clone: it cannot resolve.
 wgs = [
     "pysam>=0.21",
     "rapidfuzz>=3.0",
-    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@7c4c10f1d1a79acd231ba45176daaa40747d30fc",
+    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@8f2592b8da1afc2b9f49e4addc70a2587318d6a3",
 ]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [

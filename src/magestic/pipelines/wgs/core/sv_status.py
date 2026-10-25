@@ -269,12 +269,16 @@ def integration_measurement(
     integrated_contigs: Iterable[str] | None = None,
     junction_distance: int | Mapping[str, int] = 1129,
     window: int = 200,
+    min_mapq: int | None = None,
+    min_anchor: int | None = None,
 ) -> IntegrationMeasurement:
     """Measure plasmid integration, or say plainly that it was not measurable.
 
     A BAM with no `integrated_plasmid_` contig cannot be measured for integration —
-    the junctions this assay counts do not exist in its coordinate space. Returning
-    `0` for that case, as TRACE does, is the defect.
+    the junctions this assay counts do not exist in its coordinate space. TRACE at
+    `7c4c10f` returned `0` for that case, which is the defect; the pinned TRACE now
+    raises instead, so this function never makes that call. `min_mapq` / `min_anchor`
+    pass through to TRACE only when set, so TRACE's defaults (20, 1) otherwise stand.
     """
     import pysam
 
@@ -293,8 +297,10 @@ def integration_measurement(
             sample=sample, measured=False, status=INTEGRATION_NOT_MEASURED,
             n_integrated_contigs=0, upstream_count=None, downstream_count=None,
         )
+    thresholds = {k: v for k, v in (("min_mapq", min_mapq), ("min_anchor", min_anchor))
+                  if v is not None}
     counts = _trace.sv_plasmid().detect_plasmid_integration(
-        bam_path, present, junction_distance, window
+        bam_path, present, junction_distance, window, **thresholds
     )
     return IntegrationMeasurement(
         sample=sample, measured=True, status=INTEGRATION_MEASURED,

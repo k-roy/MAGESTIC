@@ -308,6 +308,12 @@ class WGSLocusConfig:
     plasmid_bc_right_sequence: str | None = None
     amplicon_left_window: str | None = None  # "start-end", 1-based inclusive
     amplicon_right_window: str | None = None  # "start-end", 1-based inclusive
+    # The reference sequence each window covers. Required with its window: a window is a
+    # raw coordinate pair, and `validate_tracks` compares this sequence with the FASTA
+    # every run, as it does the junction flanks, so a re-pointed locus cannot leave the
+    # windows silently at the old primer sites.
+    amplicon_left_window_sequence: str | None = None
+    amplicon_right_window_sequence: str | None = None
 
     @property
     def has_plasmid_track(self) -> bool:
@@ -339,6 +345,9 @@ class WGSBc1Config:
     use_plasmid: bool = False
     """Call the plasmid barcode track in addition to the genome track."""
 
+    min_mapq: int | None = None
+    """TRACE's default is conservative locus assignment (20); explicit 0 enables legacy sensitivity comparisons."""
+
     bridge_table: Path | None = None
     """Optional bc1 -> oligo bridge table. `None` runs BRIDGE-LESS, whose pre-registered
     consequence is `bridge_tier == "NONE"` on every row and a depressed `confidence`
@@ -369,6 +378,9 @@ class WGSDonorPrecallConfig:
                is TRACE-side; `qc/pipeline_qc.py` guards it loudly meanwhile.
     """
 
+    donor_table: Path | None = None
+    """Headered oligo donor definitions with explicit coordinates and sequences."""
+
     ne_threshold: int = 1
     """Minimum reference depth for a gVCF position to count as covered."""
 
@@ -397,27 +409,16 @@ class WGSDonorPrecallConfig:
     """Per-plate multi-sample VCFs to split into the per-sample layout. Empty means
     Stage 2 has no input and must fail loudly rather than emit an empty table."""
 
-    resolve_underscore_contigs: bool = True
-    """Resolve GATE 3 with `core/contig_alias.ContigAlias` instead of refusing.
-
-    NN 251 defect 3. TRACE's `precall_sample` re-parses its own variant id with a
-    positional `split("_")`, so **4 of the 5 contigs the WGS reference-mapping policy
-    mandates crash it**. `True` (the default) encodes every contig name TRACE sees to
-    an underscore-free alias and DECODES the variant ids before the shard is
-    published, so no aliased name reaches a shipped table; `False` restores the old
-    unconditional `GateError`.
-
-    The alias is a no-op on an already-safe reference, so an underscore-free cohort
-    runs byte-identically either way."""
-
     min_allele_fraction: float | None = None
     """Rescue a reference-GT record whose AD-derived allele fraction clears this.
 
     NN 251 defect 1. `None` keeps the GT-only behaviour, which is what every existing
-    output was produced with. See `core/vcf_adapter.PLOIDY_CAVEAT` before setting it:
-    a rescued record reaches Stage 2 as a 100% call, so anything below
-    `vcf_adapter.DEFAULT_FULL_ALLELE_FRACTION` is flagged `MAG_MINOR` and listed in
-    `VcfSplitResult.minor_allele_variants`.
+    output was produced with. See `core/vcf_adapter.PLOIDY_CAVEAT` before setting it.
+    planning/268 §2e (Kevin 2026-10-24): a rescued record is written with GT `0/1`
+    (`vcf_adapter.RESCUED_GT`), with the caller's original kept in `MAG_RESCUED_GT`.
+    The pinned TRACE refuses that as `unknown;ambiguous_genotype`, and step_5 reports a
+    well whose ambiguous genotype is a `MAG_MINOR` allele as `mixture_signal`. A rescued
+    minority allele therefore never reads as unedited, and is never asserted installed.
 
     ⚠️ NN 255: this governs the RESCUE only. Annotating a minority allele is now
     unconditional, so a 10% `GT 0/1` on a diploid-default plate VCF is flagged whatever
@@ -427,8 +428,13 @@ class WGSDonorPrecallConfig:
     because at `--ploidy 1` every minority allele is `GT 0` and the rescue is the only
     thing that can see it."""
 
-    min_alt_reads: int = 2
-    """Minimum ALT read count for a rescued record. NN 255.
+    min_alt_reads: int | None = None
+    """Minimum ALT read count for a rescued record. NN 255; made depth-conditional by Kevin's
+    2026-10-25 ruling (planning/284 §8 ruling 1, "even a single read is OK"): `None` (the default)
+    takes TRACE's `reconcile.min_alt_reads(depth)` at the record's AD depth, which is one read up to
+    51x; an integer pins a fixed floor, e.g. `2` to reproduce an NN 255-era run.
+
+    The NN 255 reasoning for a fixed 2, kept for the record:
 
     A fraction threshold with no count floor selects for low coverage. Measured per-well
     depth, named by dataset: `spg_20240702_POST` median 20.1x / q25 9.1x (n=480);
@@ -456,10 +462,22 @@ class WGSDonorPrecallConfig:
 class WGSSvPlasmidConfig:
     """Stage 3 — plasmid integration and donor-read cleaning (`trace_crispr.wgs.sv_plasmid`)."""
 
+    donor_sequences: Path | None = None
+    """Headered oligo_name/donor_sequence table for per-contig junction derivation."""
+
+    min_mapq: int | None = None
+    """Optional override; the standard-mode evidence default is owned by TRACE."""
+
+    min_anchor: int | None = None
+    """Minimum aligned bases per side of a junction; TRACE supplies the default."""
+
     blacklist: Path | None = None
-    """`REDI_reads_mapped_regions.txt` — the REDI hand-off input. Parsing is
-    deliberately permissive (Perl parity), so a malformed row goes inert rather than
-    raising; `readers/` checks the row count instead of trusting a clean parse."""
+    """`REDI_reads_mapped_regions.txt` — reference-specific REDI intervals.
+    Standard mode validates intervals and reference identity; permissive historical
+    parsing is available only in explicit parity mode."""
+
+    blacklist_reference: Path | None = None
+    """Reference on which blacklist coordinates were defined; required in standard mode."""
 
     samtools: str = "samtools"
     """🔴 UNDECLARED EXTERNAL BINARY. `sv_plasmid` shells out to `samtools` three times
@@ -498,49 +516,59 @@ class WGSReconcileConfig:
     """
 
     require_frame_check: bool = True
-    """Refuse to score a window whose reference frame cannot be verified.
+    """Refuse a window whose `wt_seq` does not match the reference in either orientation.
 
-    NN 251 defect 10 / NN 243 A11. Stage 4 compares reads to `fasta.fetch` and is
-    never given the design's `wt_seq`, so a reference that already carries the
-    design's ALT inverts every per-cell call **while the apparent aggregate rate
-    lands on exactly truth** (per-cell accuracy 0.0%). No rate-level check can
-    detect that, so the per-site check is the only defence.
+    NN 251 defect 10 / NN 243 A11: a reference that already carries the design's ALT
+    inverts every per-cell call **while the apparent aggregate rate lands on exactly
+    truth** (per-cell accuracy 0.0%), so only a per-site check can detect it.
 
-    `True` requires a `wt_seq` column in `reconcile.oligo_windows` and verifies every
-    window with `core.window_table.verify_window_frame`. `False` records an explicit
-    `frame_unverified_no_wt_seq` refusal instead — never a silent pass."""
-
-    depth_gate: bool = True
-    """Gate `min_cov` on the designed position (or the window minimum), not the maximum.
-
-    NN 251 defects 6 and 11 / NN 243 A10+A12. `classify_site` applies `min_cov` to the
-    depth at the window's MAXIMUM-VAF position, so a soft-clipped deletion leaving the
-    designed base at depth 0 shipped as `NO_EDIT cov=42 n_nocov=0 confidence=high`.
-
-    `True` routes scoring through `core.edit_profile`, which gates on the designed
-    position when `reconcile.oligo_windows` carries `wt_seq` + `design_donor`, and on
-    the window minimum otherwise — and records `variant_class`, so an SV cannot be
-    reported as a substitution. `False` restores TRACE's exact behaviour for a parity
-    run.
-
-    ⚠️ Expect the cohort's `NO_EDIT` count to FALL: a window whose edge dips below
-    `min_cov` now reads `SITE_NOCOV` (not measured) rather than `SITE_WT` (no edit).
-    That is the intended direction, not a free win — supply the design columns to gate
-    at the base that matters instead of at the whole window."""
+    Since planning/268 a window that declares `intended_variants` is scored by TRACE's
+    allele-specific scorer, which validates each REF against the FASTA, so a wrong frame
+    cannot invert it. A window that declares none is scored from read evidence against
+    `fasta.fetch` (`core.edit_profile`), where it can. So `True` refuses a table with NO
+    `wt_seq` column only when some window declares no intended allele, and otherwise
+    records `frame_unverified_no_wt_seq` in the audit sidecar. When `wt_seq` IS present
+    every window is verified with `core.window_table.verify_window_frame`; `True` refuses
+    a mismatch or an empty `wt_seq`. `False` records each case as accepted-unverified,
+    never a silent pass."""
 
     strict_window_table: bool = False
-    """Refuse a window table that drops rows or collapses duplicate oligos.
+    """Also refuse a window table that repeats an oligo row.
 
-    NN 251 defect 12. Default `False` because the real design table is only **50.2%
-    filled** on `donor_start_coord`/`donor_end_coord`, so `True` would refuse every
-    existing cohort outright; the denominators are logged and reported either way,
-    which is what makes the undercount visible. Set `True` for a curated table."""
+    NN 251 defect 12. TRACE's `load_oligo_windows` now refuses a malformed row (a
+    `3001.0`, an empty coordinate) and a conflicting duplicate itself, so Stage 4 cannot
+    drop a window in silence at any setting; `core.window_table.load_windows_audited`
+    runs first so the denominators are logged before such a refusal. What `True` adds is
+    refusing IDENTICAL duplicate rows, which TRACE accepts. The real design table is
+    only **50.2% filled** on `donor_start_coord`/`donor_end_coord`, so it must be
+    curated before Stage 4 will accept it."""
+
+    min_mapq: int | None = None
+    """Optional intended-allele mapping-quality floor; TRACE owns default 20."""
+
+    read_source: str = "auto"
+    """Allele evidence: auto uses Stage 3 cleaning when its inputs are configured;
+    raw preserves original alignments; donor_cleaned requires completed Half B.
+    Barcode identity always uses the original BAM. Raw evidence is labelled and
+    observed plasmid barcode evidence caps raw editing confidence at low.
+    """
 
     oligo_windows: Path | None = None
     """Oligo-window table (`oligo_name`, `chrom`, `donor_start_coord`,
-    `donor_end_coord`). `load_oligo_windows` SILENTLY skips short rows and rows whose
-    coordinates are not `.isdigit()`, and keeps the first occurrence per oligo — so
-    `readers/oligo_tables.py` compares loaded row count against file row count."""
+    `donor_end_coord`, optional `intended_variants` JSON `[{pos, ref, alt}]` in the BAM
+    reference frame, optional `wt_seq` / `design_donor`). TRACE's `load_oligo_windows`
+    refuses a malformed or conflicting row. A window with `intended_variants` is scored
+    by TRACE per allele; one without is scored from its read evidence, gated at the
+    designed base that `wt_seq` + `design_donor` give, and flagged
+    `WINDOW_EVIDENCE_NO_INTENDED_ALLELES` (planning/268). A window with neither is
+    REFUSED (`DesignedPositionsRequired`; Kevin 2026-10-25, planning/284 §8 ruling 4).
+
+    The data that enables that (planning/268 §2g, agreed by Kevin 2026-10-24): the
+    cohort's Stage-2 donor table (`donor_precall.donor_table`) already carries `chrom`,
+    the donor coordinates, `wt_seq` and `design_donor` for every assigned oligo. Point
+    this key at that table, or at a copy with `intended_variants` added. That turns on
+    the frame check and the designed-base gate. The raw design table will not load: TRACE
+    refuses its unfilled coordinate rows."""
 
     oligo_assignments: Path | None = None
     """Per-sample oligo assignment (`sample` -> one or more `oligo_name`), the input that
@@ -676,8 +704,11 @@ class WGSConfig:
         for label, path, owning_steps in (
             ("bc1.bridge_table", self.bc1.bridge_table, {"1", "4"}),
             ("sv_plasmid.blacklist", self.sv_plasmid.blacklist, {"3"}),
+            ("sv_plasmid.blacklist_reference", self.sv_plasmid.blacklist_reference, {"3"}),
+            ("sv_plasmid.donor_sequences", self.sv_plasmid.donor_sequences, {"3"}),
+            ("donor_precall.donor_table", self.donor_precall.donor_table, {"2"}),
             ("reconcile.oligo_windows", self.reconcile.oligo_windows, {"3", "4"}),
-            ("reconcile.oligo_assignments", self.reconcile.oligo_assignments, {"3", "4"}),
+            ("reconcile.oligo_assignments", self.reconcile.oligo_assignments, {"2", "3", "4"}),
         ):
             if not (owning_steps & wanted):
                 continue
@@ -722,7 +753,7 @@ class WGSConfig:
 
 def _as_path(value: Any) -> Path | None:
     """Coerce an optional YAML scalar to a `Path`, preserving `None`/empty as `None`."""
-    return Path(value) if value else None
+    return Path(value).expanduser() if value else None
 
 
 def _under_root_optional(value: Any, project_root: Path) -> Path | None:
@@ -771,7 +802,7 @@ def load_config(
         If a required key (`cohort_name`, `sequencing_date`, `paths.project_root`,
         `paths.manifest`) is missing.
     """
-    path = Path(path)
+    path = Path(path).expanduser().resolve()
     with path.open() as fh:
         data: dict[str, Any] = yaml.safe_load(fh) or {}
 
@@ -787,11 +818,17 @@ def load_config(
         )
 
     paths_d: dict[str, Any] = data["paths"]
-    project_root = Path(project_dir) if project_dir is not None else Path(paths_d["project_root"])
+    if project_dir is not None:
+        project_root = Path(project_dir).expanduser().resolve()
+    else:
+        project_root = Path(paths_d["project_root"]).expanduser()
+        if not project_root.is_absolute():
+            project_root = path.parent / project_root
+        project_root = project_root.resolve()
 
     def _under_root(key: str, default: str) -> Path:
         """Resolve a path key against the effective project root when it is relative."""
-        raw = Path(paths_d.get(key, default))
+        raw = Path(paths_d.get(key, default)).expanduser()
         return raw if raw.is_absolute() else project_root / raw
 
     paths = WGSPaths(
@@ -809,20 +846,45 @@ def load_config(
     locus = WGSLocusConfig(**locus_d) if locus_d else None
 
     bc1_d = dict(data.get("bc1", {}))
-    bc1_d["bridge_table"] = _as_path(bc1_d.get("bridge_table"))
+    bc1_d["bridge_table"] = _under_root_optional(bc1_d.get("bridge_table"), project_root)
+    value = bc1_d.get('min_mapq')
+    if value is not None and (type(value) is not int or not 0 <= value <= 254):
+        raise ValueError('bc1.min_mapq must be an integer from 0 to 254')
     bc1 = WGSBc1Config(**bc1_d)
 
     precall_d = dict(data.get("donor_precall", {}))
-    precall_d["plate_vcfs"] = [Path(p) for p in precall_d.get("plate_vcfs", [])]
+    precall_d["plate_vcfs"] = [_under_root_optional(p, project_root) for p in precall_d.get("plate_vcfs", [])]
+    precall_d["donor_table"] = _under_root_optional(precall_d.get("donor_table"), project_root)
     donor_precall = WGSDonorPrecallConfig(**precall_d)
 
     sv_d = dict(data.get("sv_plasmid", {}))
-    sv_d["blacklist"] = _as_path(sv_d.get("blacklist"))
+    sv_d["blacklist"] = _under_root_optional(sv_d.get("blacklist"), project_root)
+    sv_d["blacklist_reference"] = _under_root_optional(sv_d.get("blacklist_reference"), project_root)
+    sv_d["donor_sequences"] = _under_root_optional(sv_d.get("donor_sequences"), project_root)
+    if 'samtools' in sv_d and (not isinstance(sv_d['samtools'], str) or not sv_d['samtools'].strip()):
+        raise ValueError('sv_plasmid.samtools must be a nonempty executable string')
+    if sv_d.get('dup_mode', 'standard') not in ('standard', 'parity'):
+        raise ValueError('sv_plasmid.dup_mode must be standard or parity')
+    for key, lower in (('min_mapq', 0), ('min_anchor', 1)):
+        value = sv_d.get(key)
+        if value is not None and (type(value) is not int or value < lower):
+            raise ValueError(f'sv_plasmid.{key} must be an integer >= {lower}')
+    if sv_d.get('min_mapq') is not None and sv_d['min_mapq'] > 254:
+        raise ValueError('sv_plasmid.min_mapq must be <= 254 (255 is unknown)')
+    for key, lower in (('bp_to_extend', 1), ('flexible_bases', 0), ('junction_distance', 1)):
+        value = sv_d.get(key)
+        if value is not None and (type(value) is not int or value < lower):
+            raise ValueError(f'sv_plasmid.{key} must be an integer >= {lower}')
     sv_plasmid = WGSSvPlasmidConfig(**sv_d)
 
     recon_d = dict(data.get("reconcile", {}))
-    recon_d["oligo_windows"] = _as_path(recon_d.get("oligo_windows"))
-    recon_d["oligo_assignments"] = _as_path(recon_d.get("oligo_assignments"))
+    if recon_d.get('read_source', 'auto') not in ('auto', 'raw', 'donor_cleaned'):
+        raise ValueError('reconcile.read_source must be auto, raw, or donor_cleaned')
+    value = recon_d.get('min_mapq')
+    if value is not None and (type(value) is not int or not 0 <= value <= 254):
+        raise ValueError('reconcile.min_mapq must be an integer from 0 to 254')
+    recon_d["oligo_windows"] = _under_root_optional(recon_d.get("oligo_windows"), project_root)
+    recon_d["oligo_assignments"] = _under_root_optional(recon_d.get("oligo_assignments"), project_root)
     reconcile = WGSReconcileConfig(**recon_d)
 
     return WGSConfig(

@@ -12,8 +12,12 @@
 # Stage 1 (bc1 calling) as an idempotent SLURM array — one SAMPLE per array task
 # (ARCHITECTURE_POLICY §6). Submit with:
 #
-#   CONFIG=/path/to/<cohort>_wgs.yaml MANIFEST=/path/to/sample_manifest.tsv \
-#     sbatch --array=1-$(( $(wc -l < "$MANIFEST") - 1 )) template.sbatch
+#   export CONFIG=/path/to/<cohort>_wgs.yaml MANIFEST=/path/to/sample_manifest.tsv
+#   sbatch --array=1-$(python -m magestic.pipelines.wgs.slurm.task_select \
+#     --config "$CONFIG" --manifest "$MANIFEST" --count) template.sbatch
+#
+# Size the array with the selector, never `wc -l`: comment and blank manifest lines
+# are not samples, so a line count creates tasks that have no sample.
 #
 # 🔴 This template deliberately carries NO CPU-generation node filter and no node
 # exclusion, and none may be added. Two older repo files still pin an AVX-512 CPU
@@ -39,24 +43,22 @@ export MKL_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-# Row 1 of the manifest is the header, so task N reads line N+1.
-LINE_NUM=$(( SLURM_ARRAY_TASK_ID + 1 ))
-SAMPLE=$(awk -v n="$LINE_NUM" 'NR==n {print $1}' "$MANIFEST")
-if [ -z "$SAMPLE" ]; then
-    echo "no manifest row for array task ${SLURM_ARRAY_TASK_ID} (line ${LINE_NUM})" >&2
+# Task N is the Nth SAMPLE as the shared manifest reader enumerates it (the same one
+# the direct and Snakemake paths use): columns by header name, comment and blank lines
+# skipped, sample IDs kept whole. The selector refuses a task ID outside 1..n and a
+# MANIFEST that is not the manifest CONFIG declares, and prints nothing when it refuses.
+: "${SLURM_ARRAY_TASK_ID:?SLURM_ARRAY_TASK_ID must be set (submit this file as an array)}"
+PYTHON="${PYTHON:-python3}"
+SAMPLE=$("$PYTHON" -m magestic.pipelines.wgs.slurm.task_select \
+    --config "$CONFIG" --manifest "$MANIFEST" --task "$SLURM_ARRAY_TASK_ID") || {
+    echo "array task ${SLURM_ARRAY_TASK_ID} has no manifest sample; nothing was run" >&2
     exit 1
-fi
+}
 
-# §6 skip-check: every artifact is written atomically, so a file that EXISTS is a file
-# that is COMPLETE and re-running a requeued task is free. Checking the output rather
-# than a sentinel is deliberate — a sentinel written after a loop is not a completion
-# signal.
-OUTPUT_DIR="${PROCESSED_DIR:-processed_data}/bc1_calls"
-if [ -f "${OUTPUT_DIR}/${SAMPLE}.bc1_calls.tsv" ] && \
-   [ -f "${OUTPUT_DIR}/${SAMPLE}.bc1_tracks.tsv" ]; then
-    echo "${SAMPLE}: output already complete, skipping"
-    exit 0
-fi
+# §6 requeue safety lives in the stage, not here. A requeued task re-enters the stage
+# CLI, whose cache reuses its outputs only when the recorded input, parameter and code
+# identity still matches. An existence test on the output names would also "reuse" a
+# stale or foreign file after the bridge, BAM or config changed, so there is none.
 
 # The SAME console script the Snakemake path calls, so there is one entry point per
 # stage and dual-path parity stays structural (§4).

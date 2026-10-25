@@ -17,10 +17,13 @@ Author: Kevin R. Roy
 from __future__ import annotations
 
 import re
+import shlex
+import hashlib
+from functools import lru_cache
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from ..core.manifest import WGSSample
+from ..core.manifest import WGSSample, ReferenceMismatchError, require_reference_consistency
 
 __all__ = [
     "BamInventoryError",
@@ -41,14 +44,14 @@ class BamInventoryError(RuntimeError):
 def index_path(bam: str | Path) -> Path | None:
     """The htslib index beside `bam`, or None.
 
-    htslib resolves `<bam>.bai` / `<bam>.csi` — NOT the picard-style `<stem>.bai`, so
-    accepting the latter would pass a precondition check and then fail inside `fetch`.
+    Includes the stem.bai/stem.csi alternatives recognized by htslib. Existence
+    is only discovery; require_indexed also opens the index through htslib.
     """
     bam = Path(bam)
     for ext in (".bai", ".csi"):
-        candidate = bam.with_name(bam.name + ext)
-        if candidate.exists():
-            return candidate
+        for candidate in (bam.with_name(bam.name + ext), bam.with_suffix(ext)):
+            if candidate.is_file():
+                return candidate
     return None
 
 
@@ -69,12 +72,60 @@ def require_indexed(samples: Iterable[WGSSample]) -> list[Path]:
         if index_path(bam) is None:
             problems.append(f"{s.sample}: no {bam.name}.bai or .csi beside {bam}")
             continue
+        try:
+            import pysam
+            with pysam.AlignmentFile(str(bam), "rb") as handle:
+                handle.check_index()
+        except (ValueError, OSError) as exc:
+            problems.append(f"{s.sample}: BAM/index cannot be opened: {exc}")
+            continue
         bams.append(bam)
     if problems:
         raise BamInventoryError(
             f"{len(problems)} BAM precondition failure(s):\n  " + "\n  ".join(problems)
         )
     return bams
+
+
+@lru_cache(maxsize=8)
+def _reference_md5(path: str, identity: tuple) -> dict[str, str]:
+    import pysam
+    with pysam.FastaFile(path) as fa:
+        return {name: hashlib.md5(fa.fetch(name).upper().encode()).hexdigest()
+                for name in fa.references}
+
+
+def validate_bam_reference(sample: WGSSample) -> None:
+    """Refuse contradictory or absent alignment reference evidence.
+
+    Contig dictionaries must match. SQ M5 values, when present, must match the
+    actual FASTA. Complete M5 evidence also permits renamed/staged references.
+    Otherwise a parsed PG reference basename must agree. Basename agreement is
+    a provenance check, not a sequence-identity proof when M5 is absent.
+    """
+    import pysam
+    reference = Path(sample.reference)
+    if not reference.is_file() or not Path(str(reference)+".fai").is_file():
+        raise BamInventoryError(f"{sample.sample}: reference FASTA/.fai missing: {reference}")
+    with pysam.AlignmentFile(str(sample.bam), "rb") as bam:
+        header = bam.header.to_dict()
+        observed = dict(zip(bam.references, bam.lengths))
+    with pysam.FastaFile(str(reference)) as fa:
+        declared = dict(zip(fa.references, fa.lengths))
+    if observed != declared:
+        raise ReferenceMismatchError(f"{sample.sample}: BAM SQ dictionary differs from {reference}")
+    m5 = {sq['SN']: str(sq['M5']).lower() for sq in header.get('SQ', []) if sq.get('M5')}
+    if m5:
+        stat = reference.stat()
+        hashes = _reference_md5(str(reference.resolve()),
+                                (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        wrong = [name for name, value in m5.items() if hashes.get(name) != value]
+        if wrong:
+            raise ReferenceMismatchError(f"{sample.sample}: reference sequence M5 mismatch: {wrong}")
+        if len(m5) == len(declared):
+            return
+    ref = _reference_from_header(header)
+    require_reference_consistency([sample], {sample.sample: ref} if ref else {})
 
 
 def observed_references(samples: Iterable[WGSSample]) -> dict[str, str]:
@@ -109,9 +160,14 @@ def _reference_from_header(header: dict) -> str | None:
     programs: Sequence[dict] = header.get("PG", []) or []
     ordered = [pg for pg in programs if str(pg.get("ID", "")).startswith("bwa")] + list(programs)
     for pg in ordered:
-        match = _FASTA_TOKEN.search(str(pg.get("CL", "")))
-        if match:
-            return match.group(0)
+        try:
+            tokens = shlex.split(str(pg.get("CL", "")))
+        except ValueError:
+            continue
+        for token in tokens:
+            candidate = token.split("=", 1)[-1]
+            if re.search(r"\.(?:fa|fasta|fna)(?:\.gz)?$", candidate):
+                return candidate
     return None
 
 

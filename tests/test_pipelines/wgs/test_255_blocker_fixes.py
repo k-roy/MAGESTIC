@@ -44,21 +44,10 @@ def _wgs_modules(wgs_src_dir: Path) -> list[str]:
     return out
 
 
-def test_f0_expand_reference_blocks_is_BOUND_not_just_mentioned():
-    """`step_2:377` called `expand_reference_blocks` without importing it.
-
-    NN 251's own test asserted `'expand_reference_blocks(' in src` — a source-TEXT
-    check, which passes while the name is unbound. The gVCF-expansion fix (NN 252's
-    F13, its headline positive) was therefore a `NameError` the moment a gVCF existed,
-    i.e. on exactly the path that makes Stage 2 runnable.
-    """
-    step_2 = import_wgs("pipeline.step_2_donor_precall")
-    gvcf = import_wgs("core.gvcf_adapter")
-    assert hasattr(step_2, "expand_reference_blocks"), (
-        "step_2 calls expand_reference_blocks() but does not import it; the call is a "
-        "NameError on the first cohort that has a gVCF"
-    )
-    assert step_2.expand_reference_blocks is gvcf.expand_reference_blocks
+# WITHDRAWN (planning/268): "step_2 binds `expand_reference_blocks`". The merge retired the
+# gVCF block expansion from step_2: the pinned TRACE reads `INFO/END` itself and validates
+# every gVCF REF, which the expander's copied block REF failed. The unbound-name class this
+# test was written for is still guarded package-wide by the test below.
 
 
 def test_f0_no_unbound_global_name_anywhere_in_the_package(wgs_src_dir):
@@ -114,14 +103,17 @@ def test_f0_no_unbound_global_name_anywhere_in_the_package(wgs_src_dir):
 # --------------------------------------------------------------------------- #
 
 
-def _config(tmp_path):
+def _config(tmp_path, samples=()):
+    """`samples` become manifest rows: since planning/268, step_5 refuses a join whose
+    sample set differs from the manifest (the 205 lane's manifest-scoped join)."""
     cfg = import_wgs("config")
     root = tmp_path / "cohort"
     (root / "processed_data").mkdir(parents=True)
     (root / "keyfiles").mkdir(parents=True)
     (root / "intermediate_data").mkdir(parents=True)
     manifest = root / "keyfiles" / "manifest.tsv"
-    manifest.write_text("sample\tbam\treference\n")
+    manifest.write_text("sample\tbam\treference\n" + "".join(
+        f"{s}\t{root}/{s}.bam\t{root}/ref.fa\n" for s in samples))
     return cfg.WGSConfig(
         cohort_name="nn255",
         sequencing_date="20260728",
@@ -189,7 +181,7 @@ def test_f1_run_step_5_survives_the_renamed_confidence_column(tmp_path, monkeypa
     step_2 = import_wgs("pipeline.step_2_donor_precall")
     step_4 = import_wgs("pipeline.step_4_reconcile")
     step_5 = import_wgs("pipeline.step_5_join_outcomes")
-    config = _config(tmp_path)
+    config = _config(tmp_path, samples=("s1", "s2"))
 
     columns = _stage_4_audited_table(step_4.table_path(config))
     assert "bc_confidence" in columns and "confidence" not in columns, (
@@ -210,7 +202,7 @@ def test_f1_legacy_unrenamed_confidence_still_joins(tmp_path):
     step_2 = import_wgs("pipeline.step_2_donor_precall")
     step_4 = import_wgs("pipeline.step_4_reconcile")
     step_5 = import_wgs("pipeline.step_5_join_outcomes")
-    config = _config(tmp_path)
+    config = _config(tmp_path, samples=("s1", "s2"))
     _stage_4_audited_table(step_4.table_path(config))
     legacy = step_4.table_path(config)
     legacy.write_text(legacy.read_text().replace("bc_confidence", "confidence", 1))
@@ -229,7 +221,7 @@ def test_f1_a_missing_confidence_column_FAILS_LOUDLY_not_as_an_empty_string(tmp_
     step_2 = import_wgs("pipeline.step_2_donor_precall")
     step_4 = import_wgs("pipeline.step_4_reconcile")
     step_5 = import_wgs("pipeline.step_5_join_outcomes")
-    config = _config(tmp_path)
+    config = _config(tmp_path, samples=("s1", "s2"))
     _stage_4_audited_table(step_4.table_path(config))
     p = step_4.table_path(config)
     p.write_text(p.read_text().replace("bc_confidence", "something_else", 1))
@@ -448,14 +440,16 @@ def test_f11b_rescue_needs_a_READ_COUNT_floor_not_only_a_fraction(tmp_path):
         # 0.05 fraction floor; only `two` clears a 2-read count floor.
         fh.write("chrXV\t100\t.\tT\tG\t50\t.\t.\tGT:AD"
                  "\t0:13,1\t0:12,2\n")
+    # Kevin 2026-10-25 (planning/284 §8 ruling 1): the floor is DEPTH-CONDITIONAL and "even a
+    # single read is OK". WITHDRAWN: "a fixed 2-read floor drops the 1-of-14 record by default".
+    # The default is TRACE's min_alt_reads(14) = 1, so both are rescued.
     res = split_plate_vcf(p, tmp_path / "wd", min_allele_fraction=0.05)
-    assert res.n_rescued_by_af == 1, "only the 2-read record may be rescued"
-    assert res.n_dropped_below_min_alt_reads == 1
-    assert res.n_records_out["one"] == 0 and res.n_records_out["two"] == 1
-    # POSITIVE control: lowering the floor to 1 read admits it, so the floor is the
-    # thing doing the work and not an unrelated filter.
-    res1 = split_plate_vcf(p, tmp_path / "wd1", min_allele_fraction=0.05, min_alt_reads=1)
-    assert res1.n_rescued_by_af == 2 and res1.n_dropped_below_min_alt_reads == 0
+    assert res.n_rescued_by_af == 2 and res.n_dropped_below_min_alt_reads == 0
+    # The count floor is still the thing doing the work when pinned: 2 reads, as NN 255 had it.
+    res2 = split_plate_vcf(p, tmp_path / "wd2", min_allele_fraction=0.05, min_alt_reads=2)
+    assert res2.n_rescued_by_af == 1, "only the 2-read record may be rescued"
+    assert res2.n_dropped_below_min_alt_reads == 1
+    assert res2.n_records_out["one"] == 0 and res2.n_records_out["two"] == 1
 
 
 @_needs_bcftools
@@ -542,110 +536,12 @@ def test_f11b_a_plate_with_two_different_call_commands_is_refused(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# F5 / F6 / F6b — the GATE-3 alias guard refused the unedited majority class   #
+# F5 / F6 / F6b — WITHDRAWN with the GATE-3 alias wiring (planning/268)         #
 # --------------------------------------------------------------------------- #
-
-_DONOR_RAW = "blank_MAGESTIC3_pF835_guide_donor_plasmid"
-_REF_NAMES = ("chrXV", _DONOR_RAW, "integrated_plasmid_o1")
-
-
-def _alias():
-    return import_wgs("core.contig_alias").ContigAlias.from_names(_REF_NAMES)
-
-
-def _alias_fixture(tmp_path: Path, vcf_chroms, *, alias=None):
-    """A samplesheet + aliased FASTA + a VCF carrying `vcf_chroms`, ready for the guard."""
-    import pysam
-
-    alias = alias or _alias()
-    donor = alias.encode(_DONOR_RAW)
-    sheet = tmp_path / "s.samplesheet.tsv"
-    sheet.write_text(
-        "sample\tchrom\tdonor_start_coord\tdonor_end_coord\twt_seq\tdesign_donor\t"
-        "synthetic_donor\n"
-        f"s1\t{donor}\t101\t160\tA\tA\tA\n"
-    )
-    fasta = tmp_path / "aliased.fa"
-    fasta.write_text("".join(f">{alias.encode(n)}\nACGTACGTAC\n" for n in _REF_NAMES))
-    pysam.faidx(str(fasta))
-    vcf = tmp_path / "unedited.vcf"
-    gvcf = tmp_path / "unedited.g.vcf"
-    body = "".join(
-        f"{c}\t{100 + i}\t.\tA\tG\t50\t.\t.\tGT\t1\n" for i, c in enumerate(vcf_chroms)
-    )
-    for p in (vcf, gvcf):
-        p.write_text("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\t"
-                     "INFO\tFORMAT\ts1\n" + body)
-    return alias, sheet, vcf, gvcf, fasta, donor
-
-
-def test_f5_an_UNEDITED_cell_is_accepted_not_refused(tmp_path):
-    """🔴 BLOCKER. `_require_alias_consistency` raised `StepIncompleteError` for a
-    correctly-and-fully aliased cell that simply had **no variant on its donor contig**.
-
-    That is the `designed_variant_unedited` class — the majority outcome and the one the
-    whole stage exists to separate from `unknown` — and the guard hard-stopped it on the
-    GATE-3 path, which the composite-reference standard makes universal. The message's
-    reasoning was inverted for this input: having no variant at the donor window is the
-    CORRECT unedited result, not a mis-applied alias.
-    """
-    step_2 = import_wgs("pipeline.step_2_donor_precall")
-    # Variants on two OTHER contigs, none on the donor contig: a textbook unedited cell.
-    other = _alias().encode("integrated_plasmid_o1")
-    alias, sheet, vcf, gvcf, fasta, donor = _alias_fixture(tmp_path, ["chrXV", other])
-    assert donor not in {
-        ln.split("\t")[0] for ln in vcf.read_text().splitlines()
-        if ln and not ln.startswith("#")
-    }, "fixture must carry NO record on the donor contig"
-    step_2._require_alias_consistency(alias, sheet, vcf, gvcf, fasta)  # must not raise
-
-
-def test_f5_a_HALF_APPLIED_alias_is_still_refused(tmp_path):
-    """The positive control for F5, in the same shape: the guard must still fire.
-
-    This is also NN 252's **F6** — a VCF carrying BOTH the alias and the RAW donor contig
-    name passed the old set-membership check, which is precisely the failure the guard's
-    docstring claims it prevents. Fixing F5 by deleting the guard would have shipped F6.
-    """
-    common = import_wgs("pipeline._common")
-    step_2 = import_wgs("pipeline.step_2_donor_precall")
-    alias = _alias()
-    _, sheet, vcf, gvcf, fasta, donor = _alias_fixture(
-        tmp_path, ["chrXV", donor_alias := alias.encode(_DONOR_RAW), _DONOR_RAW],
-        alias=alias,
-    )
-    assert donor_alias != _DONOR_RAW
-    with pytest.raises(common.StepIncompleteError, match="RAW contig name"):
-        step_2._require_alias_consistency(alias, sheet, vcf, gvcf, fasta)
-
-
-def test_f5_a_header_only_vcf_is_no_longer_a_free_pass(tmp_path):
-    """The old `if seen and chrom not in seen` inverted the severity: zero records passed
-    unchecked while one off-contig record was fatal. Both now behave the same way —
-    accepted, because neither is evidence of an inconsistent alias."""
-    step_2 = import_wgs("pipeline.step_2_donor_precall")
-    alias, sheet, vcf, gvcf, fasta, donor = _alias_fixture(tmp_path, [])
-    step_2._require_alias_consistency(alias, sheet, vcf, gvcf, fasta)
-
-
-def test_f5_a_contig_the_reference_does_not_carry_is_NAMED_not_ignored(tmp_path, caplog):
-    """F6b: `alias.encode` is identity for a name absent from the reference `.fai`, so
-    such a contig keeps its underscores and is left un-aliased. TRACE skips it only
-    because it is not the donor contig — a coincidence, not a guard — so it is reported."""
-    import logging
-
-    step_2 = import_wgs("pipeline.step_2_donor_precall")
-    alias, sheet, vcf, gvcf, fasta, donor = _alias_fixture(
-        tmp_path, ["chrXV", "some_other_contig"]
-    )
-    with caplog.at_level(logging.WARNING):
-        step_2._require_alias_consistency(alias, sheet, vcf, gvcf, fasta)
-    assert "some_other_contig" in caplog.text and "NOT VERIFIED" in caplog.text
-
-
-# --------------------------------------------------------------------------- #
-# F10 — the documented escape hatch did not exist                              #
-# --------------------------------------------------------------------------- #
+# The four `_require_alias_consistency` tests guarded a ContigAlias encode/decode that
+# step_2 no longer performs: the pinned TRACE builds variant ids from structured fields,
+# so an underscore-bearing contig needs no alias (its crash-pins in test_known_answer_242
+# now assert that). `core/contig_alias.py` and its own tests are unchanged.
 
 
 def _frame_fixture(tmp_path: Path, *, wt_matches: bool):
@@ -752,11 +648,14 @@ def test_f7_every_step_2_column_reaches_step_5():
 
 
 def test_f7_a_minor_allele_at_the_designed_position_reaches_the_joined_table(tmp_path):
-    """The signal arrives, AND it moves `precall_state` EDIT -> MIXED with a reason."""
+    """The signal arrives, AND it moves `precall_state` EDIT -> mixture_signal with a reason.
+
+    planning/268: master's collapsed `mixed` state was split by the 205 lane into
+    `partial_install` and `mixture_signal`; a minority allele fraction is the second."""
     step_2 = import_wgs("pipeline.step_2_donor_precall")
     step_4 = import_wgs("pipeline.step_4_reconcile")
     step_5 = import_wgs("pipeline.step_5_join_outcomes")
-    config = _config(tmp_path)
+    config = _config(tmp_path, samples=("s1", "s2"))
     _stage_4_audited_table(step_4.table_path(config))
     # s1 is `designed_variant_installed` at chrXV_130_G_to_A and carries a MAG_MINOR
     # allele AT THAT POSITION; s2 is unedited and carries none.
@@ -771,7 +670,7 @@ def test_f7_a_minor_allele_at_the_designed_position_reaches_the_joined_table(tmp
     assert s1[header.index("editing_outcome")] == "designed_variant_installed", (
         "the raw outcome is passed through verbatim; the downgrade is a separate column"
     )
-    assert s1[header.index("precall_state")] == "mixed"
+    assert s1[header.index("precall_state")] == "mixture_signal"
     assert s1[header.index("precall_state_reason")] == (
         step_5.PRECALL_STATE_MINOR_ALLELE
     )
@@ -789,7 +688,7 @@ def test_f7_a_minority_allele_ELSEWHERE_does_not_downgrade_a_clean_edit(tmp_path
     step_2 = import_wgs("pipeline.step_2_donor_precall")
     step_4 = import_wgs("pipeline.step_4_reconcile")
     step_5 = import_wgs("pipeline.step_5_join_outcomes")
-    config = _config(tmp_path)
+    config = _config(tmp_path, samples=("s1", "s2"))
     _stage_4_audited_table(step_4.table_path(config))
     _stage_2_table(step_2.table_path(config), minor=("chrIV_9999_C_to_T", ""))
     written = step_5.run_step_5(config)
@@ -815,7 +714,6 @@ def test_f7_the_minor_allele_id_matches_the_designed_variant_id_namespace():
     import ast
 
     step_2 = import_wgs("pipeline.step_2_donor_precall")
-    alias_mod = import_wgs("core.contig_alias")
     from magestic.pipelines.wgs.core.vcf_adapter import split_plate_vcf
 
     # (a) Behavioural: the rescued id carries the RAW, underscore-bearing contig name.
@@ -833,24 +731,28 @@ def test_f7_the_minor_allele_id_matches_the_designed_variant_id_namespace():
     got = res.minor_allele_variants["s1"]
     assert got == (f"{raw}_130_G_to_A",), got
 
-    # (b) ...and TRACE's ALIASED id decodes to exactly that string, so the two meet.
-    alias = alias_mod.ContigAlias.from_names(["chrXV", raw])
-    aliased_id = f"{alias.encode(raw)}_130_G_to_A"
-    assert alias.decode_variant_id(aliased_id) == got[0]
-
-    # (c) Structural: `_require_vcf_inputs` (which calls `split_plate_vcf`) must run
-    # BEFORE the aliasing block inside `_run_one_sample`, or (a) would not hold.
+    # (b) step_2 reads those ids back from the split VCF it shipped, unchanged, and
+    # (c) no longer aliases, so TRACE's ids carry the same raw contig name. The alias
+    # half of the original claim (decode before the downgrade) is WITHDRAWN with the
+    # alias wiring (planning/268).
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        plate = td / "p.vcf"
+        plate.write_text(
+            "##fileformat=VCFv4.2\n"
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\n"
+            f"{raw}\t130\t.\tG\tA\t50\t.\t.\tGT:AD\t0:36,4\n"
+        )
+        res = split_plate_vcf(plate, td / "wd", min_allele_fraction=0.05)
+        assert step_2._minor_alleles_from_vcf(Path(res.vcf_paths["s1"])) == got
     tree = ast.parse(Path(step_2.__file__).read_text())
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "_run_one_sample")
-    calls = [
-        (n.lineno, n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
-        for n in ast.walk(fn) if isinstance(n, ast.Call)
-        and (isinstance(n.func, ast.Name) or hasattr(n.func, "attr"))
-    ]
-    names = [c[1] for c in sorted(calls)]
-    assert names.index("_require_vcf_inputs") < names.index("alias_vcf_contigs")
-    assert "_decode_outcome_table" in names
+    names = {n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+             for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and (isinstance(n.func, ast.Name) or hasattr(n.func, "attr"))}
+    assert "_minor_alleles_from_vcf" in names
+    assert not names & {"alias_vcf_contigs", "alias_fasta", "_decode_outcome_table"}
 
 
 # --------------------------------------------------------------------------- #
@@ -1239,11 +1141,17 @@ def test_f10_the_no_wt_seq_branch_RECORDS_before_returning(tmp_path):
     rec = s4._FRAME_AUDIT["s9"]
     assert rec["n_no_wt_seq"] == 2 and rec["n_verified"] == 0
     assert rec["status"] == "no_wt_seq_column"
-    # POSITIVE CONTROL: require_frame_check=True on the same table still REFUSES.
+    # POSITIVE CONTROL: require_frame_check=True on the same table still REFUSES while
+    # any window is scored from read evidence (declares no intended allele)...
     config.reconcile = cfg.WGSReconcileConfig(require_frame_check=True)
     common = import_wgs("pipeline._common")
     with pytest.raises(common.StepIncompleteError, match="no `wt_seq` column"):
-        s4._check_reference_frame(config, record, audit)
+        s4._check_reference_frame(config, record, audit, undeclared={"o1"})
+    # ...and planning/268: records instead when every window declares REF-validated
+    # intended alleles, because TRACE then checks the frame itself.
+    s4._FRAME_AUDIT.clear()
+    assert s4._check_reference_frame(config, record, audit, undeclared=set()) == {}
+    assert s4._FRAME_AUDIT["s9"]["status"] == "no_wt_seq_column"
 
 
 def test_f11b_the_recommended_command_is_window_restricted_and_normalized():
