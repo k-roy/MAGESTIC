@@ -73,6 +73,7 @@ from ._common import (
     cohort_table,
     collect_shards,
     manifest_samples,
+    preflight_provenance,
     publish,
     read_table,
     record_for,
@@ -170,6 +171,7 @@ def integration_table_path(config: WGSConfig) -> Path:
 
 def run_step_3(config: WGSConfig, sample: str | None = None) -> list[Path]:
     """Run both halves. Returns every path written (the CLI prints them all)."""
+    preflight_provenance(STEP)
     if sample is not None:
         return [_run_one_sample(config, sample)]
     return _combine(config)

@@ -64,6 +64,7 @@ __all__ = [
     "ProvenanceError",
     "build_sha",
     "code_state",
+    "preflight_provenance",
     "write_run_provenance",
     "write_step_provenance",
 ]
@@ -118,6 +119,49 @@ def build_sha() -> str:
     return (git_state().get("commit") or "").strip()
 
 
+def _verify_against_checkout(sha: str, state: Mapping[str, Any]) -> tuple[bool, str]:
+    """`(verified, reason)` for a sha taken from `$MAGESTIC_BUILD_SHA` or `BUILD_SHA`.
+
+    planning/284 X-PROV-ENV-SHA: every plate-5031 receipt named `9d654b8`, the sha the
+    driver exported, while candidate trees with uncommitted repairs ran. A sha is
+    verified only when the package sits in a clean checkout whose HEAD IS that sha.
+    A checkout at a DIFFERENT commit raises (`preflight_provenance`), because the
+    receipt would name code that did not run.
+    """
+    head = (state.get("commit") or "").strip()
+    if not head:
+        return False, ("no git checkout holds the package, so the exported sha cannot be "
+                       "checked; magestic_wgs_source_sha256 identifies the code that ran")
+    if not (head.startswith(sha) or sha.startswith(head)):
+        raise ProvenanceError(
+            f"the exported code sha {sha} is not the checkout's HEAD {head} "
+            f"({state.get('repo')}). A receipt would name code that did not run "
+            f"(planning/284 X-PROV-ENV-SHA). Export `git rev-parse HEAD` of the tree that runs, "
+            f"or unset ${BUILD_SHA_ENV}.")
+    if state.get("dirty"):
+        return False, "the checkout at that sha has uncommitted changes (dirty_files)"
+    return True, "clean checkout at that sha"
+
+
+def preflight_provenance(step: str) -> str:
+    """Resolve and check the code sha BEFORE a step computes or publishes anything.
+
+    planning/284 X-S1-PARTIAL-PUBLISH: Stage 1 published a 96-row `bc1_calls.tsv` and
+    only then raised `ProvenanceError`, leaving a complete-looking table with no
+    receipt. Every `run_step_N` calls this first, so an unresolvable or mismatched sha
+    fails before any output exists. Returns the sha.
+    """
+    sha = build_sha()
+    if not sha:
+        raise ProvenanceError(
+            f"{step}: no code sha could be resolved (checked ${BUILD_SHA_ENV}, a "
+            f"{BUILD_SHA_FILE} file beside the package, and git_state()), so its outputs "
+            "could not carry a receipt. Refused before computing (planning/284 "
+            "X-S1-PARTIAL-PUBLISH). Export the sha in the run driver.")
+    code_state()  # raises when an exported sha contradicts the checkout
+    return sha
+
+
 def code_state() -> dict[str, Any]:
     """`git_state()` with the resolved sha merged in, plus how the sha was found.
 
@@ -141,9 +185,17 @@ def code_state() -> dict[str, Any]:
             if os.environ.get(BUILD_SHA_ENV, "").strip()
             else (BUILD_SHA_FILE if _sha_from_file() else "git_state")
         )
+        if source == "git_state":
+            verified, reason = not state.get("dirty"), (
+                "clean checkout" if not state.get("dirty") else
+                "the checkout has uncommitted changes (dirty_files)")
+        else:
+            verified, reason = _verify_against_checkout(sha, state)
         state["checkout_commit"] = state.get("commit")
         state["commit"] = sha
         state["commit_source"] = source
+        state["commit_verified"] = verified
+        state["commit_verification"] = reason
     else:
         state["commit_source"] = "unresolved"
     return state

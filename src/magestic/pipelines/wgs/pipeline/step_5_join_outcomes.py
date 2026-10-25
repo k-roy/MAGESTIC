@@ -38,6 +38,7 @@ from ._common import (
     atomic,
     cohort_table,
     manifest_samples,
+    preflight_provenance,
     read_table,
     write_provenance,
 )
@@ -199,6 +200,7 @@ def run_step_5(config: WGSConfig) -> list[Path]:
     Raises `GateError` when Stage 2 produced no table, because Stage 2 is GATED by
     default (§8) — a join with one side missing is not a result.
     """
+    preflight_provenance(STEP)
     # Imported here, not at module scope: this step makes no TRACE call, and a
     # module-scope import of its two neighbours would make `import step_5` require
     # the `magestic[wgs]` extra for nothing but two file names.

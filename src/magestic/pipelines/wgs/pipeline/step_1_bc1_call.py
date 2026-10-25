@@ -60,6 +60,7 @@ from ._common import (
     cohort_table,
     collect_shards,
     manifest_samples,
+    preflight_provenance,
     record_for,
     require_indexed_bam,
     require_row_count,
@@ -183,6 +184,7 @@ def run_step_1(config: WGSConfig, sample: str | None = None) -> Path:
 
     Returns the path written — the per-sample shard, or the cohort emit table.
     """
+    preflight_provenance(STEP)
     if sample is not None:
         return _run_one_sample(config, sample)
     return _combine(config)

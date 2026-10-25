@@ -445,6 +445,18 @@ def require_row_count(path: Path, observed: int, expected: int, *, label: str) -
     return observed
 
 
+def preflight_provenance(step: str) -> None:
+    """Refuse a step whose outputs could not carry a truthful receipt, before it computes.
+
+    Called first by every `run_step_N`, so a missing or contradicted code sha fails
+    before any table is published (planning/284 X-S1-PARTIAL-PUBLISH, X-PROV-ENV-SHA).
+    Imported lazily for the reason `write_provenance` gives.
+    """
+    from ..qc.provenance import preflight_provenance as _preflight
+
+    _preflight(step)
+
+
 def write_provenance(
     step: str,
     output: Path,

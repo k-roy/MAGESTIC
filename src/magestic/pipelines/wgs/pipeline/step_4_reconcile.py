@@ -58,6 +58,7 @@ from ._common import (
     cohort_table,
     collect_shards,
     manifest_samples,
+    preflight_provenance,
     record_for,
     require_indexed_bam,
     require_row_count,
@@ -199,6 +200,7 @@ def _load_inputs(config: WGSConfig) -> _Inputs:
 
 def run_step_4(config: WGSConfig, sample: str | None = None) -> Path:
     """One sample shard or complete cohort, using the same scoring code path."""
+    preflight_provenance(STEP)
     if sample is not None:
         return _run_one_sample(config, sample)
     return _combine(config)

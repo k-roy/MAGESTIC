@@ -57,6 +57,7 @@ from ._common import (
     cohort_table,
     collect_shards,
     manifest_samples,
+    preflight_provenance,
     publish,
     record_for,
     require_indexed_bam,
@@ -186,6 +187,7 @@ def run_step_2(config: WGSConfig, sample: str | None = None) -> Path:
 
     Raises `GateError` when a selected sample lacks its required gVCF input.
     """
+    preflight_provenance(STEP)
     if sample is not None:
         return _run_one_sample(config, sample)
     return _combine(config)
