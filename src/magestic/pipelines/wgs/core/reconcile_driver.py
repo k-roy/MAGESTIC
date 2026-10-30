@@ -42,7 +42,8 @@ def score_sites(bam: pysam.AlignmentFile, fasta: pysam.FastaFile,
                 oligos: Iterable[str], oligo_windows: dict[str, Any], *,
                 tau_full: float | None = None, tau_wt: float | None = None,
                 min_cov: int | None = None, min_base_qual: int | None = None, min_mapq: int | None = None,
-                designed_positions: Mapping[str, Sequence[int]] | None = None) -> list[SiteCall]:
+                designed_positions: Mapping[str, Sequence[int]] | None = None,
+                allele_evidence: str | None = None) -> list[SiteCall]:
     """Score each candidate window: by its declared alleles when it has them, else by
     its own read evidence.
 
@@ -69,13 +70,16 @@ def score_sites(bam: pysam.AlignmentFile, fasta: pysam.FastaFile,
     tr = _trace.reconcile()
     kwargs = _only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov,
                        min_base_qual=min_base_qual, min_mapq=min_mapq)
+    # planning/328: how TRACE reads an intended allele. None keeps TRACE's default (local realignment to the
+    # site haplotypes since TRACE 9209016); "aligned" reproduces the aligned-base reader for parity.
+    site_kwargs = dict(kwargs, **_only_set(evidence=allele_evidence))
     profile_kwargs = _only_set(min_base_qual=min_base_qual, min_mapq=min_mapq, min_cov=min_cov)
     calls = []
     for site in tr.build_edit_sites(list(oligos), oligo_windows, fasta=fasta):
         profile = edit_profile.window_edit_profile(
             bam, fasta, site.chrom, site.start, site.end, **profile_kwargs)
         if site.intended_alleles:
-            call = tr.score_edit_site(bam, fasta, site, **kwargs)
+            call = tr.score_edit_site(bam, fasta, site, **site_kwargs)
             if call.status == tr.SITE_PARTIAL and any(e.alt_count == 1 for e in call.allele_evidence):
                 call = dataclasses.replace(call, flags=tuple(call.flags) + (edit_profile.FLAG_SINGLE_ALT_READ,))
         else:
@@ -119,7 +123,8 @@ def reconcile_sample(bam: pysam.AlignmentFile, fasta: pysam.FastaFile, sample: s
                      min_support: int | None = None, high_only: bool = True,
                      tau_full: float | None = None, tau_wt: float | None = None,
                      min_cov: int | None = None, min_base_qual: int | None = None, min_mapq: int | None = None,
-                     designed_positions: Mapping[str, Sequence[int]] | None = None) -> CellReconciliation:
+                     designed_positions: Mapping[str, Sequence[int]] | None = None,
+                     allele_evidence: str | None = None) -> CellReconciliation:
     """Score the explicit assignment, or bridge candidates when none is supplied.
 
     Explicit assignments define the intended sites even with no bridge. Barcode
@@ -153,7 +158,7 @@ def reconcile_sample(bam: pysam.AlignmentFile, fasta: pysam.FastaFile, sample: s
         flags.append("NO_GENOME_BC1")
     sites = score_sites(allele_bam if allele_bam is not None else bam, fasta, oligos, oligo_windows, tau_full=tau_full,
                          tau_wt=tau_wt, min_cov=min_cov, min_base_qual=min_base_qual, min_mapq=min_mapq,
-                         designed_positions=designed_positions)
+                         designed_positions=designed_positions, allele_evidence=allele_evidence)
     confidence = bc_confidence(genome_calls)
     if "BRIDGE_ASSIGNMENT_CONFLICT" in flags:
         confidence = "low"

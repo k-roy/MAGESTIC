@@ -280,6 +280,7 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
             oligo_windows=inputs.windows,
             bridge=inputs.bridge,
             min_mapq=getattr(config.reconcile, "min_mapq", None),
+            allele_evidence=getattr(config.reconcile, "allele_evidence", None),
             assigned_oligos=inputs.assignments[sample] if inputs.assignments is not None else None,
             allele_bam=allele_bam,
             read_source_flags=("DONOR_CLEANED_READS" if uses_cleaned_reads(config) else "RAW_DONOR_READS",),

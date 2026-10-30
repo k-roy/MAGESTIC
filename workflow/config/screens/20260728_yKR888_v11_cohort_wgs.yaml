@@ -151,6 +151,10 @@ reconcile:
   # Kevin's D1 for Stage 4 too (planning/284 §8 ruling 2): intended-allele evidence at
   # every MAPQ. MAPQ 255 (unknown) is still always rejected.
   min_mapq: 0
+  # How TRACE reads an intended allele (planning/328). Omit for TRACE's default, local realignment of every
+  # read reaching the designed span (soft clips included) to the wild-type and design haplotypes; "aligned"
+  # reproduces the aligned-base reader, which is blind to a dense design that bwa soft-clips.
+  # allele_evidence: "aligned"
 
 # --- Cluster resources -------------------------------------------------------
 # Scheduling only — never an analysis parameter, and never rendered into a rule's

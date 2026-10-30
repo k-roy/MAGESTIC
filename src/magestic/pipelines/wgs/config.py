@@ -546,6 +546,12 @@ class WGSReconcileConfig:
     min_mapq: int | None = None
     """Optional intended-allele mapping-quality floor; TRACE owns default 20."""
 
+    allele_evidence: str | None = None
+    """How TRACE reads an intended allele (planning/328). None keeps TRACE's default: local realignment of
+    every read reaching the designed span, soft clips included, to the site's wild-type and design
+    haplotypes. "aligned" reads only the genome-wide alignment's aligned bases, which is blind to a dense
+    design that bwa soft-clips; it is kept to reproduce earlier runs."""
+
     read_source: str = "auto"
     """Allele evidence: auto uses Stage 3 cleaning when its inputs are configured;
     raw preserves original alignments; donor_cleaned requires completed Half B.
@@ -880,6 +886,8 @@ def load_config(
     recon_d = dict(data.get("reconcile", {}))
     if recon_d.get('read_source', 'auto') not in ('auto', 'raw', 'donor_cleaned'):
         raise ValueError('reconcile.read_source must be auto, raw, or donor_cleaned')
+    if recon_d.get('allele_evidence') not in (None, 'realign', 'aligned'):
+        raise ValueError('reconcile.allele_evidence must be realign or aligned')
     value = recon_d.get('min_mapq')
     if value is not None and (type(value) is not int or not 0 <= value <= 254):
         raise ValueError('reconcile.min_mapq must be an integer from 0 to 254')
