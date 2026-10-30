@@ -81,7 +81,7 @@ redi = [
 wgs = [
     "pysam>=0.21",
     "rapidfuzz>=3.0",
-    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@a0e8ec097622c3e96c10c4298f296fb54e312b81",
+    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@427926016798672e9b7d66ee76eb84d491cb81a3",
 ]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [
