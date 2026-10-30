@@ -109,7 +109,7 @@ def test_assignment_and_counts_survive_actual_stage(fixture_factory):
     row=read_rows(s4.run_step_4(config))[0]
     assert (row['sample'],row['label'],row['n_full'],row['confidence'])==('well_A1','SINGLE_EDIT','1','high')
     assert json.loads(row['allele_counts'])==[{'oligo':'oligo_1','chrom':'chrII','pos':301,'ref':'A','alt':'C',
-        'alt_count':4,'ref_count':0,'other_count':0,'depth':4,'low_mapq_reads':0,'unknown_mapq_reads':0}]
+        'alt_count':4,'ref_count':0,'other_count':0,'depth':4,'low_mapq_reads':0,'unknown_mapq_reads':0,'unmapped_at_locus':0}]
 
 
 @pytest.mark.parametrize('seqs,label,status,depth,alts', [(['C'+'A'*19]*4,'SINGLE_EDIT','full',4,4),

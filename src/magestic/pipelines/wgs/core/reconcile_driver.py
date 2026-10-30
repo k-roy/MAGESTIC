@@ -71,7 +71,7 @@ def score_sites(bam: pysam.AlignmentFile, fasta: pysam.FastaFile,
     kwargs = _only_set(tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov,
                        min_base_qual=min_base_qual, min_mapq=min_mapq)
     # planning/328: how TRACE reads an intended allele. None keeps TRACE's default (local realignment to the
-    # site haplotypes since TRACE 9209016); "aligned" reproduces the aligned-base reader for parity.
+    # site haplotypes since TRACE 6f5e439); "aligned" reproduces the aligned-base reader for parity.
     site_kwargs = dict(kwargs, **_only_set(evidence=allele_evidence))
     profile_kwargs = _only_set(min_base_qual=min_base_qual, min_mapq=min_mapq, min_cov=min_cov)
     calls = []
