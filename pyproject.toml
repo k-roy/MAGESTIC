@@ -73,13 +73,15 @@ redi = [
 # (k-roy/TRACE PR #4, planning/268): GitHub's June modules + the September reconcile line +
 # the 205 lane's repairs, the only TRACE that defines `score_edit_site` / `bc_confidence_from`
 # / `build_edit_sites(fasta=)`, which Stage 4 calls, plus Kevin's 2026-10-25 depth-conditional
-# floor (`min_alt_reads` / `classify_counts`, planning/284 section 8). It resolves for pip from that pushed ref
+# floor (`min_alt_reads` / `classify_counts`, planning/284 section 8). Bumped 2026-10-30 to the head of the
+# pushed branch `feat/328-local-realign` (k-roy/TRACE PR #5, SGTC planning/328): local realignment of the reads
+# at a localized edit, the Half B dovetail fix and the Stage 2 BP_RESOLUTION fix. It resolves for pip from that pushed ref
 # before the PR merges; merge the PR with a merge commit (not squash or rebase) so the sha
 # stays on `main`. Never pin a sha that exists only in a local clone: it cannot resolve.
 wgs = [
     "pysam>=0.21",
     "rapidfuzz>=3.0",
-    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@12b35c533688e2c0b9c62dafa3903dd098891d6e",
+    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@2c4b276ebf68696badd3f267b5782b9c6f3769f4",
 ]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [
