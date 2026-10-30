@@ -597,6 +597,21 @@ class WGSReconcileConfig:
     min_mapq: int | None = None
     """Optional intended-allele mapping-quality floor; TRACE owns default 20."""
 
+    calling: str = "floors"
+    """How Stage 4 calls a site (planning/328). `floors` keeps TRACE's per-allele count floors. `v7` adds the
+    haplotype-level calls Kevin R. Roy ruled on 2026-10-30 (TRACE `target_calls`): read-pair floors from
+    `contamination_rate`, an incomplete edit for a read pair that is part design and part wild type, and a
+    target-level call (CE, CE_target, helpers_only, IE, MIX, NE, CE_unconfirmed_target, UN) that judges the
+    target codon apart from its synonymous helpers. `v7` needs `cds_table` and window columns
+    `gene`, `target_codon_start`, `target_codon_end`, and reads alleles by realignment."""
+
+    contamination_rate: float | None = None
+    """Per-read-pair chance of another genome for `v7`; None keeps TRACE's 0.054 (planning/328u)."""
+
+    cds_table: Path | None = None
+    """`gene chrom start end strand` per target gene, single-exon CDS in the SAMPLE reference's coordinates
+    (1-based, inclusive). TRACE verifies each translates M...* before using it."""
+
     allele_evidence: str | None = None
     """How TRACE reads an intended allele (planning/328). None keeps TRACE's default: local realignment of
     every read reaching the designed span, soft clips included, to the site's wild-type and design
@@ -962,6 +977,17 @@ def load_config(
         raise ValueError('reconcile.read_source must be auto, raw, or donor_cleaned')
     if recon_d.get('allele_evidence') not in (None, 'realign', 'aligned'):
         raise ValueError('reconcile.allele_evidence must be realign or aligned')
+    if recon_d.get('calling', 'floors') not in ('floors', 'v7'):
+        raise ValueError('reconcile.calling must be floors or v7')
+    if recon_d.get('calling') == 'v7':
+        if recon_d.get('allele_evidence') == 'aligned':
+            raise ValueError('reconcile.calling v7 reads alleles by realignment; drop allele_evidence: aligned')
+        if not recon_d.get('cds_table'):
+            raise ValueError('reconcile.calling v7 needs reconcile.cds_table')
+    rate = recon_d.get('contamination_rate')
+    if rate is not None and (isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 < rate < 1):
+        raise ValueError('reconcile.contamination_rate must lie in (0, 1)')
+    recon_d["cds_table"] = _under_root_optional(recon_d.get("cds_table"), project_root)
     value = recon_d.get('min_mapq')
     if value is not None and (type(value) is not int or not 0 <= value <= 254):
         raise ValueError('reconcile.min_mapq must be an integer from 0 to 254')

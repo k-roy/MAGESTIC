@@ -150,6 +150,7 @@ class _Inputs:
     assignments: dict[str, list[str]] | None
     bridge: Any
     audit: WindowAudit | None = None
+    targets: dict | None = None
 
 
 def _load_inputs(config: WGSConfig) -> _Inputs:
@@ -195,7 +196,32 @@ def _load_inputs(config: WGSConfig) -> _Inputs:
         expected = {r.sample for r in manifest_samples(config)}
         if set(assignments) != expected:
             raise ValueError(f"{path}: assignment samples do not match manifest; missing={sorted(expected-set(assignments))}, unexpected={sorted(set(assignments)-expected)}")
-    return _Inputs(windows, assignments, step_1_bc1_call.load_bridge(config), audit)
+    return _Inputs(windows, assignments, step_1_bc1_call.load_bridge(config), audit, _load_targets(config))
+
+
+def _load_targets(config: WGSConfig) -> dict | None:
+    """For `calling: v7`: oligo -> TRACE `TargetSpec` from the window table's `gene`, `target_codon_start`,
+    `target_codon_end` columns and `reconcile.cds_table`. Every missing piece is refused, never skipped."""
+    if config.reconcile.calling != "v7":
+        return None
+    from trace_crispr.wgs import target_calls as tc
+    cds = {}
+    with open(config.reconcile.cds_table, newline="") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            cds[row["gene"]] = tc.CDS(row["chrom"], int(row["start"]), int(row["end"]), row["strand"])
+    targets = {}
+    with open(config.reconcile.oligo_windows, newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        need = {"gene", "target_codon_start", "target_codon_end", config.columns.oligo_col}
+        if not reader.fieldnames or not need <= set(reader.fieldnames):
+            raise StepIncompleteError(f"step_4: calling v7 needs window columns {sorted(need)}")
+        for row in reader:
+            gene = row["gene"]
+            if gene not in cds:
+                raise StepIncompleteError(f"step_4: gene {gene!r} is not in {config.reconcile.cds_table}")
+            targets[row[config.columns.oligo_col]] = tc.TargetSpec(
+                cds[gene], int(row["target_codon_start"]), int(row["target_codon_end"]))
+    return targets
 
 
 def run_step_4(config: WGSConfig, sample: str | None = None) -> Path:
@@ -281,6 +307,9 @@ def _run_one_sample(config: WGSConfig, sample: str, *, inputs: _Inputs | None = 
             bridge=inputs.bridge,
             min_mapq=getattr(config.reconcile, "min_mapq", None),
             allele_evidence=getattr(config.reconcile, "allele_evidence", None),
+            calling=None if config.reconcile.calling == "floors" else config.reconcile.calling,
+            targets=inputs.targets,
+            contamination_rate=config.reconcile.contamination_rate,
             assigned_oligos=inputs.assignments[sample] if inputs.assignments is not None else None,
             allele_bam=allele_bam,
             read_source_flags=("DONOR_CLEANED_READS" if uses_cleaned_reads(config) else "RAW_DONOR_READS",),

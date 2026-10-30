@@ -371,3 +371,40 @@ def test_contained_policy_config_is_refused_when_incomplete(fixture_factory, sv,
     path = f['root'] / 'bad.yaml'; path.write_text(yaml.safe_dump(data))
     with pytest.raises(ValueError, match=message):
         load_config(path)
+
+
+# planning/328 v7 (Kevin, 2026-10-30): Stage 4 haplotype-level calling is opt-in and refuses an incomplete setup.
+@pytest.mark.parametrize('recon,message', [
+    ({'calling': 'sometimes'}, 'floors or v7'),
+    ({'calling': 'v7'}, 'cds_table'),
+    ({'calling': 'v7', 'cds_table': 'cds.tsv', 'allele_evidence': 'aligned'}, 'realignment'),
+    ({'contamination_rate': 1.5}, r'\(0, 1\)'),
+])
+def test_v7_calling_config_is_refused_when_incomplete(fixture_factory, recon, message):
+    from magestic.pipelines.wgs.config import load_config
+    f = fixture_factory(records=[])
+    data = yaml.safe_load(f['config_path'].read_text()); data['reconcile'].update(recon)
+    path = f['root'] / 'bad_v7.yaml'; path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match=message):
+        load_config(path)
+
+
+def test_v7_driver_refuses_a_window_without_a_target(fixture_factory):
+    from magestic.pipelines.wgs.core import reconcile_driver as rd
+    from trace_crispr.wgs.reconcile import EditSite, IntendedAllele
+    f = fixture_factory(records=[])
+    site_windows = {'oligo_1': None}
+    class _TR:   # only build_edit_sites is reached before the refusal
+        SITE_PARTIAL = 'partial'
+        @staticmethod
+        def build_edit_sites(oligos, windows, fasta=None):
+            return [EditSite('chrII', 301, 310, 'oligo_1', (IntendedAllele(301, 'A', 'C'),))]
+    import magestic.pipelines.wgs.core.reconcile_driver as mod
+    real = mod._trace.reconcile
+    mod._trace.reconcile = lambda: _TR
+    try:
+        with pysam.AlignmentFile(str(f['bam'])) as bam, pysam.FastaFile(str(f['fa'])) as fa:
+            with pytest.raises(ValueError, match='target codon'):
+                rd.score_sites(bam, fa, ['oligo_1'], site_windows, calling='v7', targets={})
+    finally:
+        mod._trace.reconcile = real
