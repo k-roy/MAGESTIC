@@ -1286,8 +1286,9 @@ class TestDefect7SvRefusal:
         old = ("sample", "upstream_count", "downstream_count", "total_count",
                "n_integrated_contigs", "half_b_status", "read_count_mid_point",
                "frags_genome", "frags_plasmid", "frags_chimeric")
-        # planning/268 adds the 205 lane's `half_a_status`: 13 columns.
-        assert len(old) == 10 and len(SHARD_COLUMNS) == 13
+        # planning/268 adds the 205 lane's `half_a_status`: 13 columns; planning/328 appends the six
+        # contained-fragment policy columns: 19.
+        assert len(old) == 10 and len(SHARD_COLUMNS) == 19
         stale = tmp_path / "S1.sv_plasmid.tsv"
         stale.write_text("\t".join(old) + "\n" + "\t".join(["x"] * 10) + "\n")
         with pytest.raises(StepIncompleteError) as exc:
