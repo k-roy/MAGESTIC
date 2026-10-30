@@ -458,6 +458,23 @@ class WGSDonorPrecallConfig:
         return AXIS_ENABLED
 
 
+CONTAINED_DISCARD, CONTAINED_AUTO, CONTAINED_KEEP = "discard", "auto", "keep"
+
+
+def parse_interval(text: str, where: str = "interval") -> tuple[str, int, int]:
+    """`contig:start-end` (1-based, inclusive) -> `(contig, start, end)`, refusing anything else."""
+    if not isinstance(text, str) or ":" not in text:
+        raise ValueError(f"{where}: {text!r} is not contig:start-end")
+    contig, _, span = text.rpartition(":")
+    try:
+        start, end = (int(x) for x in span.split("-"))
+    except ValueError:
+        raise ValueError(f"{where}: {text!r} is not contig:start-end") from None
+    if not contig or start < 1 or end < start:
+        raise ValueError(f"{where}: {text!r} is not a valid 1-based interval")
+    return contig, start, end
+
+
 @dataclass
 class WGSSvPlasmidConfig:
     """Stage 3 — plasmid integration and donor-read cleaning (`trace_crispr.wgs.sv_plasmid`)."""
@@ -500,6 +517,40 @@ class WGSSvPlasmidConfig:
     which is what TRACE's own docstring says production should do. Setting an integer
     pins the `1129` parity literal instead and should only be done to reproduce a legacy
     run."""
+
+    contained_fragments: str = CONTAINED_DISCARD
+    """What Half B does with a fragment lying wholly inside the donor (it cannot be told from
+    a plasmid donor template). Kevin R. Roy, 2026-10-30: "count contained read pairs when the
+    backbone is empty ... a per clone/per dataset option for trace".
+
+    * `"discard"` (default): the span rule; only fragments reaching the chromosome count.
+    * `"auto"`: per sample, keep them when TRACE's `plasmids_purged` passes on that sample's
+      measured plasmid load (no donor-to-backbone pair, copy-number upper limit at or below
+      `purged_max_copies`); otherwise discard.
+    * `"keep"`: the dataset is declared purged; keep them in every sample except one that shows
+      plasmid (a donor-to-backbone pair, or copies above `purged_max_copies`), which discards.
+
+    `auto` and `keep` require `donor_plasmid_contigs` and an explicit `plasmid_mask`."""
+
+    donor_plasmid_contigs: list[str] = field(default_factory=list)
+    """Plasmid contigs that CARRY the donor, the only ones that can make a contained fragment
+    (e.g. the guide-donor plasmid, not the nuclease plasmid)."""
+
+    plasmid_mask: list[str] | None = None
+    """`contig:start-end` intervals (1-based, inclusive) excluded from the backbone count, such as
+    the bc1 cassette that amplicon product maps to without any plasmid present. Must be stated
+    for `auto`/`keep`, even as `[]`, so an unmasked cassette is a decision, not an omission."""
+
+    purged_max_copies: float = 0.05
+    """Copy-number ceiling (per genome) for a purge. 0.05 bounds the template share of contained
+    fragments near 5%, the foreign-genome share measured at the bc1 locus (planning/328u)."""
+
+    nuclear_contigs: list[str] | None = None
+    """Contigs for nuclear depth; `None` lets TRACE take every `chr<roman>` contig."""
+
+    plasmid_mates_are_template: bool = False
+    """Opt-in: a donor read whose mate maps anywhere on `donor_plasmid_contigs` counts as plasmid
+    template (contained) or chimeric (past the donor), as a REDI-cassette mate does."""
 
 
 @dataclass
@@ -881,6 +932,29 @@ def load_config(
         value = sv_d.get(key)
         if value is not None and (type(value) is not int or value < lower):
             raise ValueError(f'sv_plasmid.{key} must be an integer >= {lower}')
+    mode = sv_d.get('contained_fragments', CONTAINED_DISCARD)
+    if mode not in (CONTAINED_DISCARD, CONTAINED_AUTO, CONTAINED_KEEP):
+        raise ValueError('sv_plasmid.contained_fragments must be discard, auto or keep')
+    contigs = sv_d.get('donor_plasmid_contigs', [])
+    if not isinstance(contigs, list) or not all(isinstance(c, str) and c for c in contigs):
+        raise ValueError('sv_plasmid.donor_plasmid_contigs must be a list of contig names')
+    if sv_d.get('plasmid_mask') is not None:
+        if not isinstance(sv_d['plasmid_mask'], list):
+            raise ValueError('sv_plasmid.plasmid_mask must be a list of contig:start-end intervals')
+        for item in sv_d['plasmid_mask']:
+            parse_interval(item, 'sv_plasmid.plasmid_mask')
+    if mode != CONTAINED_DISCARD:
+        if sv_d.get('dup_mode', 'standard') != 'standard':
+            raise ValueError('sv_plasmid.contained_fragments auto/keep is a standard-mode policy')
+        if not contigs:
+            raise ValueError('sv_plasmid.contained_fragments auto/keep needs donor_plasmid_contigs')
+        if sv_d.get('plasmid_mask') is None:
+            raise ValueError('sv_plasmid.contained_fragments auto/keep needs an explicit plasmid_mask (use [] for none)')
+    if sv_d.get('plasmid_mates_are_template') and not contigs:
+        raise ValueError('sv_plasmid.plasmid_mates_are_template needs donor_plasmid_contigs')
+    cap = sv_d.get('purged_max_copies', 0.05)
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not cap > 0:
+        raise ValueError('sv_plasmid.purged_max_copies must be a positive number')
     sv_plasmid = WGSSvPlasmidConfig(**sv_d)
 
     recon_d = dict(data.get("reconcile", {}))

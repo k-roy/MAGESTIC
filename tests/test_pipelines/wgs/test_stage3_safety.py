@@ -205,7 +205,7 @@ def test_same_sample_concurrent_stage_calls_compute_once(fixture_factory, monkey
         state['calls'] += 1
         (first_inside if state['calls'] == 1 else second_inside).set()
         assert release.wait(3), 'test did not release the held computation'
-        return s3.HALF_B_NO_ASSIGNMENT, ['', '', '', '']
+        return s3.HALF_B_NO_ASSIGNMENT, ['', '', '', ''], ['', '', '', '', '', '']
     monkeypatch.setattr(s3, '_run_half_b', half_b)
     monkeypatch.setattr(s3, 'cache_key', lambda *a, **kw: {'inputs': [], 'test_identity': 'same_sample'})
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -295,3 +295,79 @@ def test_stage_and_standalone_cleaner_share_final_output_lock(fixture_factory, m
     assert state['calls'] == 2
     with pysam.AlignmentFile(args['out_bam']) as bam:
         assert bam.check_index()
+
+
+# planning/328 (Kevin, 2026-10-30): "count contained read pairs when the backbone is empty ... a per
+# clone/per dataset option". The contained fragment is 301..310, inside the donor window 301..310.
+CONTAINED = dict(name='template', contig='chrII', start=300, seq='A' * 10, cigar='10M', mate_start=300, tlen=10)
+GENOMIC = dict(name='genome', contig='chrII', start=295, seq='A' * 20, cigar='20M', mate_start=350, tlen=75)
+
+
+def _deep(n=3000):
+    # nuclear depth away from the donor and the barcode locus, so the plasmid bound is informative
+    return [dict(name=f'n{i}', contig='chrII', start=i % 60, seq='A' * 20, cigar='20M', mate_start=400, tlen=420)
+            for i in range(n)]
+
+
+def _policy_run(fixture_factory, records, **sv):
+    f = fixture_factory(records=records)
+    assignment = f['root'] / 'assign.tsv'; assignment.write_text('sample\toligo_name\nwell_A1\toligo_1\n')
+    blacklist = f['root'] / 'blacklist.tsv'; blacklist.write_text('plasmid_demo\t1\t500\n')
+    cfg = replace(f['config'], sv_plasmid=replace(
+        f['config'].sv_plasmid, samtools=SAMTOOLS, blacklist=blacklist, blacklist_reference=f['fa'],
+        donor_plasmid_contigs=['plasmid_demo'], plasmid_mask=['plasmid_demo:91-130'], nuclear_contigs=['chrII'], **sv),
+        reconcile=replace(f['config'].reconcile, oligo_assignments=assignment))
+    row = read_rows(s3.run_step_3(cfg)[0])[0]
+    with pysam.AlignmentFile(str(s3.cleaned_bam_path(cfg, 'well_A1'))) as bam:
+        kept = sorted({r.query_name for r in bam if not r.query_name.startswith('n')})
+    return row, kept
+
+
+def test_contained_default_is_the_span_rule(fixture_factory):
+    row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC] + _deep())
+    assert row['contained_policy'] == 'discard' and row['frags_contained_kept'] == '0'
+    assert row['frags_plasmid'] == '1' and kept == ['genome']
+
+
+def test_contained_auto_keeps_when_the_backbone_is_provably_empty(fixture_factory):
+    row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC] + _deep(), contained_fragments='auto')
+    assert row['contained_policy'] == 'keep_purged'
+    assert row['plasmid_backbone_reads'] == '0' and row['donor_backbone_pairs'] == '0'
+    assert float(row['plasmid_copies_upper95']) < 0.05
+    assert row['frags_contained_kept'] == '1' and row['frags_plasmid'] == '0' and row['frags_genome'] == '1'
+    assert kept == ['genome', 'template']
+
+
+def test_contained_auto_discards_when_too_shallow_to_bound(fixture_factory):
+    row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC], contained_fragments='auto')
+    assert row['contained_policy'] == 'discard_not_purged' and kept == ['genome']
+
+
+def test_contained_keep_still_discards_a_sample_that_shows_plasmid(fixture_factory):
+    pair = dict(name='donor_mate', contig='chrII', start=301, seq='A' * 8, cigar='8M', flag=97,
+                mate='plasmid_demo', mate_start=300, tlen=0)
+    row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC, pair] + _deep(), contained_fragments='keep')
+    assert row['contained_policy'] == 'discard_plasmid_seen' and row['donor_backbone_pairs'] == '1'
+    assert 'template' not in kept
+
+
+def test_contained_keep_is_honoured_without_plasmid(fixture_factory):
+    row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC], contained_fragments='keep')
+    assert row['contained_policy'] == 'keep_declared' and kept == ['genome', 'template']
+
+
+@pytest.mark.parametrize('sv,message', [
+    ({'contained_fragments': 'sometimes'}, 'discard, auto or keep'),
+    ({'contained_fragments': 'auto', 'plasmid_mask': []}, 'donor_plasmid_contigs'),
+    ({'contained_fragments': 'auto', 'donor_plasmid_contigs': ['p']}, 'explicit plasmid_mask'),
+    ({'contained_fragments': 'keep', 'donor_plasmid_contigs': ['p'], 'plasmid_mask': [], 'dup_mode': 'parity'}, 'standard-mode'),
+    ({'contained_fragments': 'auto', 'donor_plasmid_contigs': ['p'], 'plasmid_mask': ['p:10']}, 'contig:start-end'),
+    ({'purged_max_copies': 0}, 'positive number'),
+])
+def test_contained_policy_config_is_refused_when_incomplete(fixture_factory, sv, message):
+    from magestic.pipelines.wgs.config import load_config
+    f = fixture_factory(records=[])
+    data = yaml.safe_load(f['config_path'].read_text()); data['sv_plasmid'] = sv
+    path = f['root'] / 'bad.yaml'; path.write_text(yaml.safe_dump(data))
+    with pytest.raises(ValueError, match=message):
+        load_config(path)

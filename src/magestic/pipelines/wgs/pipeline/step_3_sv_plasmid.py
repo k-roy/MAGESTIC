@@ -50,7 +50,14 @@ from pathlib import Path
 import pysam
 from trace_crispr.wgs import sv_plasmid
 
-from ..config import SV_PLASMID_SUBDIR, WGSConfig
+from ..config import (
+    CONTAINED_AUTO,
+    CONTAINED_DISCARD,
+    CONTAINED_KEEP,
+    SV_PLASMID_SUBDIR,
+    WGSConfig,
+    parse_interval,
+)
 from ..core.blacklist_adapter import (
     reference_contig_lengths,
     require_blacklist_applicable,
@@ -122,6 +129,14 @@ SHARD_COLUMNS = (
     "frags_genome",
     "frags_plasmid",
     "frags_chimeric",
+    # planning/328 (Kevin, 2026-10-30): the contained-fragment policy applied to this sample
+    # and the plasmid-load evidence behind it. Appended, so every earlier index is unchanged.
+    "contained_policy",
+    "plasmid_backbone_reads",
+    "plasmid_expected_reads_per_copy",
+    "plasmid_copies_upper95",
+    "donor_backbone_pairs",
+    "frags_contained_kept",
 )
 
 #: The only SV status this pipeline can honestly emit. See `core/sv_status.py` for
@@ -133,6 +148,13 @@ HALF_B_NO_ASSIGNMENT = "not_run_no_oligo_assignment"
 HALF_B_WINDOW_UNKNOWN = "not_run_oligo_window_unknown"
 HALF_B_RUN = "run"
 HALF_A_NO_CONTIGS = "not_run_no_integrated_contigs"
+
+#: `contained_policy` values: what Half B did with donor-contained fragments, and why.
+POLICY_DISCARD = "discard"                        # the span rule (configured)
+POLICY_KEEP_PURGED = "keep_purged"                # auto: this sample passed plasmids_purged
+POLICY_DISCARD_NOT_PURGED = "discard_not_purged"  # auto: this sample failed plasmids_purged
+POLICY_KEEP_DECLARED = "keep_declared"            # keep: dataset declared purged, no plasmid seen here
+POLICY_DISCARD_PLASMID_SEEN = "discard_plasmid_seen"  # keep: but this sample shows plasmid
 
 
 def shard_path(config: WGSConfig, sample: str) -> Path:
@@ -228,7 +250,7 @@ def _run_one_sample_locked(config: WGSConfig, sample: str, *, record: WGSSample 
            if getattr(config.sv_plasmid, k) is not None},
     )
     half_a_status = "run" if measure.measured else HALF_A_NO_CONTIGS
-    status, anno = _run_half_b(config, record)
+    status, anno, contained = _run_half_b(config, record)
     blank = ""
 
     # 🔴 NN 255 F2: the refusal was applied to the provenance MAPPING only, never to a
@@ -259,6 +281,7 @@ def _run_one_sample_locked(config: WGSConfig, sample: str, *, record: WGSSample 
                     half_a_status,
                     status,
                     *anno,
+                    *contained,
                 ]
             ],
         )
@@ -374,15 +397,55 @@ def _donor_sequences(config: WGSConfig) -> dict[str, str]:
     return dict(load_donor_sequences(config))
 
 
-def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
-    """Clean donor reads for one sample. Returns `(status, the .anno fields)`."""
+def _contained_policy(config: WGSConfig, record: WGSSample, window: tuple[str, int, int]) -> tuple[bool, list[str]]:
+    """Decide whether Half B keeps donor-contained fragments for this sample (planning/328).
+
+    Kevin R. Roy, 2026-10-30: "count contained read pairs when the backbone is empty. This is safe when we
+    know that we have removed plasmids, so it needs to be a per clone/per dataset option for trace".
+    Returns `(keep_contained, [policy, backbone reads, expected reads per copy, copies upper limit,
+    donor-backbone pairs])`; `frags_contained_kept` is appended by the caller after cleaning.
+    """
+    sv = config.sv_plasmid
+    if sv.contained_fragments == CONTAINED_DISCARD:
+        return False, [POLICY_DISCARD, "", "", "", ""]
+    load = sv_plasmid.plasmid_load(
+        str(record.bam), sv.donor_plasmid_contigs,
+        mask=[parse_interval(m, "sv_plasmid.plasmid_mask") for m in (sv.plasmid_mask or [])],
+        donor_windows=[window],
+        nuclear_contigs=sv.nuclear_contigs,
+        flexible_bases=sv.flexible_bases,
+    )
+    evidence = [str(load.plasmid_reads), f"{load.expected_reads_per_copy:.3f}",
+                f"{load.copies_upper95:.6g}", str(load.donor_backbone_pairs)]
+    if sv.contained_fragments == CONTAINED_AUTO:
+        keep = sv_plasmid.plasmids_purged(load, max_copies=sv.purged_max_copies)
+        return keep, [POLICY_KEEP_PURGED if keep else POLICY_DISCARD_NOT_PURGED, *evidence]
+    if sv.contained_fragments == CONTAINED_KEEP:
+        seen = load.donor_backbone_pairs > 0 or load.copies > sv.purged_max_copies
+        if seen:
+            logger.warning(
+                "step_3: %s shows plasmid (%d donor-backbone pair(s), %.3g copies per genome) although the "
+                "dataset is declared purged; its contained fragments are discarded",
+                record.sample, load.donor_backbone_pairs, load.copies,
+            )
+        return not seen, [POLICY_DISCARD_PLASMID_SEEN if seen else POLICY_KEEP_DECLARED, *evidence]
+    raise StepIncompleteError(f"step_3: unknown contained_fragments policy {sv.contained_fragments!r}")
+
+
+def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str], list[str]]:
+    """Clean donor reads for one sample.
+
+    Returns `(status, the .anno fields, the contained-policy fields)`, the last matching the six
+    `contained_policy` .. `frags_contained_kept` shard columns.
+    """
     blank = ["", "", "", ""]
+    blank_policy = ["", "", "", "", "", ""]
     if config.reconcile.oligo_windows is None:
-        return HALF_B_NO_WINDOW_TABLE, blank
+        return HALF_B_NO_WINDOW_TABLE, blank, blank_policy
 
     oligo = _assigned_oligo(config, record.sample)
     if oligo is None:
-        return HALF_B_NO_ASSIGNMENT, blank
+        return HALF_B_NO_ASSIGNMENT, blank, blank_policy
     windows = _donor_windows(config)
     window = windows.get(oligo)
     if window is None:
@@ -390,7 +453,7 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
         # here is an oligo genuinely absent from the table, never a dropped row.
         logger.warning("step_3: %s oligo %s has no window in %s",
                        record.sample, oligo, config.reconcile.oligo_windows)
-        return HALF_B_WINDOW_UNKNOWN, blank
+        return HALF_B_WINDOW_UNKNOWN, blank, blank_policy
 
     blacklist = config.sv_plasmid.blacklist
     if blacklist is None or not Path(blacklist).exists():
@@ -414,6 +477,12 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
     final_bam = cleaned_bam_path(config, record.sample)
     final_index = cleaned_bam_index_path(config, record.sample, record=record)
     final_bam.parent.mkdir(parents=True, exist_ok=True)
+    keep_contained, policy = _contained_policy(config, record, window)
+    extra = {}
+    if keep_contained:
+        extra["keep_contained"] = True
+    if config.sv_plasmid.plasmid_mates_are_template:
+        extra["plasmid_contigs"] = list(config.sv_plasmid.donor_plasmid_contigs)
     with tempfile.TemporaryDirectory(prefix=f".{record.sample}.cleaned_", dir=final_bam.parent) as temp:
         staged = Path(temp) / "cleaned.bam"
         result = sv_plasmid.clean_donor_reads(
@@ -424,6 +493,7 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
             reference_path=str(record.reference),
             blacklist_reference=str(config.sv_plasmid.blacklist_reference) if config.sv_plasmid.blacklist_reference is not None else None,
             **({"min_mapq": config.sv_plasmid.min_mapq} if config.sv_plasmid.min_mapq is not None else {}),
+            **extra,
         )
         anno = result.anno_row().strip("\n").split("\t")
         expected = len(sv_plasmid.ANNO_HEADER.split("\t"))
@@ -438,7 +508,7 @@ def _run_half_b(config: WGSConfig, record: WGSSample) -> tuple[str, list[str]]:
         publish(staged, final_bam)
         publish(Path(str(staged) + final_index.suffix), final_index)
         publish(Path(str(staged) + ".target_filtering.anno"), Path(str(final_bam) + ".target_filtering.anno"))
-    return HALF_B_RUN, anno
+    return HALF_B_RUN, anno, [*policy, str(result.frags_contained_kept) if keep_contained else "0"]
 
 
 _WINDOWS: dict[tuple, dict[str, tuple[str, int, int]]] = {}
@@ -540,6 +610,9 @@ def _combine(config: WGSConfig) -> list[Path]:
         )
     status_idx = SHARD_COLUMNS.index("half_b_status")
     half_b_run = sum(1 for row in rows if row.split("\t")[status_idx] == HALF_B_RUN)
+    contained = _pooled_contained_evidence(rows)
+    if contained:
+        logger.info("step_3: contained fragments %s", contained)
     logger.info(
         "step_3: %d samples; %d MEASURED for integration, %d NOT MEASURED (no "
         "integrated_plasmid_ contig); %d of the measured with >=1 junction-spanning "
@@ -572,6 +645,11 @@ def _combine(config: WGSConfig) -> list[Path]:
                 if config.sv_plasmid.junction_distance is None
                 else int(config.sv_plasmid.junction_distance)
             ),
+            "contained_fragments": config.sv_plasmid.contained_fragments,
+            "donor_plasmid_contigs": list(config.sv_plasmid.donor_plasmid_contigs),
+            "plasmid_mask": list(config.sv_plasmid.plasmid_mask or []),
+            "purged_max_copies": config.sv_plasmid.purged_max_copies,
+            "plasmid_mates_are_template": config.sv_plasmid.plasmid_mates_are_template,
         },
         counts=_provenance_counts(
             {
@@ -582,10 +660,42 @@ def _combine(config: WGSConfig) -> list[Path]:
                 "half_a_run": sum(row["half_a_status"] == "run" for row in summary),
                 "half_b_run": half_b_run,
                 "sv_status": SV_STATUS_VALUE,
+                **({"contained_fragments": contained} if contained else {}),
             }
         ),
     )
     return [out, integration_out]
+
+
+def _pooled_contained_evidence(rows: Sequence[str]) -> dict[str, object]:
+    """Cohort view of the contained-fragment policy: samples per policy and the POOLED plasmid bound.
+
+    The pooled limit (all backbone reads over all expected reads per copy) is the evidence a dataset-level
+    `keep` should rest on: one shallow clone cannot bound its own copy number, a cohort can.
+    """
+    idx = {name: i for i, name in enumerate(SHARD_COLUMNS)}
+    policies: dict[str, int] = {}
+    reads = 0
+    expected = 0.0
+    kept = 0
+    for row in rows:
+        f = row.split("\t")
+        policy = f[idx["contained_policy"]]
+        if not policy:
+            continue
+        policies[policy] = policies.get(policy, 0) + 1
+        if f[idx["plasmid_backbone_reads"]]:
+            reads += int(f[idx["plasmid_backbone_reads"]])
+            expected += float(f[idx["plasmid_expected_reads_per_copy"]])
+        if f[idx["frags_contained_kept"]]:
+            kept += int(f[idx["frags_contained_kept"]])
+    if not policies:
+        return {}
+    out: dict[str, object] = {"samples_by_policy": policies, "fragments_kept": kept}
+    if expected:
+        out.update({"pooled_backbone_reads": reads,
+                    "pooled_copies_upper95": sv_plasmid.poisson_upper(reads) / expected})
+    return out
 
 
 def _provenance_counts(counts: dict[str, object]) -> dict[str, object]:
