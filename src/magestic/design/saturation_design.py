@@ -110,6 +110,23 @@ def _find_orf_pams(
     plus_strand_pams: dict = {}
     minus_strand_pams: dict = {}
 
+    # 🔴 `pam_upstream` IS NAMED THE OPPOSITE OF WHAT IT MEANS. Per `nuclease.py` (docstring at
+    # L97-99, and the registry itself: SPCAS9/SPG set it True, LBCAS12A/IMP_LBCAS12A set it False),
+    # `pam_upstream=True` means the PAM is 3' OF THE GUIDE — the Cas9 family — and False means the
+    # PAM is 5' of it, the Cas12a family. `pam_search.py:131,145` and `oligo_generation.py:152,160`
+    # both branch that way. This function alone had the two branches swapped, i.e. it read the flag
+    # by its NAME, so for SpCas9 it extracted the Cas12a-flank 20-mer and then tested it against an
+    # `allowed_guides` set built from Cas9-flank 20-mers. Measured consequences, before the fix:
+    #   - every returned site put the guide on the wrong side of its own PAM, 662/662 sites over 3
+    #     genes with an accept-all guide set (SGTC planning/325_saturation_geometry.md), and 43/43
+    #     against the real set (NN 308 §3e)
+    #   - `guide_with_pam` came out `pam+guide`, which `get_disruption_score` cannot score: its
+    #     `position - len(PAM) + 1` arithmetic requires the PAM at the 3' end
+    #   - yield collapsed to ~5 sites/gene, because a wrong-flank 20-mer only passes the
+    #     `in allowed_guides` test when it coincidentally exists as a real guide elsewhere
+    # The allowed-set convention is not inferred: 876,876/876,876 rows of BYa_allowed_SpCas9.txt
+    # carry their guide on the Cas9 side of PAM_coord (planning/325d_allowed_set_minus_anchor.py).
+    # 🔴 Do not "simplify" these branches back to matching the flag's name.
     for coord in range(scan_start, scan_end):
         if coord < 0 or coord + pam_length > len(chrom_seq):
             continue
@@ -118,11 +135,11 @@ def _find_orf_pams(
         pam_seq = chrom_seq[coord: coord + pam_length].upper()
         if pam_seq in all_pams:
             if pam_upstream:
-                guide_seq = chrom_seq[coord + pam_length: coord + pam_length + guide_length].upper()
-                guide_with_pam = pam_seq + guide_seq
-            else:
                 guide_seq = chrom_seq[coord - guide_length: coord].upper()
                 guide_with_pam = guide_seq + pam_seq
+            else:
+                guide_seq = chrom_seq[coord + pam_length: coord + pam_length + guide_length].upper()
+                guide_with_pam = pam_seq + guide_seq
             if (guide_seq in allowed_guides
                     and max_poly_t * "T" not in guide_seq):
                 plus_strand_pams[coord] = ("+", pam_seq, coord, guide_seq, guide_with_pam)
@@ -131,11 +148,11 @@ def _find_orf_pams(
         rc_pam_seq = rev_comp(pam_seq)
         if rc_pam_seq in all_pams:
             if pam_upstream:
-                rc_guide_seq = rev_comp(chrom_seq[coord - guide_length: coord].upper())
-                rc_guide_with_pam = rc_pam_seq + rc_guide_seq
-            else:
                 rc_guide_seq = rev_comp(chrom_seq[coord + pam_length: coord + pam_length + guide_length].upper())
                 rc_guide_with_pam = rc_guide_seq + rc_pam_seq
+            else:
+                rc_guide_seq = rev_comp(chrom_seq[coord - guide_length: coord].upper())
+                rc_guide_with_pam = rc_pam_seq + rc_guide_seq
             if (rc_guide_seq in allowed_guides
                     and max_poly_t * "T" not in rc_guide_seq):
                 minus_strand_pams[coord] = ("-", rc_pam_seq, coord, rc_guide_seq, rc_guide_with_pam)
