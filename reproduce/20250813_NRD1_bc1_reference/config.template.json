@@ -1,0 +1,11 @@
+{
+  "out_dir": "<OUT>",
+  "key": "<DATA>/keyfiles/bc1_donor_bc0_combined_key.tsv",
+  "fragment_fastq_dir": "<DATA>/bc1_donor_bc0_trimmed_fastq",
+  "donor_bc0_fastq_dir": "<DATA>/donor_bc0_collapsed_fastq",
+  "gdb_table": "<DATA>/V625_guide_donor_bc0_purity_filtered.tsv",
+  "oligo_pool": "<DATA>/20240411_Twist_200mer_oligo_array_order.tsv",
+  "oligo_info": "<DATA>/20240409_NRD1_mut_SpCas9_NGG_codon_change_guide_donor_200_bp_oligos_info.txt",
+  "table_name": "NRD1_screen_bc1_reference_table_2025.tsv",
+  "tie_order": "stable"
+}
