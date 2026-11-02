@@ -156,3 +156,9 @@ def test_stage_g_ambiguous_donor_takes_first_in_file_order(tmp_path):
     sa.map_donor_bc0_to_oligos(str(tmp_path / "combined.tsv"), str(tmp_path / "pool.tsv"), str(tmp_path))
     m = pd.read_csv(tmp_path / "donor_bc0_to_oligo_mapping.tsv", sep="\t").iloc[0]
     assert m["db_oligo_name"] == "X_first" and not bool(m["unambiguous_oligo_name"])
+
+
+def test_tie_order_is_validated(project):
+    project["tie_order"] = "quick"
+    with pytest.raises(ValueError):
+        sa.run(project, stages=["c"], n_jobs=1)

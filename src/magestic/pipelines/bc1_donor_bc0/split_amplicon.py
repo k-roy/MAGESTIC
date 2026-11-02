@@ -22,15 +22,21 @@ a reader can put the two side by side):
     g  map_donor_bc0_to_oligos      donor -> designed oligo (perfect donor, else the central 60 nt)
     h  link_reference_table         c + g + GDB + oligo annotations -> the reference table
 
-PARITY CONTRACT (planning/378). Every stage reproduces the legacy script's output on the real NRD1 data, row
-for row and column for column, with ONE deliberate difference, which is where the legacy code was
-non-deterministic:
+TIE ORDER, AND WHY THE LEGACY TABLE CANNOT BE REBUILT BIT FOR BIT (measured, planning/378). Stages c and g
+choose a representative among TIED rows by the order an earlier sort left them in. The legacy scripts used
+pandas' default sort (numpy quicksort), whose order among ties depends on the CPU: numpy >= 1.25 sorts with
+AVX-512 kernels where the CPU has them. The same legacy scripts on the same inputs gave tables that differ in
+1,758 bc1s at stage c and in 5,339 donor_bc0_fragments at stage g between an AMD Milan and an Intel Skylake
+node. Stage c also gathered results with ``Pool.imap_unordered``, so its per-bc1 top fragment among fragments
+tied on counts depended on worker scheduling (117 bc1s between two runs on one node).
 
-* Stage c's per-bc1 "top fragment" was chosen by ``drop_duplicates(keep="first")`` after an UNSTABLE sort of
-  results gathered with ``Pool.imap_unordered``, so among fragments tied on total counts the pick depended on
-  worker scheduling. Here results are gathered in group order and sorted stably, so the tie goes to the
-  fragment the collapse selected first (highest counts + PCR replicates, then the legacy group order). Every
-  bc1 whose top was a tie is listed in ``<out>/top_fragment_ties.tsv`` -- the table schema is unchanged.
+* ``tie_order="stable"`` (default): every sort is stable and results are gathered in group order, so ties go
+  to the earlier row of a fully specified order and the table is a function of the inputs alone, on any CPU.
+* ``tie_order="legacy"``: the legacy sorts, so the route equals the legacy scripts run on the same CPU class,
+  except stage c's scheduling ties (measured: 105 bc1s, all listed in the ties file).
+
+Every bc1 whose top fragment was a tie is listed in ``<out>/data_tables/top_fragment_ties.tsv``; the table
+schema is unchanged.
 
 Behaviours kept for parity and documented rather than changed (changing any of them changes the table):
 
@@ -191,7 +197,14 @@ def collapse_sequences(df: pd.DataFrame, group_cols: List[str], seq_col: str, co
     return pd.DataFrame(rows)
 
 
-def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_jobs: int = 1) -> Dict[str, int]:
+def _kind(tie_order: str) -> str:
+    if tie_order not in ("stable", "legacy"):
+        raise ValueError(f"tie_order must be 'stable' or 'legacy', not {tie_order!r}")
+    return "stable" if tie_order == "stable" else "quicksort"
+
+
+def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_jobs: int = 1,
+                          tie_order: str = "stable") -> Dict[str, int]:
     """Stage c. Writes ``top_bc1_donor_bc0_fragments.tsv`` and ``top_fragment_ties.tsv`` in ``out_dir``."""
     key = key[key["description"] == "bc1-donor-bc0"]
     dfs = []
@@ -215,11 +228,11 @@ def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_
     allsamp = per_sample.groupby(["bc1", "donor_bc0_fragment"])["counts"].sum().reset_index()
     allsamp["num_PCR_replicates"] = (per_sample.groupby(["bc1", "donor_bc0_fragment"])["sample_number"]
                                      .nunique().reset_index(drop=True))
-    allsamp.sort_values(by=["num_PCR_replicates"], ascending=False, inplace=True)  # legacy order, deterministic
+    allsamp.sort_values(by=["num_PCR_replicates"], ascending=False, inplace=True, kind=_kind(tie_order))
 
     frag = collapse_sequences(allsamp, ["bc1"], "donor_bc0_fragment", ["counts", "num_PCR_replicates"],
                               EDIT_DISTANCE_THRESHOLD, n_jobs)
-    frag.sort_values(by=["counts"], ascending=False, inplace=True, kind="stable")  # the one deliberate change
+    frag.sort_values(by=["counts"], ascending=False, inplace=True, kind="stable")  # imap order + stable: no scheduling ties
     frag.rename(columns={"counts": "total_bc1_donor_bc0_counts"}, inplace=True)
 
     # Ties the legacy code broke by worker scheduling: report them.
@@ -287,12 +300,13 @@ def _oligo_lookups(oligo_pool: pd.DataFrame):
     return perfect, partial
 
 
-def map_donor_bc0_to_oligos(combined_donor_bc0: str, oligo_pool_path: str, out_dir: str) -> Dict[str, int]:
+def map_donor_bc0_to_oligos(combined_donor_bc0: str, oligo_pool_path: str, out_dir: str,
+                            tie_order: str = "stable") -> Dict[str, int]:
     """Stage g. One row per donor_bc0_fragment: its highest-count full donor (ties resolved toward a perfect
     donor, then a perfect central window) and the designed oligo that donor names."""
     df = pd.read_csv(combined_donor_bc0, sep="\t")
     perfect, partial = _oligo_lookups(pd.read_csv(oligo_pool_path, sep="\t"))
-    df.sort_values("counts", ascending=False, inplace=True)
+    df.sort_values("counts", ascending=False, inplace=True, kind=_kind(tie_order))
     keep = df.groupby("donor_bc0_fragment")["counts"].transform("max") == df["counts"]
     df = df[keep].reset_index(drop=True)
     donors = df["donor"].values
@@ -319,7 +333,7 @@ def map_donor_bc0_to_oligos(combined_donor_bc0: str, oligo_pool_path: str, out_d
     res = (res.sort_values(by=["donor_bc0_fragment", "db_counts", "db_perfect_donor",
                                "db_perfect_middle_donor_region"], ascending=[True, False, False, False])
            .drop_duplicates(subset=["donor_bc0_fragment"]).reset_index(drop=True))
-    res = res.sort_values(by=["db_counts"], ascending=False)
+    res = res.sort_values(by=["db_counts"], ascending=False, kind=_kind(tie_order))
     os.makedirs(out_dir, exist_ok=True)
     res.to_csv(os.path.join(out_dir, "donor_bc0_to_oligo_mapping.tsv"), sep="\t", index=False)
     return {"rows_out": int(len(res)), "ambiguous_name": int((~res["unambiguous_oligo_name"]
@@ -374,13 +388,16 @@ def _run_e(args):
 def run(cfg: dict, stages: Sequence[str] = ("b", "e", "c", "f", "g", "h"), n_jobs: int = 1) -> dict:
     """Run the requested stages. ``cfg`` keys: ``out_dir``, ``key``, ``fragment_fastq_dir`` (trimmed R1/R2),
     ``donor_bc0_fastq_dir`` (collapsed), ``gdb_table``, ``oligo_pool``, ``oligo_info``, ``table_name``; optional
-    ``fragment_counts_dir`` / ``donor_bc0_counts_dir`` to start from existing stage b / e outputs."""
+    ``fragment_counts_dir`` / ``donor_bc0_counts_dir`` to start from existing stage b / e outputs, and
+    ``tie_order`` (``stable``, the default, or ``legacy``; see the module docstring)."""
     from magestic.utils.provenance import StepProvenance, write_run_provenance
 
     out = Path(cfg["out_dir"])
     frag_dir = cfg.get("fragment_counts_dir") or str(out / "bc1_donor_bc0_fragment_counts")
     dbc_dir = cfg.get("donor_bc0_counts_dir") or str(out / "complete_donor_bc0_counts")
     tables = str(out / "data_tables")
+    tie_order = cfg.get("tie_order", "stable")
+    _kind(tie_order)
     table = os.path.join(tables, cfg.get("table_name", "bc1_reference_table.tsv"))
     key = pd.read_csv(cfg["key"], sep="\t")
     sidecars, summary = [], {}
@@ -415,8 +432,8 @@ def run(cfg: dict, stages: Sequence[str] = ("b", "e", "c", "f", "g", "h"), n_job
         o = os.path.join(tables, "top_bc1_donor_bc0_fragments.tsv")
         p = step("c_combine_bc1_fragments", o, "edit-distance collapse, PCR-replicate support, bc1 purity")
         p.set_parameters(edit_distance_threshold=EDIT_DISTANCE_THRESHOLD, min_pcr_replicates=MIN_PCR_REPLICATES,
-                         top_tie_rule="stable: collapse order (counts+replicates, then group order)")
-        summary["c"] = combine_bc1_fragments(key, frag_dir, tables, n_jobs)
+                         tie_order=tie_order)
+        summary["c"] = combine_bc1_fragments(key, frag_dir, tables, n_jobs, tie_order)
         p.set_counts(**summary["c"]).add_output(o).write()
         sidecars.append(p.sidecar_path())
     if "f" in stages:
@@ -429,8 +446,9 @@ def run(cfg: dict, stages: Sequence[str] = ("b", "e", "c", "f", "g", "h"), n_job
         o = os.path.join(tables, "donor_bc0_to_oligo_mapping.tsv")
         p = step("g_map_donor_bc0_to_oligos", o, "full donor -> designed oligo")
         p.add_input(cfg["oligo_pool"], role="oligo_pool")
+        p.set_parameters(tie_order=tie_order)
         summary["g"] = map_donor_bc0_to_oligos(os.path.join(tables, "combined_donor_bc0_counts.tsv"),
-                                               cfg["oligo_pool"], tables)
+                                               cfg["oligo_pool"], tables, tie_order)
         p.set_counts(**summary["g"]).add_output(o).write()
         sidecars.append(p.sidecar_path())
     if "h" in stages:
