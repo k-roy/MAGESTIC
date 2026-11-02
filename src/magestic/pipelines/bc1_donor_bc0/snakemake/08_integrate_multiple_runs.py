@@ -31,9 +31,11 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from rapidfuzz.distance import Levenshtein as _rapidfuzz_lev
 
+from magestic.pipelines.bc1_donor_bc0.core.link_collapse import _order_key
 
 
-def _peel_off(seqs, cvs, threshold):
+
+def _peel_off(seqs, cvs, threshold, tkeys=None):
     """Greedy top-by-count peel-off on plain lists.
 
     Behavior-preserving reimplementation of the original pandas process_group inner
@@ -55,12 +57,18 @@ def _peel_off(seqs, cvs, threshold):
     out = []
     remaining = n
     while remaining:
-        # top = FIRST surviving index with the max total (matches pandas idxmax tie-break)
+        # top = the surviving row with the max total, ties broken by a TOTAL key (the type-tagged
+        # sequence, then the preserved values), never by arrival order. "First index with the max"
+        # let the input row order choose the representative and hence the collapse (STEP08, Kevin
+        # 2026-10-01 "Fix now"; the same bug class link_collapse._peel fixed in NN 256).
         top = -1
         best = None
         for i in range(n):
-            if alive[i] and (best is None or totals[i] > best):
-                best = totals[i]
+            if not alive[i]:
+                continue
+            k = (-totals[i], tkeys[i] if tkeys is not None else "")
+            if best is None or k < best:
+                best = k
                 top = i
         ts = seqs[top]
         agg = list(cvs[top])
@@ -92,7 +100,9 @@ def _collapse_payload(payload, group_cols, seq_col, cc, pcols, threshold):
     gkey, seqs, cvs, pres = payload
     base = {group_cols[k]: gkey[k] for k in range(len(group_cols))}
     rows = []
-    for rep, agg in _peel_off(seqs, cvs, threshold):
+    tkeys = [_order_key(s) + ("\x02" + "\x02".join(_order_key(x) for x in pres[i]) if pres is not None else "")
+             for i, s in enumerate(seqs)]
+    for rep, agg in _peel_off(seqs, cvs, threshold, tkeys):
         row = dict(base)
         row[seq_col] = seqs[rep]
         for k in range(len(cc)):

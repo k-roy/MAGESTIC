@@ -318,9 +318,13 @@ def validate_bc0_purity(
 
     metrics.n_unique_bc0s = len(bc0_purity_df)
 
-    # Purity statistics
-    if "purity" in bc0_purity_df.columns:
-        purity = bc0_purity_df["purity"].dropna()
+    # Purity statistics. Production (step 04) names the column `guide_bc0_purity`; the core helper
+    # names it `purity`. Reading only `purity` skipped production purity silently (GDB-C006, planning/288).
+    pcol = next((c for c in ("purity", "guide_bc0_purity") if c in bc0_purity_df.columns), None)
+    if pcol is None:
+        metrics.warnings.append("BC0 purity table has neither `purity` nor `guide_bc0_purity`; purity not checked")
+    if pcol is not None:
+        purity = bc0_purity_df[pcol].dropna()
         metrics.mean_bc0_purity = purity.mean()
         metrics.median_bc0_purity = purity.median()
         metrics.low_purity_bc0s = (purity < config.min_bc0_purity).sum()
@@ -362,9 +366,13 @@ def validate_library_representation(
         metrics.warnings.append("No library representation data available")
         return metrics
 
-    # Count covered oligos
-    if "reads" in representation_df.columns:
-        covered = representation_df["reads"] >= config.min_reads_for_present
+    # Count covered oligos. Production (step 05) names the per-oligo column `counts`; reading only
+    # `reads` skipped production representation silently (GDB-C007, planning/288).
+    rcol = next((c for c in ("reads", "counts") if c in representation_df.columns), None)
+    if rcol is None:
+        metrics.warnings.append("representation table has neither `reads` nor `counts`; coverage not checked")
+    if rcol is not None:
+        covered = representation_df[rcol] >= config.min_reads_for_present
         metrics.n_oligos_covered = covered.sum()
         metrics.n_oligos_missing = n_designed_oligos - metrics.n_oligos_covered
         metrics.coverage_rate = metrics.n_oligos_covered / max(n_designed_oligos, 1)
@@ -381,15 +389,17 @@ def validate_library_representation(
             )
 
         # Read depth statistics
-        reads = representation_df["reads"]
+        reads = representation_df[rcol]
         metrics.min_reads_per_oligo = reads.min()
         metrics.max_reads_per_oligo = reads.max()
         metrics.median_reads_per_oligo = reads.median()
 
         # Coverage depth distribution
+        # Left-closed bins, so each label is exactly its interval: 0 | 1-9 | 10-99 | 100-999 | 1000+.
+        # (The right-closed form with include_lowest put 1 read in "0" and 10 in "1-9", GDB-C007.)
         bins = [0, 1, 10, 100, 1000, float('inf')]
         labels = ["0", "1-9", "10-99", "100-999", "1000+"]
-        depth_binned = pd.cut(reads, bins=bins, labels=labels, include_lowest=True)
+        depth_binned = pd.cut(reads, bins=bins, labels=labels, right=False)
         metrics.coverage_depth_distribution = depth_binned.value_counts().to_dict()
 
     return metrics

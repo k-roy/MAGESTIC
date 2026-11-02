@@ -683,7 +683,11 @@ def find_closest_designed_donor(
 
         # Get top candidates by k-mer overlap
         if oligo_scores:
-            candidates = sorted(oligo_scores.items(), key=lambda x: -x[1])[:TOP_KMER_CANDIDATES]
+            # Ties in k-mer score are broken by oligo name. `oligo_scores` is filled by iterating SETS of
+            # names, whose order follows PYTHONHASHSEED, so a score-only sort let the hash seed choose both
+            # the truncated candidate list and, among equal edit distances, the reported design (H12,
+            # planning/288: 3 winners over 8 seeds).
+            candidates = sorted(oligo_scores.items(), key=lambda x: (-x[1], x[0]))[:TOP_KMER_CANDIDATES]
         else:
             candidates = []
 

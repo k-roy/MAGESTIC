@@ -124,8 +124,12 @@ def build_lookup_dictionaries(oligo_pool_df: pd.DataFrame) -> Dict[str, Dict]:
     oligo_pool_df["guide_donor"] = (
         oligo_pool_df["guide"] + SPCAS9_CLONING_SITE + oligo_pool_df["donor"]
     )
-    guide_donor_to_oligo = dict(
-        zip(oligo_pool_df["guide_donor"], oligo_pool_df["oligo_name"])
+    # Several designs can share one guide+donor (5,243 pairs in the shipped registry, e.g. a design and
+    # its `_SV_prone_site` copy). `dict(zip(...))` kept the LAST row, so the reported alias depended on
+    # pool row order (GDB-C003, planning/288). Take the smallest name instead: order-free, and it picks
+    # the base design over its `_SV_prone_site` copy.
+    guide_donor_to_oligo = (
+        oligo_pool_df.groupby("guide_donor", sort=False)["oligo_name"].min().to_dict()
     )
 
     # 2. Guide -> oligos (vectorized groupby)
@@ -216,6 +220,14 @@ def resolve_oligo_name(
             confidence=0.0,
         )
 
+    # Guide and donor evidence that are each ambiguous can still name ONE design together: the
+    # intersection of the guide's candidates with the full donor's (or, failing that, the central
+    # window's). The numbered step 03 always did this; this resolver did not, so the same reads got two
+    # answers by entrypoint (GDB-C002, planning/288).
+    intersection = _intersect_candidates(guide, donor, lookups, middle_donor_start, middle_donor_end)
+    if intersection is not None:
+        return OligoMatchResult(oligo_name=intersection, match_type="intersection", confidence=0.9)
+
     # If guide matches uniquely
     if len(guide_matches) == 1:
         return OligoMatchResult(
@@ -249,6 +261,23 @@ def resolve_oligo_name(
         match_type="unmatched",
         confidence=0.0,
     )
+
+
+def _intersect_candidates(guide, donor, lookups, middle_donor_start=MIDDLE_DONOR_START,
+                          middle_donor_end=MIDDLE_DONOR_END):
+    """The single design shared by the guide's candidates and the donor's (full donor first, else the
+    central window), or None when the intersection is empty or holds more than one design."""
+    g = lookups["guide_to_oligos"].get(guide)
+    if not g:
+        return None
+    d = lookups["perfect_donor_to_oligos"].get(donor)
+    if not d:
+        d = lookups["partial_donor_to_oligos"].get(donor[middle_donor_start:middle_donor_end])
+    if not d:
+        return None
+    ds = set(d)
+    inter = [o for o in g if o in ds]
+    return inter[0] if len(inter) == 1 else None
 
 
 def _derive_match_maps(lookups: Dict[str, Dict]) -> Dict[str, Dict]:
@@ -352,13 +381,22 @@ def process_counts_file(
         both_same = (~has_exact) & ~nag & (ng == 1) & (nd == 1) & (gsv == dsv)
         conflicting = (~has_exact) & ~nag & (ng == 1) & (nd == 1) & (gsv != dsv)
         fallback = (~has_exact) & (~both_same) & (~conflicting) & ~nag
-        guide_only = fallback & (ng == 1)
-        donor_only = fallback & (~guide_only) & (nd == 1)
-        partial = fallback & (~guide_only) & (~donor_only) & (nm == 1)
+        # Intersection of guide and donor candidates (resolve_oligo_name's next branch, GDB-C002).
+        # Per-row Python only for rows that can have one: a guide candidate and a donor or window one.
+        inter = np.full(n, None, dtype=object)
+        g_arr, d_arr = guide_s.to_numpy(dtype=object), donor_up.to_numpy(dtype=object)
+        for i in np.flatnonzero(fallback & (ng >= 1) & ((nd >= 1) | (nm >= 1))):
+            inter[i] = _intersect_candidates(g_arr[i], d_arr[i], lookups)
+        intersection = fallback & np.array([x is not None for x in inter], dtype=bool)
+        rest = fallback & ~intersection
+        guide_only = rest & (ng == 1)
+        donor_only = rest & (~guide_only) & (nd == 1)
+        partial = rest & (~guide_only) & (~donor_only) & (nm == 1)
 
         oligo = np.full(n, "NA", dtype=object)
         oligo[has_exact] = oligo_exact.to_numpy(dtype=object)[has_exact]
         oligo[both_same] = gsv[both_same]
+        oligo[intersection] = inter[intersection]
         oligo[guide_only] = gsv[guide_only]
         oligo[donor_only] = dsv[donor_only]
         oligo[partial] = msv[partial]
@@ -367,6 +405,7 @@ def process_counts_file(
         mtype[conflicting] = "conflicting"
         mtype[has_exact] = "exact"
         mtype[both_same] = "exact"
+        mtype[intersection] = "intersection"
         mtype[guide_only] = "guide_only"
         mtype[donor_only] = "donor_only"
         mtype[partial] = "partial"
@@ -438,12 +477,15 @@ def calculate_bc0_purity(
         DataFrame with bc0, dominant_oligo, purity, total_reads columns
     """
     # Group by BC0 and calculate stats
-    bc0_stats = bc0_counts.groupby(bc0_col).agg({
-        count_col: ['sum', 'max'],
-        oligo_col: lambda x: x.loc[x.idxmax()] if len(x) > 0 else None,
-    }).reset_index()
-
-    bc0_stats.columns = [bc0_col, 'total_reads', 'max_reads', 'dominant_oligo']
+    # The dominant oligo is the one carrying the most reads. The old aggregation took `idxmax` of the
+    # NAME column, i.e. the alphabetically last name (GDB-C009, planning/288). Ties between equal read
+    # counts go to the smallest name, so the result does not depend on row order.
+    g = bc0_counts.groupby(bc0_col)
+    bc0_stats = g[count_col].agg(['sum', 'max']).reset_index()
+    bc0_stats.columns = [bc0_col, 'total_reads', 'max_reads']
+    ranked = bc0_counts.sort_values([bc0_col, count_col, oligo_col], ascending=[True, False, True], kind="stable")
+    dominant = ranked.drop_duplicates(bc0_col)[[bc0_col, oligo_col]].rename(columns={oligo_col: 'dominant_oligo'})
+    bc0_stats = bc0_stats.merge(dominant, on=bc0_col, how='left')
     bc0_stats['purity'] = bc0_stats['max_reads'] / bc0_stats['total_reads']
 
     return bc0_stats[[bc0_col, 'dominant_oligo', 'purity', 'total_reads']]

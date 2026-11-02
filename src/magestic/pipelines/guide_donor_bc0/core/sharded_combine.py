@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -143,14 +144,41 @@ def orient_read(seq: str, inner_primers: str) -> str:
     return seq
 
 
+def input_fingerprint(path: str | os.PathLike, edge: int = 1 << 20) -> Dict[str, object]:
+    """Identity of an input file for resume decisions: size, mtime_ns, inode, and the md5 of its first and
+    last MiB. The content part matters on Oak, whose mtimes have one-second resolution, so a same-size
+    rewrite inside one second leaves every stat field unchanged."""
+    st = os.stat(path)
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        h.update(fh.read(edge))
+        if st.st_size > edge:
+            fh.seek(max(st.st_size - edge, edge))
+            h.update(fh.read())
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "ino": st.st_ino, "edge_md5": h.hexdigest()}
+
+
 def parse_shard(row: Dict[str, str], shard_dir: Path, fastq_md5: Optional[str] = None) -> Dict[str, object]:
     """Parse one collapsed FASTQ into ``shard_<id>.tsv`` + stats + provenance sidecar.
 
-    Idempotent: if the rc sentinel reads ``0`` and the TSV exists, nothing is redone.
+    Idempotent ON INPUT IDENTITY: a shard is reused only if its rc sentinel reads ``0``, its TSV exists,
+    and the FASTQ it was parsed from still has the fingerprint recorded at parse time (and the md5, when
+    one is supplied). A changed FASTQ at the same manifest path is re-parsed; the old rule (sentinel +
+    output exist) kept a stale shard silently (GDB-RESUME-R1, planning/288).
     """
     paths = shard_paths(shard_dir, row["shard_id"])
-    if paths["rc"].exists() and paths["rc"].read_text().strip() == "0" and paths["tsv"].exists():
-        return {"skipped": True, "shard_id": row["shard_id"], "tsv": str(paths["tsv"])}
+    if paths["rc"].exists() and paths["rc"].read_text().strip() == "0" and paths["tsv"].exists() \
+            and paths["stats"].exists():
+        try:
+            st = json.load(open(paths["stats"]))
+        except (OSError, ValueError):
+            st = {}
+        same = st.get("fastq_fingerprint") == input_fingerprint(row["fastq"])
+        if fastq_md5 is not None:
+            same = same and st.get("fastq_md5") == fastq_md5
+        if same:
+            return {"skipped": True, "shard_id": row["shard_id"], "tsv": str(paths["tsv"])}
+        paths["rc"].unlink()
 
     shard_dir.mkdir(parents=True, exist_ok=True)
     fq = Path(row["fastq"])
@@ -185,7 +213,8 @@ def parse_shard(row: Dict[str, str], shard_dir: Path, fastq_md5: Optional[str] =
     prov.add_output(paths["tsv"], rows=n_rows)
     prov.write()
     write_json_atomic({"shard_id": int(row["shard_id"]), "library_ID": row["library_ID"], "fastq": str(fq),
-                       "counts_col": row["counts_col"], **counts, "tsv_md5": prov.outputs[-1]["md5"]}, paths["stats"])
+                       "counts_col": row["counts_col"], **counts, "tsv_md5": prov.outputs[-1]["md5"],
+                       "fastq_fingerprint": input_fingerprint(fq), "fastq_md5": fastq_md5}, paths["stats"])
     paths["rc"].write_text("0\n")
     return {"skipped": False, "shard_id": row["shard_id"], "tsv": str(paths["tsv"]), **counts}
 
@@ -226,9 +255,18 @@ def merge_library(library_ID: str, manifest: Sequence[Dict[str, str]], shard_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{library_ID}_guide_donor_bc0_counts.tsv"
     rc_path = out_dir / f".{library_ID}_guide_donor_bc0_counts.rc"
-    if rc_path.exists() and rc_path.read_text().strip() == "0" and out_path.exists() \
-            and Path(str(out_path) + ".provenance.json").exists():
-        return {"skipped": True, "library_ID": library_ID, "output": str(out_path)}
+    sidecar = Path(str(out_path) + ".provenance.json")
+    if rc_path.exists() and rc_path.read_text().strip() == "0" and out_path.exists() and sidecar.exists():
+        # Reuse only if every shard is the one this merge consumed (a re-parsed shard has a new md5).
+        try:
+            used = {int(i["shard_id"]): i.get("md5") for i in json.load(open(sidecar)).get("inputs", [])
+                    if i.get("role") == "shard"}
+            now = {int(r["shard_id"]): json.load(open(shard_paths(shard_dir, r["shard_id"])["stats"])).get("tsv_md5")
+                   for r in rows}
+        except (OSError, ValueError, KeyError):
+            used, now = None, {}
+        if used == now:
+            return {"skipped": True, "library_ID": library_ID, "output": str(out_path)}
 
     prov = StepProvenance(pipeline="guide_donor_bc0", step="02_combine.merge_library", output=str(out_path),
                           description="per-library guide_donor_bc0 counts table: shard rows summed per oriented "
