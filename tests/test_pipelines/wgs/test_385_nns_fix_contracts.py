@@ -98,3 +98,34 @@ def test_allele_evidence_config_values(fixture_factory, value, ok):
     else:
         with pytest.raises(ValueError, match="realign or aligned"):
             load_config(path)
+
+
+def _v7_config(f, *, genes_in_cds=("NRD1",)):
+    from magestic.pipelines.wgs.config import load_config
+    cds = f["root"] / "cds.tsv"
+    cds.write_text("gene\tchrom\tstart\tend\tstrand\n" + "".join(f"{g}\tchrII\t301\t330\t+\n" for g in genes_in_cds))
+    windows = f["root"] / "windows_v7.tsv"
+    windows.write_text("oligo_name\tchrom\tdonor_start_coord\tdonor_end_coord\tintended_variants\tgene\t"
+                       "target_codon_start\ttarget_codon_end\n"
+                       'oligo_1\tchrII\t301\t310\t[{"pos":301,"ref":"A","alt":"C"}]\tNRD1\t301\t303\n')
+    data = yaml.safe_load(f["config_path"].read_text())
+    data["reconcile"].update({"calling": "v7", "cds_table": str(cds), "oligo_windows": str(windows)})
+    path = f["root"] / "v7.yaml"
+    path.write_text(yaml.safe_dump(data))
+    return load_config(path)
+
+
+def test_v7_targets_are_built_from_the_window_and_cds_tables(fixture_factory):
+    """3db9841's positive path (only its refusals were tested): one TargetSpec per window, in sample coordinates."""
+    from magestic.pipelines.wgs.pipeline import step_4_reconcile as s4
+    from trace_crispr.wgs import target_calls as tc
+    targets = s4._load_targets(_v7_config(fixture_factory(records=[])))
+    assert set(targets) == {"oligo_1"}
+    t = targets["oligo_1"]
+    assert t.cds == tc.CDS("chrII", 301, 330, "+") and (t.codon_start, t.codon_end) == (301, 303)
+
+
+def test_v7_target_gene_missing_from_cds_table_is_refused(fixture_factory):
+    from magestic.pipelines.wgs.pipeline import step_4_reconcile as s4
+    with pytest.raises(Exception, match="not in"):
+        s4._load_targets(_v7_config(fixture_factory(records=[]), genes_in_cds=("SEN1",)))
