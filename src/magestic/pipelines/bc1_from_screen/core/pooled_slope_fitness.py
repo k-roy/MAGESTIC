@@ -16,6 +16,11 @@ THE METHOD, per edit (a group of barcodes sharing ``key_cols``) and treatment:
 3. The series is truncated at the first run of ``trim_k`` consecutive post-generation-0 points below
    log2(``trim_fc``) (inclusive), and the raw slope is the least-squares slope over the kept points
    (at least ``min_points``).
+3b. ``index="endpoint"`` replaces the slope with the pooled log2 fold change at ONE generation (the series'
+   last finite post-zero generation, or ``endpoint_generation``), so an edit measured at generation 0 and one
+   later point gets an index where the slope route gets nothing. Truncation is off by default on this route,
+   because a series that dies IS the depletion an endpoint measure reports. ``min_points`` does not apply.
+   Steps 4 to 7 are shared verbatim between the two routes, so they cannot drift apart.
 4. The fitness index is the slope minus the median slope of all edits in the same treatment.
 5. Depletion: the series' last finite point is below log2(``depletion_fc``).
 6. Hit (criteria 1-3): fitness index in ``treatment`` below its ``tail_prob`` quantile over all edits,
@@ -73,6 +78,27 @@ class PooledSlopeConfig:
     #: index above the (1 - tail_prob) quantile, final fold change above 1 / depletion_fc, and
     #: index(treatment) / ratio_factor > index(control). PROVISIONAL for QTL screens (planning/384 §0).
     direction: str = "depleted"
+    #: "slope" (the R script: OLS over the truncated series, needs >= min_points generations) or
+    #: "endpoint" (the pooled log2 fold change at ONE generation relative to generation 0, needs only that
+    #: generation). Kevin asked for the endpoint route on 2026-11-03 because two QTL screens yield no slope
+    #: at all: the December 2021 screen has none of its 32 conditions fittable and 42 of 48 conditions in
+    #: yL437/yL442 are endpoint only (planning/384 §3). Every later step is shared between the two routes.
+    index: str = "slope"
+    #: the generation the endpoint index is read at; None takes each series' last finite generation, so
+    #: series of unequal length are each read at their own last point and ``endpoint_gen`` records it.
+    endpoint_generation: Optional[int] = None
+    #: apply the ``trim_fc``/``trim_k`` truncation before reading the endpoint. Default False: a series that
+    #: dies IS the depletion signal an endpoint measure is meant to report, and truncating would discard it.
+    endpoint_trim: bool = False
+
+    def __post_init__(self) -> None:
+        if self.index not in ("slope", "endpoint"):
+            raise ValueError(f"index must be 'slope' or 'endpoint', got {self.index!r}")
+        if self.direction not in ("depleted", "both"):
+            raise ValueError(f"direction must be 'depleted' or 'both', got {self.direction!r}")
+        if self.endpoint_generation is not None and self.endpoint_generation == 0:
+            raise ValueError("endpoint_generation 0 is generation 0 itself: its log2 fold change is 0 by "
+                             "construction and carries no fitness information")
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -265,6 +291,25 @@ def _quantile7(v: np.ndarray, p: float) -> float:
     return float(np.quantile(v, p)) if len(v) else np.nan
 
 
+def _endpoint(x: np.ndarray, y: np.ndarray, at: Optional[int]) -> Tuple[float, float]:
+    """The log2 fold change at one generation, and the generation it was read at.
+
+    ``at`` None takes the last generation carrying a finite value, excluding generation 0, whose fold change
+    is 0 by construction. A requested generation that this series does not carry gives (nan, nan) rather
+    than the nearest one, so a missing timepoint is never silently substituted."""
+    m = np.isfinite(y) & (x > 0)
+    if not m.any():
+        return np.nan, np.nan
+    xs, ys = x[m], y[m]
+    if at is None:
+        i = int(np.argmax(xs))
+        return float(ys[i]), float(xs[i])
+    hit = np.flatnonzero(xs == float(at))
+    if not len(hit):
+        return np.nan, np.nan
+    return float(ys[hit[0]]), float(at)
+
+
 def pooled_slope_fitness(long: pd.DataFrame, cfg: PooledSlopeConfig) -> Dict[str, pd.DataFrame]:
     """Run the method on a long table (``bc1``, ``key_cols``, ``treatment``, ``generation``, ``value``; row
     order = input column order within each barcode). Returns the R script's six tables under its file
@@ -290,17 +335,28 @@ def pooled_slope_fitness(long: pd.DataFrame, cfg: PooledSlopeConfig) -> Dict[str
         agg["mean_log2fc"] = agg["wx"] / agg["ww"]
     mean_tab = agg[KT + ["generation", "mean_log2fc"]].copy()
 
-    # 3. the truncation point of each series, then the raw slope
+    # 3. the truncation point of each series, then its raw index (OLS slope, or the endpoint fold change)
+    endpoint = cfg.index == "endpoint"
+    if endpoint and not (long["generation"] > 0).any():
+        raise ValueError("no generation above 0: the endpoint index is a fold change against generation 0, refusing")
     cuts, slopes = [], []
     for key, g in mean_tab.groupby(KT, dropna=False, sort=True):
         x, y = g["generation"].to_numpy(float), g["mean_log2fc"].to_numpy(float)
         cut = _cut_generation(x, y, cfg.trim_fc, cfg.trim_k)
         cuts.append((*key, cut))
-        m = np.isfinite(y) & (x <= cut)
-        if m.any():  # R summarises only the rows that survive the filter: an empty series has no slope row
-            slopes.append((*key, _first_per_x_slope(x[m], y[m], cfg.min_points)))
+        if endpoint:
+            xw, yw = (x, y) if not cfg.endpoint_trim else (x[x <= cut], y[x <= cut])
+            v, at = _endpoint(xw, yw, cfg.endpoint_generation)
+            if np.isfinite(v):   # a series with no usable post-zero point gets no index row
+                slopes.append((*key, v, at))
+        else:
+            m = np.isfinite(y) & (x <= cut)
+            if m.any():  # R summarises only the rows that survive the filter: an empty series has no slope row
+                slopes.append((*key, _first_per_x_slope(x[m], y[m], cfg.min_points), np.nan))
     trim = pd.DataFrame(cuts, columns=KT + ["cut_gen"])
-    st = pd.DataFrame(slopes, columns=KT + ["slope"])
+    st = pd.DataFrame(slopes, columns=KT + ["slope", "endpoint_gen"])
+    if not endpoint:
+        st = st.drop(columns=["endpoint_gen"])
     st["median_slope"] = st.groupby("treatment")["slope"].transform(lambda s: np.nanmedian(s) if s.notna().any() else np.nan)
     st["slope_adj"] = st["slope"] - st["median_slope"]
 
@@ -333,11 +389,20 @@ def pooled_slope_fitness(long: pd.DataFrame, cfg: PooledSlopeConfig) -> Dict[str
 
     # 7. barcode support
     d2 = df.merge(trim, on=KT, how="inner")
-    d2 = d2[np.isfinite(d2["log2fc"]) & (d2["generation"] <= d2["cut_gen"])]
+    keep_window = np.isfinite(d2["log2fc"])
+    if not endpoint or cfg.endpoint_trim:
+        keep_window &= d2["generation"] <= d2["cut_gen"]
+    d2 = d2[keep_window]
     rows = []
     for key, g in d2.groupby(KT + ["bc1"], dropna=False, sort=False):
-        rows.append((*key, _first_per_x_slope(g["generation"].to_numpy(float), g["log2fc"].to_numpy(float),
-                                              cfg.min_points), g["w"].iloc[0]))
+        gx, gy = g["generation"].to_numpy(float), g["log2fc"].to_numpy(float)
+        if endpoint:
+            # the same first-replicate-per-generation rule the slope route inherits from R's distinct()
+            _, first = np.unique(gx, return_index=True)
+            v = _endpoint(gx[first], gy[first], cfg.endpoint_generation)[0]
+        else:
+            v = _first_per_x_slope(gx, gy, cfg.min_points)
+        rows.append((*key, v, g["w"].iloc[0]))
     pb = pd.DataFrame(rows, columns=KT + ["bc1", "slope", "w"])
     pb["slope_adj"] = pb["slope"] - pb.groupby("treatment")["slope"].transform(
         lambda s: np.nanmedian(s) if s.notna().any() else np.nan)

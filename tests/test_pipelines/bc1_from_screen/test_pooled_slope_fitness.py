@@ -143,3 +143,77 @@ def test_median_depth_normalization_keeps_a_read_floor():
     long = psf.long_from_count_matrix(counts, samples, keys, normalize="median_depth")
     a = long[long.bc1 == "A"].set_index("generation")["value"]
     assert a[0] == pytest.approx(10 / 40 * 70) and a[4] == pytest.approx(20 / 100 * 70)
+
+
+# ---------------------------------------------------------------- the endpoint route (planning/384 §3, Kevin 2026-11-03)
+
+def _two_point_long():
+    """Generation 0 and ONE later generation: the shape that yields no slope at all (Dec 2021; yL437/yL442)."""
+    r = []
+    for b, vals in (("a1", [100, 25]), ("a2", [100, 25]), ("b1", [100, 100]), ("b2", [100, 100])):
+        pos = 1 if b.startswith("a") else 2
+        r += [{"bc1": b, "amino_acid_position": pos, "mutation_type": "missense", "treatment": t,
+               "replicate": 1, "generation": g, "value": v}
+              for t, series in (("T", vals), ("C", [100, 100])) for g, v in zip((0, 6), series)]
+    return pd.DataFrame(r)
+
+
+ECFG = psf.PooledSlopeConfig(treatment="T", control="C", tail_prob=0.5, depletion_fc=0.1, index="endpoint")
+
+
+def test_endpoint_index_is_the_pooled_log2fc_at_the_last_generation():
+    res = psf.pooled_slope_fitness(_long(), ECFG)
+    t = res["slope_table_log2FC"].query("treatment == 'T'").set_index("amino_acid_position")
+    # edit 1 reaches -4 at generation 8; edit 3 reaches +2; edit 2 is the g0-weighted mean (100*-2 + 300*0)/400
+    assert t.loc[1, "slope"] == pytest.approx(-4.0) and t.loc[3, "slope"] == pytest.approx(2.0)
+    assert t.loc[2, "slope"] == pytest.approx(-0.5)
+    assert set(t.endpoint_gen.dropna()) == {8.0}
+    med = np.median([-4.0, -0.5, 2.0])
+    assert t.loc[1, "slope_adj"] == pytest.approx(-4.0 - med)
+    assert list(res["hits_with_support"].amino_acid_position) == [1]
+
+
+def test_endpoint_generation_selects_that_point_and_never_substitutes_a_neighbour():
+    res = psf.pooled_slope_fitness(_long(), psf.PooledSlopeConfig(
+        treatment="T", control="C", tail_prob=0.5, depletion_fc=0.1, index="endpoint", endpoint_generation=4))
+    t = res["slope_table_log2FC"].query("treatment == 'T'").set_index("amino_acid_position")
+    assert t.loc[1, "slope"] == pytest.approx(-2.0) and set(t.endpoint_gen.dropna()) == {4.0}
+    missing = psf.pooled_slope_fitness(_long(), psf.PooledSlopeConfig(
+        treatment="T", control="C", tail_prob=0.5, depletion_fc=0.1, index="endpoint", endpoint_generation=99))
+    assert missing["slope_table_log2FC"].empty
+
+
+def test_endpoint_rescues_a_two_timepoint_screen_the_slope_route_cannot_fit():
+    d = _two_point_long()
+    slope = psf.pooled_slope_fitness(d, psf.PooledSlopeConfig(treatment="T", control="C", tail_prob=0.5,
+                                                              depletion_fc=0.1))
+    assert slope["slope_table_log2FC"].slope.notna().sum() == 0      # min_points=3 on a 2-point series
+    end = psf.pooled_slope_fitness(d, ECFG)
+    t = end["slope_table_log2FC"].query("treatment == 'T'").set_index("amino_acid_position")
+    assert t.loc[1, "slope"] == pytest.approx(-2.0) and t.loc[2, "slope"] == pytest.approx(0.0)
+    assert t.loc[1, "slope_adj"] == pytest.approx(-1.0) and t.loc[2, "slope_adj"] == pytest.approx(1.0)
+    assert int(end["hit_barcode_support_summary"].set_index("amino_acid_position").loc[1, "n_barcodes"]) == 2
+
+
+def test_endpoint_refuses_without_any_generation_above_zero():
+    d = _long()
+    d = d[d.generation == 0]
+    with pytest.raises(ValueError, match="generation above 0"):
+        psf.pooled_slope_fitness(d, ECFG)
+
+
+def test_config_rejects_a_bad_route_and_generation_zero_as_the_endpoint():
+    with pytest.raises(ValueError, match="index must be"):
+        psf.PooledSlopeConfig(index="trend")
+    with pytest.raises(ValueError, match="generation 0 itself"):
+        psf.PooledSlopeConfig(index="endpoint", endpoint_generation=0)
+
+
+def test_slope_route_is_byte_identical_after_the_endpoint_change():
+    """The endpoint route must not perturb the published path: same tables, same values, no new columns."""
+    res = psf.pooled_slope_fitness(_long(), CFG)
+    assert "endpoint_gen" not in res["slope_table_log2FC"].columns
+    st = res["slope_table_log2FC"]
+    t = st[st.treatment == "T"].set_index("amino_acid_position")
+    assert t.loc[1, "slope"] == pytest.approx(-0.5) and t.loc[2, "slope"] == pytest.approx(-0.0625)
+    assert list(res["hits_with_support"].amino_acid_position) == [1]

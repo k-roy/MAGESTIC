@@ -15,6 +15,11 @@ Three ways in, all explicit (nothing is inferred from file or sample names beyon
 ``--config`` (JSON) sets PooledSlopeConfig fields; anything not named keeps the R script's default, and the
 resolved parameters are written to ``parameters.csv`` and the provenance sidecar. The NRD1 Supplementary Table 1
 settings are in ``reproduce/20250813_NRD1_fitness/config.json``.
+
+The ENDPOINT route needs no new flag: ``{"index": "endpoint"}`` in that JSON scores each edit by its pooled log2
+fold change against generation 0 instead of a slope, so a screen measured at generation 0 and one later point is
+callable (``{"index": "endpoint", "endpoint_generation": 12}`` pins the generation). Everything after the index is
+shared with the slope route, and ``parameters.csv`` records which route ran.
 """
 
 from __future__ import annotations
