@@ -89,7 +89,8 @@ def _make_project(tmp_path, extra=()):
         tmp_path / "pool.tsv", sep="\t", index=False)
     pd.DataFrame({"library_ID": ["V625"] * 3, "guide": [o["guide"] for o in OLIGOS.values()],
                   "donor": [o["donor"] for o in OLIGOS.values()],
-                  "donor_bc0_fragment": [fragment(n) for n in OLIGOS], "oligo_name": list(OLIGOS)}).to_csv(
+                  "donor_bc0_fragment": [fragment(n) for n in OLIGOS], "oligo_name": list(OLIGOS),
+                  "perfect_donor": [True] * 3, "perfect_middle_donor_region": [True] * 3}).to_csv(
         tmp_path / "gdb.tsv", sep="\t", index=False)
     pd.DataFrame({"oligo_name": list(OLIGOS), "common_ORF_name": ["NRD1"] * 3}).to_csv(
         tmp_path / "info.tsv", sep="\t", index=False)
