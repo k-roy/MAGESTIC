@@ -1,0 +1,15 @@
+{
+  "treatment": "YPD",
+  "control": "YPD_noIAA",
+  "key_cols": ["amino_acid_position", "mutation_type"],
+  "min_g0": 10,
+  "eps": 1e-08,
+  "weighted": true,
+  "trim_fc": 0.01,
+  "trim_k": 3,
+  "min_points": 3,
+  "tail_prob": 0.05,
+  "depletion_fc": 0.1,
+  "ratio_factor": 3,
+  "min_support": 1
+}

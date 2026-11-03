@@ -108,6 +108,7 @@ magestic-gdb-pipeline      = "magestic.pipelines.guide_donor_bc0._cli:main"
 magestic-bc1-link          = "magestic.pipelines.bc1_donor_bc0._cli:main"
 magestic-bc1-reference     = "magestic.pipelines.bc1_donor_bc0.split_amplicon:main"
 magestic-screen-analysis   = "magestic.pipelines.bc1_from_screen._cli:main"
+magestic-pooled-slope      = "magestic.pipelines.bc1_from_screen.pooled_slope_cli:main"
 # REDI submodule (Phase J §9d) — umbrella + per-step CLIs
 magestic-redi              = "magestic.pipelines.redi._cli:umbrella_main"
 magestic-redi-trim         = "magestic.pipelines.redi._cli:trim_main"

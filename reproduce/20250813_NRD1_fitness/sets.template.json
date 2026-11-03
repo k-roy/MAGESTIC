@@ -1,0 +1,9 @@
+{
+  "sets": [["YPD", "R1", "<SETS>/YPD_set_R1_barcode_counts.csv"], ["YPD", "R2", "<SETS>/YPD_set_R2_barcode_counts.csv"],
+           ["YPD", "R3", "<SETS>/YPD_set_R3_barcode_counts.csv"], ["YPD noIAA", "R1", "<SETS>/YPD noIAA_set_R1_barcode_counts.csv"],
+           ["YPD noIAA", "R2", "<SETS>/YPD noIAA_set_R2_barcode_counts.csv"], ["YPD noIAA", "R3", "<SETS>/YPD noIAA_set_R3_barcode_counts.csv"]],
+  "annot": {"common_ORF_name": "gene_name", "aa_nums_str": "amino_acid_position", "ref_aas_str": "ref_amino_acid",
+            "alt_aas_str": "mutant_amino_acid",
+            "multiple_donor_bc0_fragments_passing_filter": "multiple_donor_bc0_fragments_passing_filter"},
+  "pseudocount": 1, "fill": "zero", "mdf": "keep", "join": "inner"
+}

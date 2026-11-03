@@ -160,6 +160,44 @@ def long_from_wide(wide: pd.DataFrame, mdf_col: str = "multiple_donor_bc0_fragme
     return long.drop(columns=["_row", "_col"]).reset_index(drop=True)
 
 
+def long_from_count_matrix(counts: pd.DataFrame, samples: pd.DataFrame, bc1_keys: pd.DataFrame,
+                           pseudocount: float = 0.0, normalize: str = "cpm") -> pd.DataFrame:
+    """Long table from a raw count matrix (bc1 x sample, e.g. step 08's), an EXPLICIT sample table and a bc1 ->
+    edit-key table. Nothing is inferred from sample names.
+
+    ``samples``: one row per count-matrix column to use, columns ``sample``, ``treatment``, ``replicate``,
+    ``generation`` (integer); the row order sets "the first replicate" for per-barcode slopes.
+    ``bc1_keys``: ``bc1`` plus the edit-key columns; only barcodes listed are kept (one row per bc1 required).
+    ``normalize``: ``cpm`` (counts per million of the sample's total over ALL barcodes of the matrix, as the
+    NRD1 per-set counts were) or ``none``. ``pseudocount`` is added after normalizing, as in the NRD1 run.
+    """
+    need = {"sample", "treatment", "replicate", "generation"}
+    if not need <= set(samples.columns):
+        raise ValueError(f"samples needs columns {sorted(need)}")
+    missing = [s for s in samples["sample"] if s not in counts.columns]
+    if missing:
+        raise ValueError(f"samples not in the count matrix: {missing[:10]}")
+    if bc1_keys["bc1"].duplicated().any():
+        raise ValueError("bc1_keys has duplicate bc1: resolve the edit of each barcode before fitting")
+    gens = pd.to_numeric(samples["generation"], errors="coerce")
+    if gens.isna().any() or (gens != np.round(gens)).any():
+        raise ValueError("every sample needs an integer generation")
+    m = counts[list(samples["sample"])].astype(float)
+    if normalize == "cpm":
+        m = m / m.sum(axis=0) * 1e6
+    elif normalize != "none":
+        raise ValueError("normalize must be cpm or none")
+    m = m + pseudocount
+    m = m.loc[m.index.intersection(pd.Index(bc1_keys["bc1"]))]
+    meta = samples.assign(generation=gens.astype(int)).set_index("sample")
+    long = m.rename_axis("bc1").reset_index().melt(id_vars="bc1", var_name="sample", value_name="value")
+    order = {s: i for i, s in enumerate(samples["sample"])}
+    long["_c"] = long["sample"].map(order)
+    long = long.sort_values(["bc1", "_c"], kind="stable").drop(columns="_c")
+    long = long.join(meta[["treatment", "replicate", "generation"]], on="sample")
+    return long.merge(bc1_keys, on="bc1", how="inner").reset_index(drop=True)
+
+
 # ===================================================================================== the method
 def _ols_slope(x: np.ndarray, y: np.ndarray, min_points: int) -> float:
     if len(x) < min_points:
@@ -331,7 +369,7 @@ def pooled_slope_fitness(long: pd.DataFrame, cfg: PooledSlopeConfig) -> Dict[str
         hits = hits.merge(sup, on=K, how="left")
         hk = hits[K].assign(hit=True)
         st = st.merge(hk, on=K, how="left")
-        st["hit"] = st["hit"].fillna(False).astype(bool)
+        st["hit"] = st["hit"].eq(True)
         hrows = st[st["hit"]].drop_duplicates(K)[K].assign(treatment="HIT", slope=np.nan, median_slope=np.nan,
                                                             slope_adj=np.nan, hit=True)
         st_out = pd.concat([st, hrows], ignore_index=True)
