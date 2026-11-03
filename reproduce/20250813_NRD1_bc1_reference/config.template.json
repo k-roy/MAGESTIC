@@ -7,5 +7,5 @@
   "oligo_pool": "<DATA>/20240411_Twist_200mer_oligo_array_order.tsv",
   "oligo_info": "<DATA>/20240409_NRD1_mut_SpCas9_NGG_codon_change_guide_donor_200_bp_oligos_info.txt",
   "table_name": "NRD1_screen_bc1_reference_table_2025.tsv",
-  "tie_order": "stable"
+  "tie_order": "designed"
 }

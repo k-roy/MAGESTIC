@@ -15,19 +15,23 @@ plate 1C; `*_collapsed.fastq`, read name = count), the sample key, the GDB plasm
 Trimming and merging (stage a/d, bbduk + bbmerge + collapse) are upstream of this command and unchanged from
 `NRD1/bc1_donor_bc0_linking/step_a_*.sh` and `step_d_*.sh`.
 
-## What reproduces, measured (Kevin Roy lab notes, planning/378)
+## What reproduces, measured (Kevin Roy lab notes, planning/378 and 379)
 
 * Stages b, e, f and g reproduce the surviving 2025 intermediates byte for byte (96 + 96 per-sample tables,
   4,101,755 and 2,419,499 rows).
-* With `tie_order: stable` (the default) the output is identical on AMD and Intel CPUs:
-  `md5(NRD1_screen_bc1_reference_table_2025.tsv) = 56e0dace5d9bb1ebec0d29505be674ca`
-  (pandas 2.2.2, numpy 1.26.4).
-* The 2025-08-20 table that the screen analysis used (`5c02f460ebb77a2f17b1865849e59456`) cannot be rebuilt bit
-  for bit by any code that survives. The original scripts choose among tied rows by the order of an unstable
+* With `tie_order: designed` (the default) the output is identical on AMD and Intel CPUs:
+  `md5(NRD1_screen_bc1_reference_table_2025.tsv) = 341b11ce2bc6c53acb0efccc6020394c`
+  (pandas 2.2.2, numpy 1.26.4). Among fragments tied on read support it prefers the one the donor-bc0 or
+  guide-donor-bc0 map resolves to a designed donor; untied choices are unchanged.
+* The 2025-08-20 table that the screen analysis first used (`5c02f460ebb77a2f17b1865849e59456`) cannot be rebuilt
+  bit for bit by any code that survives. The original scripts choose among tied rows by the order of an unstable
   sort, which differs between CPUs with and without AVX-512 (1,758 barcodes differ at stage c between the two),
-  and the surviving stage c output matches neither. Measured against it, the stable rebuild has the same
-  34,500 barcodes and the same 72 columns; 32,455 barcodes (94.1%) are identical in every column, 2,045 differ,
-  and 725 of those are assigned a different designed oligo. In the cases inspected the difference is which of
-  several equally supported fragments, often one or two reads each, represents the barcode.
+  and the surviving stage c output matches neither.
+* Against that table, the rebuild holds 34,714 barcodes (34,500 before). 30,491 keep the same designed oligo,
+  3,914 that had none now have one, none that stays loses one, and 77 change between designs.
+* Supplementary Table 1 recomputed from the rebuild (same consolidation and fitness script) has the same 23 hits,
+  the same 24 edits in Figure 1D and the same depletion calls; 19 edits gain a measurement (none a hit), the
+  fitness index changes by a median of 0.0004 (at most 0.12), and the barcodes used rise from 5,945 to 6,484.
 
-`tie_order: legacy` keeps the original sorts and equals the original scripts run on the same CPU class.
+`tie_order: stable` drops the designed preference; `tie_order: legacy` keeps the original sorts and equals the
+original scripts run on the same CPU class.
