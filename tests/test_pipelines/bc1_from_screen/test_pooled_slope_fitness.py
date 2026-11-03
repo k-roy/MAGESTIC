@@ -121,3 +121,25 @@ def test_nrd1_parity_on_oak():
     assert len(j) == len(r) == len(mine)
     assert np.allclose(j.slope_adj, j.slope_adj_r, atol=1e-12, equal_nan=True)
     assert len(res["hits_summary"]) == 26 and len(res["hits_with_support"]) == 23
+
+
+def test_both_directions_call_the_enriched_mirror_without_changing_depleted_calls():
+    cfg = psf.PooledSlopeConfig(treatment="T", control="C", tail_prob=0.5, depletion_fc=0.3, direction="both")
+    res = psf.pooled_slope_fitness(_long(), cfg)
+    assert list(res["hits_with_support"].amino_acid_position) == [1]
+    e = res["hits_with_support_enriched"]
+    assert list(e.amino_acid_position) == [3] and int(e.n_support.iloc[0]) == 2
+    base = psf.pooled_slope_fitness(_long(), psf.PooledSlopeConfig(treatment="T", control="C", tail_prob=0.5,
+                                                                   depletion_fc=0.3))
+    assert "hits_with_support_enriched" not in base
+    pd.testing.assert_frame_equal(base["hits_with_support"].reset_index(drop=True),
+                                  res["hits_with_support"].reset_index(drop=True))
+
+
+def test_median_depth_normalization_keeps_a_read_floor():
+    counts = pd.DataFrame({"s0": [10, 30], "s4": [20, 80]}, index=["A", "B"])
+    samples = pd.DataFrame({"sample": ["s0", "s4"], "treatment": ["T", "T"], "replicate": [1, 1], "generation": [0, 4]})
+    keys = pd.DataFrame({"bc1": ["A", "B"], "variant_id": ["v1", "v2"]})
+    long = psf.long_from_count_matrix(counts, samples, keys, normalize="median_depth")
+    a = long[long.bc1 == "A"].set_index("generation")["value"]
+    assert a[0] == pytest.approx(10 / 40 * 70) and a[4] == pytest.approx(20 / 100 * 70)

@@ -69,6 +69,10 @@ class PooledSlopeConfig:
     ratio_factor: float = 3.0
     min_support: int = 1
     mutation_types: Tuple[str, ...] = ("missense", "synonymous", "PTC", "Deletion")
+    #: "depleted" (the R script) or "both": also call the enriched tail by the mirror of every test --
+    #: index above the (1 - tail_prob) quantile, final fold change above 1 / depletion_fc, and
+    #: index(treatment) / ratio_factor > index(control). PROVISIONAL for QTL screens (planning/384 §0).
+    direction: str = "depleted"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -169,7 +173,8 @@ def long_from_count_matrix(counts: pd.DataFrame, samples: pd.DataFrame, bc1_keys
     ``generation`` (integer); the row order sets "the first replicate" for per-barcode slopes.
     ``bc1_keys``: ``bc1`` plus the edit-key columns; only barcodes listed are kept (one row per bc1 required).
     ``normalize``: ``cpm`` (counts per million of the sample's total over ALL barcodes of the matrix, as the
-    NRD1 per-set counts were) or ``none``. ``pseudocount`` is added after normalizing, as in the NRD1 run.
+    NRD1 per-set counts were), ``median_depth`` (rescaled to the median sample depth, so ``min_g0`` stays a read
+    floor in libraries of millions of barcodes, where a CPM floor of 10 would drop nearly all of them) or ``none``. ``pseudocount`` is added after normalizing, as in the NRD1 run.
     """
     need = {"sample", "treatment", "replicate", "generation"}
     if not need <= set(samples.columns):
@@ -185,8 +190,11 @@ def long_from_count_matrix(counts: pd.DataFrame, samples: pd.DataFrame, bc1_keys
     m = counts[list(samples["sample"])].astype(float)
     if normalize == "cpm":
         m = m / m.sum(axis=0) * 1e6
+    elif normalize == "median_depth":  # counts rescaled to the median sample depth: a floor in reads, not per million
+        depth = m.sum(axis=0)
+        m = m / depth * float(np.median(depth))
     elif normalize != "none":
-        raise ValueError("normalize must be cpm or none")
+        raise ValueError("normalize must be cpm, median_depth or none")
     m = m + pseudocount
     m = m.loc[m.index.intersection(pd.Index(bc1_keys["bc1"]))]
     meta = samples.assign(generation=gens.astype(int)).set_index("sample")
@@ -380,7 +388,42 @@ def pooled_slope_fitness(long: pd.DataFrame, cfg: PooledSlopeConfig) -> Dict[str
     if hits is not None:
         out["hits_summary"] = hits
         out["hits_with_support"] = final
-    out["_parameters"] = pd.DataFrame([{**cfg.to_dict(), "hit_threshold": thr}])
+    thr_e = np.nan
+    if cfg.direction == "both":
+        thr_e = _quantile7(st.loc[st["treatment"] == T, "slope_adj"].to_numpy(float), 1 - cfg.tail_prob)
+        up = -np.log2(cfg.depletion_fc)
+        bw_e = bw[K + ["bc1", T] + ([C] if C is not None else []) + ["log2fc_last"]].copy()
+        ta = bw_e[T]
+        enr_bc = (bw_e["log2fc_last"] > up).astype("boolean").mask(bw_e["log2fc_last"].isna())
+        if C is not None:
+            cb = bw_e[C]
+            bw_e["supports_hit"] = (ta.notna() & cb.notna()).astype("boolean") & enr_bc & (ta > thr_e).astype("boolean") \
+                & (ta / cfg.ratio_factor > cb).astype("boolean")
+            bw_e["agrees_direction"] = ta.notna() & cb.notna() & (ta > cb) & (ta > 0)
+        else:
+            bw_e["supports_hit"] = ta.notna().astype("boolean") & enr_bc & (ta > thr_e).astype("boolean")
+            bw_e["agrees_direction"] = ta.notna() & (ta > 0)
+        sup_e = bw_e.groupby(K, dropna=False).agg(n_barcodes=("bc1", "size"),
+                                                 n_support=("supports_hit", lambda s: int(s.fillna(False).sum())),
+                                                 n_agree=("agrees_direction", "sum")).reset_index()
+        sup_e["pct_support"] = sup_e["n_support"] / sup_e["n_barcodes"]
+        sup_e["pct_agree"] = sup_e["n_agree"] / sup_e["n_barcodes"]
+        out.update({"barcode_support_flags_enriched": bw_e, "hit_barcode_support_summary_enriched": sup_e})
+        if C is not None:
+            sw = st[st["treatment"].isin([T, C]) & st["mutation_type"].isin(cfg.mutation_types)] \
+                if "mutation_type" in K else st[st["treatment"].isin([T, C])]
+            sw = _wide_by_treatment(sw, K, ["slope", "median_slope", "slope_adj"], [T, C])
+            last = dep.loc[dep["treatment"] == T, K + ["log2fc_last"]]
+            sw = sw.merge(last, on=K, how="left")
+            sw["enrichment"] = sw["log2fc_last"] > up
+            a, b = sw[f"slope_adj_{T}"], sw[f"slope_adj_{C}"]
+            sel = a.notna() & b.notna() & sw["enrichment"] & (a > thr_e) & (a / cfg.ratio_factor > b)
+            he = sw[sel].copy()
+            he["hit"] = True
+            he = he.merge(sup_e, on=K, how="left")
+            out["hits_summary_enriched"] = he
+            out["hits_with_support_enriched"] = he[he["n_support"].fillna(0) >= cfg.min_support].copy()
+    out["_parameters"] = pd.DataFrame([{**cfg.to_dict(), "hit_threshold": thr, "hit_threshold_enriched": thr_e}])
     return out
 
 
