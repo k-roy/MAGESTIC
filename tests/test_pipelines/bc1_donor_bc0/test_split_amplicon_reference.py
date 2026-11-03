@@ -62,8 +62,7 @@ def write_pair(d, prefix, pairs):
                 fh.write(f"@r{i}\n{p[idx]}\n+\n{'I' * len(p[idx])}\n")
 
 
-@pytest.fixture
-def project(tmp_path):
+def _make_project(tmp_path, extra=()):
     fq, coll = tmp_path / "fragment_fastq", tmp_path / "donor_bc0_fastq"
     fq.mkdir()
     coll.mkdir()
@@ -72,8 +71,8 @@ def project(tmp_path):
           + [(r1(BC1["C"]), r2("oligo_001"))] * 7)
     s2 = ([(r1(BC1["A"]), r2("oligo_001"))] * 8
           + [(r1(BC1["B"]), r2("oligo_002"))] * 5 + [(r1(BC1["B"]), r2("oligo_003"))] * 5)
-    write_pair(fq, "20250815_plate_5B_sample_1", s1)
-    write_pair(fq, "20250815_plate_5B_sample_2", s2)
+    write_pair(fq, "20250815_plate_5B_sample_1", s1 + list(extra))
+    write_pair(fq, "20250815_plate_5B_sample_2", s2 + list(extra))
     with open(coll / "20250815_plate_1C_sample_1_collapsed.fastq", "w") as fh:
         for n, (name, c) in enumerate((("oligo_001", 40), ("oligo_002", 30), ("oligo_003", 20))):
             s = merged(name)
@@ -99,6 +98,22 @@ def project(tmp_path):
            "oligo_pool": str(tmp_path / "pool.tsv"), "oligo_info": str(tmp_path / "info.tsv"),
            "table_name": "ref.tsv"}
     return cfg
+
+
+@pytest.fixture
+def project(tmp_path):
+    return _make_project(tmp_path)
+
+
+def _r2_error_variant_sorting_first(name):
+    """R2 for `name` with one substitution in the join key that makes the 60-nt fragment sort BEFORE the
+    designed one, so a stable tie order picks the error variant."""
+    o = OLIGOS[name]
+    d = o["donor"]
+    i = next(k for k in range(len(d) - 30, len(d)) if d[k] != "A")
+    bad = d[:i] + "A" + d[i + 1:]
+    assert bad[-30:] + SPS + o["bc0"] < fragment(name)
+    return sa.rev_comp(bad + SPS + o["bc0"] + MSD)[:150]
 
 
 def test_stage_b_counts_and_geometry(project):
@@ -162,3 +177,18 @@ def test_tie_order_is_validated(project):
     project["tie_order"] = "quick"
     with pytest.raises(ValueError):
         sa.run(project, stages=["c"], n_jobs=1)
+
+
+@pytest.mark.parametrize("tie_order, expect", [("designed", "oligo_001"), ("stable", "")])
+def test_designed_tie_order_keeps_the_designed_fragment_of_a_one_read_tie(tmp_path, tie_order, expect):
+    # bc1 D: in each sample one read of oligo_001's fragment and one read of a 1-edit error variant. The two
+    # collapse into one; which names the group is a 1-vs-1 tie. Stable order picks the variant (it sorts
+    # first) and the bc1 loses its design; the designed order keeps oligo_001.
+    d = _seq(20)
+    cfg = _make_project(tmp_path, extra=[(r1(d), r2("oligo_001")), (r1(d), _r2_error_variant_sorting_first("oligo_001"))])
+    cfg["tie_order"] = tie_order
+    sa.run(cfg, n_jobs=1)
+    t = pd.read_csv(f"{cfg['out_dir']}/data_tables/ref.tsv", sep="\t", keep_default_na=False, dtype=str)
+    row = t[t["bc1"] == d]
+    assert len(row) == 1 and row.iloc[0]["total_bc1_donor_bc0_counts"] == "4"
+    assert row.iloc[0]["db_oligo_name"] == expect

@@ -30,8 +30,14 @@ AVX-512 kernels where the CPU has them. The same legacy scripts on the same inpu
 node. Stage c also gathered results with ``Pool.imap_unordered``, so its per-bc1 top fragment among fragments
 tied on counts depended on worker scheduling (117 bc1s between two runs on one node).
 
-* ``tie_order="stable"`` (default): every sort is stable and results are gathered in group order, so ties go
-  to the earlier row of a fully specified order and the table is a function of the inputs alone, on any CPU.
+* ``tie_order="designed"`` (the runner's default; Kevin 2026-11-02): as ``stable``, and in addition, whenever the
+  collapse or the final top-fragment choice has to pick among EQUALLY supported fragments, it prefers one that
+  the donor-bc0 map (stage g) or the GDB plasmid map resolves to a designed donor: rank 0 a perfect full donor,
+  rank 1 a perfect central window, rank 2 neither. Rows that are not tied are never affected. Without it, a bc1
+  whose reads are two one-read fragments three edits apart was named by whichever sorted first, often the one
+  carrying the sequencing errors, and so lost its designed edit (planning/378 §2c).
+* ``tie_order="stable"``: every sort is stable and results are gathered in group order, so ties go to the
+  earlier row of a fully specified order and the table is a function of the inputs alone, on any CPU.
 * ``tie_order="legacy"``: the legacy sorts, so the route equals the legacy scripts run on the same CPU class,
   except stage c's scheduling ties (measured: 105 bc1s, all listed in the ties file).
 
@@ -168,9 +174,13 @@ def _collapse_group(args):
     distance = _levenshtein()
     group = group.copy()
     rows = []
+    ranked = "_rank" in group.columns
     while not group.empty:
-        top_idx = (group[count_col].sum(axis=1).idxmax() if isinstance(count_col, list)
-                   else group[count_col].idxmax())
+        score = group[count_col].sum(axis=1) if isinstance(count_col, list) else group[count_col]
+        if ranked:  # among rows tied on the score, the best designed rank, then group order
+            top_idx = group.loc[score == score.max(), "_rank"].idxmin()
+        else:
+            top_idx = score.idxmax()
         top_seq = group.loc[top_idx, seq_col]
         group["edit_distance"] = group[seq_col].apply(lambda x: distance(x, top_seq))
         mask = group["edit_distance"] <= thr
@@ -197,15 +207,46 @@ def collapse_sequences(df: pd.DataFrame, group_cols: List[str], seq_col: str, co
     return pd.DataFrame(rows)
 
 
+TIE_ORDERS = ("designed", "stable", "legacy")
+
+
 def _kind(tie_order: str) -> str:
-    if tie_order not in ("stable", "legacy"):
-        raise ValueError(f"tie_order must be 'stable' or 'legacy', not {tie_order!r}")
-    return "stable" if tie_order == "stable" else "quicksort"
+    if tie_order not in TIE_ORDERS:
+        raise ValueError(f"tie_order must be one of {TIE_ORDERS}, not {tie_order!r}")
+    return "quicksort" if tie_order == "legacy" else "stable"
+
+
+def designed_fragment_rank(donor_mapping: str, gdb_table: Optional[str] = None) -> Dict[str, int]:
+    """``donor_bc0_fragment -> 0`` (resolves to a perfect designed donor) or ``1`` (a perfect central window),
+    from the stage g map and, when given, the GDB plasmid map. Fragments absent from the dict rank 2."""
+    rank: Dict[str, int] = {}
+    srcs = [(donor_mapping, "db_perfect_donor", "db_perfect_middle_donor_region")]
+    if gdb_table:
+        srcs.append((gdb_table, "perfect_donor", "perfect_middle_donor_region"))
+    for path, pcol, mcol in srcs:
+        d = pd.read_csv(path, sep="\t", usecols=["donor_bc0_fragment", pcol, mcol])
+        d = d[d[pcol].astype(str).eq("True") | d[mcol].astype(str).eq("True")]
+        r = (~d[pcol].astype(str).eq("True")).astype(int)
+        for f, v in zip(d["donor_bc0_fragment"], r):
+            if v < rank.get(f, 2):
+                rank[f] = int(v)
+    return rank
 
 
 def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_jobs: int = 1,
-                          tie_order: str = "stable") -> Dict[str, int]:
-    """Stage c. Writes ``top_bc1_donor_bc0_fragments.tsv`` and ``top_fragment_ties.tsv`` in ``out_dir``."""
+                          tie_order: str = "stable", rank: Optional[Dict[str, int]] = None) -> Dict[str, int]:
+    """Stage c. Writes ``top_bc1_donor_bc0_fragments.tsv`` and ``top_fragment_ties.tsv`` in ``out_dir``.
+    ``tie_order="designed"`` needs ``rank`` (``designed_fragment_rank``)."""
+    _kind(tie_order)
+    designed = tie_order == "designed"
+    if designed and rank is None:
+        raise ValueError("tie_order='designed' needs the designed-fragment rank (run stage g first)")
+
+    def with_rank(df):
+        if designed:
+            df["_rank"] = df["donor_bc0_fragment"].map(rank).fillna(2).astype(int)
+        return df
+
     key = key[key["description"] == "bc1-donor-bc0"]
     dfs = []
     for _, row in key.iterrows():
@@ -221,7 +262,7 @@ def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_
     combined = (combined.groupby(["sample_number", "polymerase", "bc1", "donor_bc0_fragment"])["counts"]
                 .sum().reset_index())
 
-    per_sample = collapse_sequences(combined, ["sample_number", "bc1"], "donor_bc0_fragment", "counts",
+    per_sample = collapse_sequences(with_rank(combined), ["sample_number", "bc1"], "donor_bc0_fragment", "counts",
                                     EDIT_DISTANCE_THRESHOLD, n_jobs)
     per_sample = per_sample.merge(key, how="left")
 
@@ -230,9 +271,13 @@ def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_
                                      .nunique().reset_index(drop=True))
     allsamp.sort_values(by=["num_PCR_replicates"], ascending=False, inplace=True, kind=_kind(tie_order))
 
-    frag = collapse_sequences(allsamp, ["bc1"], "donor_bc0_fragment", ["counts", "num_PCR_replicates"],
+    frag = collapse_sequences(with_rank(allsamp), ["bc1"], "donor_bc0_fragment", ["counts", "num_PCR_replicates"],
                               EDIT_DISTANCE_THRESHOLD, n_jobs)
-    frag.sort_values(by=["counts"], ascending=False, inplace=True, kind="stable")  # imap order + stable: no scheduling ties
+    if designed:  # equal counts: the designed fragment first; then imap order (stable)
+        frag["designed_rank"] = frag["donor_bc0_fragment"].map(rank).fillna(2).astype(int)
+        frag = frag.sort_values(by=["counts", "designed_rank"], ascending=[False, True], kind="stable")
+    else:
+        frag.sort_values(by=["counts"], ascending=False, inplace=True, kind="stable")  # imap order: no scheduling ties
     frag.rename(columns={"counts": "total_bc1_donor_bc0_counts"}, inplace=True)
 
     # Ties the legacy code broke by worker scheduling: report them.
@@ -241,6 +286,7 @@ def combine_bc1_fragments(key: pd.DataFrame, fragment_dir: str, out_dir: str, n_
     tied_bc1 = at_max["bc1"].value_counts()
     tied_bc1 = tied_bc1[tied_bc1 > 1].index
     ties = at_max[at_max["bc1"].isin(tied_bc1)]
+    frag = frag.drop(columns=["designed_rank"], errors="ignore")  # reported in the ties file, not the table
 
     top = frag.drop_duplicates(subset=["bc1"], keep="first").reset_index(drop=True)
     top = top.rename(columns={"donor_bc0_fragment": "top_bc1_donor_fragment",
@@ -385,18 +431,19 @@ def _run_e(args):
     return out, parse_donor_bc0_collapsed(fq, out)
 
 
-def run(cfg: dict, stages: Sequence[str] = ("b", "e", "c", "f", "g", "h"), n_jobs: int = 1) -> dict:
+def run(cfg: dict, stages: Sequence[str] = ("b", "e", "f", "g", "c", "h"), n_jobs: int = 1) -> dict:
     """Run the requested stages. ``cfg`` keys: ``out_dir``, ``key``, ``fragment_fastq_dir`` (trimmed R1/R2),
     ``donor_bc0_fastq_dir`` (collapsed), ``gdb_table``, ``oligo_pool``, ``oligo_info``, ``table_name``; optional
     ``fragment_counts_dir`` / ``donor_bc0_counts_dir`` to start from existing stage b / e outputs, and
-    ``tie_order`` (``stable``, the default, or ``legacy``; see the module docstring)."""
+    ``tie_order`` (``designed``, the default, ``stable`` or ``legacy``; see the module docstring). Stages run in
+    the order b, e, f, g, c, h whatever order they are named in, because ``designed`` reads stage g in stage c."""
     from magestic.utils.provenance import StepProvenance, write_run_provenance
 
     out = Path(cfg["out_dir"])
     frag_dir = cfg.get("fragment_counts_dir") or str(out / "bc1_donor_bc0_fragment_counts")
     dbc_dir = cfg.get("donor_bc0_counts_dir") or str(out / "complete_donor_bc0_counts")
     tables = str(out / "data_tables")
-    tie_order = cfg.get("tie_order", "stable")
+    tie_order = cfg.get("tie_order", "designed")
     _kind(tie_order)
     table = os.path.join(tables, cfg.get("table_name", "bc1_reference_table.tsv"))
     key = pd.read_csv(cfg["key"], sep="\t")
@@ -428,14 +475,6 @@ def run(cfg: dict, stages: Sequence[str] = ("b", "e", "c", "f", "g", "h"), n_job
         p.set_counts(samples=len(recs), records=int(sum(recs.values()))).write(f"{dbc_dir}/.e.provenance.json")
         sidecars.append(f"{dbc_dir}/.e.provenance.json")
         summary["e"] = {"samples": len(recs), "records": int(sum(recs.values()))}
-    if "c" in stages:
-        o = os.path.join(tables, "top_bc1_donor_bc0_fragments.tsv")
-        p = step("c_combine_bc1_fragments", o, "edit-distance collapse, PCR-replicate support, bc1 purity")
-        p.set_parameters(edit_distance_threshold=EDIT_DISTANCE_THRESHOLD, min_pcr_replicates=MIN_PCR_REPLICATES,
-                         tie_order=tie_order)
-        summary["c"] = combine_bc1_fragments(key, frag_dir, tables, n_jobs, tie_order)
-        p.set_counts(**summary["c"]).add_output(o).write()
-        sidecars.append(p.sidecar_path())
     if "f" in stages:
         o = os.path.join(tables, "combined_donor_bc0_counts.tsv")
         p = step("f_combine_donor_bc0", o, "donor-bc0 counts summed over samples")
@@ -450,6 +489,19 @@ def run(cfg: dict, stages: Sequence[str] = ("b", "e", "c", "f", "g", "h"), n_job
         summary["g"] = map_donor_bc0_to_oligos(os.path.join(tables, "combined_donor_bc0_counts.tsv"),
                                                cfg["oligo_pool"], tables, tie_order)
         p.set_counts(**summary["g"]).add_output(o).write()
+        sidecars.append(p.sidecar_path())
+    if "c" in stages:
+        o = os.path.join(tables, "top_bc1_donor_bc0_fragments.tsv")
+        p = step("c_combine_bc1_fragments", o, "edit-distance collapse, PCR-replicate support, bc1 purity")
+        p.set_parameters(edit_distance_threshold=EDIT_DISTANCE_THRESHOLD, min_pcr_replicates=MIN_PCR_REPLICATES,
+                         tie_order=tie_order)
+        rank = None
+        if tie_order == "designed":
+            mapping = os.path.join(tables, "donor_bc0_to_oligo_mapping.tsv")
+            p.add_input(mapping, role="donor_bc0_map").add_input(cfg["gdb_table"], role="gdb_plasmid_map")
+            rank = designed_fragment_rank(mapping, cfg["gdb_table"])
+        summary["c"] = combine_bc1_fragments(key, frag_dir, tables, n_jobs, tie_order, rank)
+        p.set_counts(**summary["c"]).add_output(o).write()
         sidecars.append(p.sidecar_path())
     if "h" in stages:
         p = step("h_link_reference_table", table, "bc1 reference table")
@@ -472,7 +524,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                  description="Build a bc1 reference table from a split-amplicon (2x150) layout: "
                                              "bc1-donor-bc0 fragment reads + donor-bc0 reads + a GDB plasmid map.")
     ap.add_argument("--config", required=True, help="JSON or YAML with the keys documented in run()")
-    ap.add_argument("--stages", default="b,e,c,f,g,h")
+    ap.add_argument("--stages", default="b,e,f,g,c,h")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
