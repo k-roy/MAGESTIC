@@ -69,19 +69,16 @@ redi = [
 # requires both paths provably use one implementation.
 # NOTE: `samtools` must also be on PATH — sv_plasmid shells out to it three times. That is
 # not expressible as a Python dependency; step_3 preflights the binary instead.
-# The TRACE pin is the head of the PUBLIC branch `integrate/june-main-and-205-wgs`
-# (k-roy/TRACE PR #4, planning/268): GitHub's June modules + the September reconcile line +
-# the 205 lane's repairs, the only TRACE that defines `score_edit_site` / `bc_confidence_from`
-# / `build_edit_sites(fasta=)`, which Stage 4 calls, plus Kevin's 2026-10-25 depth-conditional
-# floor (`min_alt_reads` / `classify_counts`, planning/284 section 8). Bumped 2026-10-30 to the head of the
-# pushed branch `feat/328-local-realign` (k-roy/TRACE PR #5, SGTC planning/328): local realignment of the reads
-# at a localized edit, the Half B dovetail fix and the Stage 2 BP_RESOLUTION fix. It resolves for pip from that pushed ref
-# before the PR merges; merge the PR with a merge commit (not squash or rebase) so the sha
-# stays on `main`. Never pin a sha that exists only in a local clone: it cannot resolve.
+# TRACE comes from PyPI by version, not from a git sha: PyPI refuses to publish a package with a
+# git-URL dependency, so a sha pin kept `magestic[wgs]` off PyPI (SGTC planning/268 section 5).
+# trace-crispr 0.7.0 (2026-11-05, TRACE main e32c2af) is the first release with the WGS modules
+# Stage 1-4 call; it contains every sha this extra was pinned to before (12b35c5 ... 4279260).
+# Pinned EXACTLY: a PyPI release is immutable, so == is as fixed as the old sha, and a range would let
+# the algorithm layer move under the parity tests (tests/test_pipelines/wgs/test_imports.py).
 wgs = [
     "pysam>=0.21",
     "rapidfuzz>=3.0",
-    "trace-crispr @ git+https://github.com/k-roy/TRACE.git@427926016798672e9b7d66ee76eb84d491cb81a3",
+    "trace-crispr==0.7.0",
 ]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [
@@ -134,9 +131,9 @@ magestic-harmonize-oligos  = "magestic.utils.harmonize_oligos:_cli"
 magestic-annotate-deseq2  = "magestic.utils.annotate_deseq2:_cli"
 
 [project.urls]
-Homepage = "https://github.com/kevinroy-lab/magestic"
-Repository = "https://github.com/kevinroy-lab/magestic"
-"Bug Tracker" = "https://github.com/kevinroy-lab/magestic/issues"
+Homepage = "https://github.com/k-roy/MAGESTIC"
+Repository = "https://github.com/k-roy/MAGESTIC"
+"Bug Tracker" = "https://github.com/k-roy/MAGESTIC/issues"
 
 [tool.hatch.metadata]
 # Required by the `wgs` extra's PEP 508 direct reference (the pinned TRACE sha).
