@@ -131,9 +131,9 @@ magestic-harmonize-oligos  = "magestic.utils.harmonize_oligos:_cli"
 magestic-annotate-deseq2  = "magestic.utils.annotate_deseq2:_cli"
 
 [project.urls]
-Homepage = "https://github.com/kevinroy-lab/magestic"
-Repository = "https://github.com/kevinroy-lab/magestic"
-"Bug Tracker" = "https://github.com/kevinroy-lab/magestic/issues"
+Homepage = "https://github.com/k-roy/MAGESTIC"
+Repository = "https://github.com/k-roy/MAGESTIC"
+"Bug Tracker" = "https://github.com/k-roy/MAGESTIC/issues"
 
 [tool.hatch.metadata]
 # Required by the `wgs` extra's PEP 508 direct reference (the pinned TRACE sha).
