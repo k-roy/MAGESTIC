@@ -27,7 +27,7 @@ jobs:
       - name: Install package, dev, wgs and screen dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y samtools  # TRACE sv_plasmid shells out to it
-          pip install -e ".[dev,wgs,screen]"   # wgs = the pinned TRACE; screen = openpyxl for the REDI tests
+          pip install -e ".[dev,wgs,screen,redi]"   # wgs = the pinned TRACE; redi = openpyxl + pyarrow
 
       - name: Run unit tests (skip integration — requires Oak data paths)
         run: pytest tests/ -m "not integration" -v --tb=short
