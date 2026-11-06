@@ -73,10 +73,12 @@ redi = [
 # git-URL dependency, so a sha pin kept `magestic[wgs]` off PyPI (SGTC planning/268 section 5).
 # trace-crispr 0.7.0 (2026-11-05, TRACE main e32c2af) is the first release with the WGS modules
 # Stage 1-4 call; it contains every sha this extra was pinned to before (12b35c5 ... 4279260).
+# Pinned EXACTLY: a PyPI release is immutable, so == is as fixed as the old sha, and a range would let
+# the algorithm layer move under the parity tests (tests/test_pipelines/wgs/test_imports.py).
 wgs = [
     "pysam>=0.21",
     "rapidfuzz>=3.0",
-    "trace-crispr>=0.7.0,<0.8",
+    "trace-crispr==0.7.0",
 ]
 # Full install: all pipelines + snakemake (excludes ihw which requires R)
 full = [

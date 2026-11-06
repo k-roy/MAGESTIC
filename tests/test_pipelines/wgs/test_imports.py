@@ -73,11 +73,6 @@ LAYOUT_MODULES = (
 #: Sub-packages that carry the house one-line docstring and `__all__`.
 SUBPACKAGES = ("", "core", "readers", "pipeline", "qc", "snakemake", "slurm", "scripts")
 
-#: The commit that must NOT be pinned. Exporting TRACE at this sha yields a
-#: 9-name `trace_crispr.wgs.__all__` carrying only `donor_outcome`; the other
-#: three modules raise ModuleNotFoundError. A quiet 1-of-4 API is worse than an
-#: unresolvable pin, so this prefix is a hard fail.
-KNOWN_BAD_TRACE_SHA_PREFIX = "4d139a6"
 
 
 # ---------------------------------------------------------------------------
@@ -203,26 +198,26 @@ def test_full_extra_includes_wgs(optional_dependencies):
     assert "wgs" in full, f"`full` extra does not include wgs: {full!r}"
 
 
-def test_trace_is_pinned_by_full_sha(optional_dependencies):
-    """TRACE is pinned by a full 40-character sha, not a branch or tag.
+def test_trace_is_pinned_to_one_immutable_release(optional_dependencies):
+    """TRACE is pinned to ONE PyPI release (`==X.Y.Z`), not a range, branch or git URL.
 
-    A moving ref would let the installed algorithm layer change underneath a
-    parity test that asserts byte-identical output.
+    A moving requirement would let the installed algorithm layer change underneath a
+    parity test that asserts byte-identical output. A PyPI release cannot be replaced,
+    so `==` fixes the code as firmly as the 40-character sha this test used to require;
+    a git URL is refused because PyPI will not publish a package that declares one
+    (SGTC planning/268 section 5), which kept `magestic[wgs]` off PyPI.
     """
     reqs = optional_dependencies["wgs"]
     trace = [r for r in reqs if "trace" in r.lower()]
     assert trace, f"`wgs` extra does not depend on TRACE: {reqs}"
     assert len(trace) == 1, f"more than one TRACE requirement: {trace}"
-    sha = re.search(r"@([0-9a-f]{40})\b", trace[0])
-    assert sha, (
-        f"TRACE is not pinned by a full 40-character sha: {trace[0]!r}. "
-        "A branch or short sha lets the algorithm layer move under the parity test."
-    )
-    assert not sha.group(1).startswith(KNOWN_BAD_TRACE_SHA_PREFIX), (
-        f"TRACE is pinned at {sha.group(1)[:7]}, which predates the commit that "
-        "added bc1_consensus, reconcile and sv_plasmid. Installing it yields a "
-        "9-name trace_crispr.wgs.__all__ and ModuleNotFoundError on 3 of 4 modules."
-    )
+    assert "git+" not in trace[0] and "@" not in trace[0], (
+        f"TRACE is a direct URL requirement: {trace[0]!r}. PyPI refuses to publish it.")
+    pin = re.fullmatch(r"\s*trace-crispr\s*==\s*(\d+)\.(\d+)\.(\d+)\s*", trace[0])
+    assert pin, f"TRACE is not pinned to one release with `==X.Y.Z`: {trace[0]!r}"
+    assert tuple(map(int, pin.groups())) >= (0, 7, 0), (
+        f"TRACE {trace[0]!r} predates 0.7.0, the first release with bc1_consensus, "
+        "reconcile and sv_plasmid; older releases give ModuleNotFoundError on 3 of 4 modules.")
 
 
 def test_rapidfuzz_is_a_hard_dependency_of_the_extra(optional_dependencies):
