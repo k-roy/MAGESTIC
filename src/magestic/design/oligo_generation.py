@@ -36,7 +36,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Sequence
+from .synonymous_recode import recode_donor_to_remove_sites
 
 from magestic.design.guide_donor_functions import rev_comp
 from magestic.design.nuclease import NucleaseConfig, expand_pam_motif
@@ -177,6 +178,51 @@ def load_guides_from_fasta(
 # Donor construction
 # ---------------------------------------------------------------------------
 
+def _recode_arms_to_remove_sites(
+    genome_seq: dict,
+    chrom: str,
+    left_side_donor: str,
+    alt: str,
+    right_side_donor: str,
+    donor_start_coord: int,
+    restriction_sites,
+    cds_model,
+    recode_log,
+):
+    """Last resort before rejecting a donor: destroy the site with a SYNONYMOUS codon change.
+
+    Shifting the homology arms is tried first and is always preferred, because it changes no
+    bases. When no shift keeps ``minimum_homology`` on both sides and the donor lies inside a
+    coding sequence, a synonymous substitution removes the site in place at no biological cost:
+    the protein is unchanged and the intended edit is protected explicitly.
+
+    Returns rebuilt ``(left_side_donor, right_side_donor)``, or ``None`` when no synonymous fix
+    exists -- in which case the caller rejects the donor exactly as it did before, so passing no
+    ``cds_model`` reproduces the previous behaviour byte for byte.
+    """
+    if cds_model is None:
+        return None
+    cds_blocks, strand, cds_sequence = cds_model
+    donor = left_side_donor + alt + right_side_donor
+    edit_start = donor_start_coord + len(left_side_donor) + 1
+    protected = range(edit_start, edit_start + len(alt))
+    recoded, changes = recode_donor_to_remove_sites(
+        donor,
+        donor_start_coord + 1,
+        cds_blocks,
+        strand,
+        cds_sequence,
+        restriction_sites,
+        protected=protected,
+    )
+    if recoded is None or not changes:
+        return None
+    if recode_log is not None:
+        for position, was, now in changes:
+            recode_log.append((chrom, position, was, now))
+    return recoded[: len(left_side_donor)], recoded[len(left_side_donor) + len(alt):]
+
+
 def construct_donor(
     chrom: str,
     variant_coord: int,
@@ -191,6 +237,8 @@ def construct_donor(
     plus_strand_bedgraph: dict,
     minus_strand_bedgraph: dict,
     restriction_sites: Tuple[str, str] = _DEFAULT_RESTRICTION_SITES,
+    cds_model: Optional[Tuple[Sequence[Tuple[int, int]], str, str]] = None,
+    recode_log: Optional[List[Tuple[str, int, str, str]]] = None,
 ) -> Optional[Tuple]:
     """
     Build a homology-directed repair (HDR) donor for a single variant.
@@ -289,7 +337,18 @@ def construct_donor(
         or (at_right_end and re_in_left)
         or (at_left_end and re_in_right)
     ):
-        return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+        # Shifting the arms failed. Before losing the design, try destroying the site with a
+        # SYNONYMOUS codon change -- only possible inside a CDS, and only when `cds_model` is
+        # supplied. The intended edit is protected explicitly and the protein is unchanged.
+        _rescued = _recode_arms_to_remove_sites(
+            genome_seq, chrom, left_side_donor, alt, right_side_donor,
+            start_of_variant - left_arm + donor_shift,
+            restriction_sites, cds_model, recode_log,
+        )
+        if _rescued is None:
+            return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+        left_side_donor, right_side_donor = _rescued
+        donor = left_side_donor + alt + right_side_donor
 
     elif re_in_left:
         donor_shift += 1
@@ -302,7 +361,18 @@ def construct_donor(
             left_side_donor = genome_seq[chrom][start_of_variant - left_arm + donor_shift: start_of_variant]
             right_side_donor = genome_seq[chrom][end_of_variant: end_of_variant + right_arm + donor_shift]
         if _restriction_site_in_seq(right_side_donor, restriction_sites) or _restriction_site_in_seq(left_side_donor, restriction_sites):
-            return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+            # Shifting the arms failed. Before losing the design, try destroying the site with a
+            # SYNONYMOUS codon change -- only possible inside a CDS, and only when `cds_model` is
+            # supplied. The intended edit is protected explicitly and the protein is unchanged.
+            _rescued = _recode_arms_to_remove_sites(
+                genome_seq, chrom, left_side_donor, alt, right_side_donor,
+                start_of_variant - left_arm + donor_shift,
+                restriction_sites, cds_model, recode_log,
+            )
+            if _rescued is None:
+                return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+            left_side_donor, right_side_donor = _rescued
+            donor = left_side_donor + alt + right_side_donor
 
     elif re_in_right:
         donor_shift -= 1
@@ -315,7 +385,18 @@ def construct_donor(
             left_side_donor = genome_seq[chrom][start_of_variant - left_arm + donor_shift: start_of_variant]
             right_side_donor = genome_seq[chrom][end_of_variant: end_of_variant + right_arm + donor_shift]
         if _restriction_site_in_seq(left_side_donor, restriction_sites) or _restriction_site_in_seq(right_side_donor, restriction_sites):
-            return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+            # Shifting the arms failed. Before losing the design, try destroying the site with a
+            # SYNONYMOUS codon change -- only possible inside a CDS, and only when `cds_model` is
+            # supplied. The intended edit is protected explicitly and the protein is unchanged.
+            _rescued = _recode_arms_to_remove_sites(
+                genome_seq, chrom, left_side_donor, alt, right_side_donor,
+                start_of_variant - left_arm + donor_shift,
+                restriction_sites, cds_model, recode_log,
+            )
+            if _rescued is None:
+                return None, donor, "donor_with_restriction_site_not_allowing_shifting"
+            left_side_donor, right_side_donor = _rescued
+            donor = left_side_donor + alt + right_side_donor
 
     # The arms that were actually BUILT can still fall short of the floor: near a
     # contig end, donor_shift is set from the chromosome bounds without reference to
