@@ -730,9 +730,10 @@ METRICS_JSON_NAME = "representation_metrics.json"
 METRICS_FAILED_NAME = "representation_metrics.FAILED.txt"
 
 #: Count floors reported by default. Several, not one, because a singleton-heavy distinct-key
-#: denominator mostly measures the error tail: 34.5 % singletons at the purity-filtered guide-bc0
-#: grain of the 2026-11 POL3 tables, 65.2-83.5 % at the finer bc1 grain of the shipped barcode maps
-#: (unit 2168 ss5.4 / 5.8.3). ``0`` keeps the designed zero-count oligos in the universe.
+#: denominator mostly counts a low-abundance tail rather than the library: 34.5 % singletons at the
+#: purity-filtered guide-bc0 grain of the 2026-11 POL3 tables, 65.2-83.5 % at the finer bc1 grain of
+#: the shipped barcode maps (unit 2168 ss5.4 / 5.8.3 -- which also measured that this tail is NOT
+#: simple sequencing error). ``0`` keeps the designed zero-count oligos in the universe.
 DEFAULT_METRIC_MIN_COUNTS = (0, 1, 2, 5, 10)
 
 #: Grain -> count column. A floor of 2 means a different thing at each grain, so both are

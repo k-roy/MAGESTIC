@@ -27,17 +27,23 @@ Two consequences are built into the API rather than left to the reader:
 **The count floor is not cosmetic, and how much it matters depends on the grain.** Measured on this
 project's own 2026-11 data, at the **bc1 grain** of the shipped barcode-to-site maps, **65.2 % and
 65.6 % of distinct bc1 are singletons** (unit 2168 §5.4, job 53132618), and after the package's own
-correction that fraction *rises* to **83.5 % / 75.6 %** (§5.8.3) — while those singletons carry only
-about **0.06 %** of the read pairs. At the coarser, already purity-filtered **guide-bc0 grain**
-of ``guide_donor_bc0`` step 05, the same project measures **34.5 %** singletons (POL3_lib1_LND,
-23,127 keys at depth 68,569). Three different numbers at three different grains and stages, so the
-floor and the grain are reported as columns and never assumed.
+correction that fraction *rises* to **83.5 % / 75.6 %** (§5.8.3). Those singletons carry **0.52 %**
+of the plasmid map's read pairs and **0.06 %** of the yeast map's. At the coarser, already
+purity-filtered **guide-bc0 grain** of ``guide_donor_bc0`` step 05, the same project measures
+**34.5 %** singletons (POL3_lib1_LND, 23,127 keys at depth 68,569). Different numbers at different
+grains and stages, so the floor and the grain are reported as columns and never assumed.
 
-Wherever the singleton share is large the distinct-key denominator is dominated by the synthesis and
-sequencing error tail, and an unfloored Gini over distinct keys is close to meaningless: it mostly
-measures how many error variants the run happened to see. Hence ``min_count`` is an explicit
-argument everywhere, :func:`representation_metrics` reports at several floors by default rather
-than one, and ``min_count=0`` (keep the designed zeros) is a distinct, labelled choice.
+Wherever that share is large, the distinct-key denominator is dominated by a **low-abundance tail
+that cannot be real library membership at these depths** -- a barcode seen once in 17.8 M read pairs
+sits at a frequency of ~5.6e-8, and no member of a library of order 1e4 can be that rare -- so an
+unfloored Gini over distinct keys is close to meaningless: it mostly counts how many such keys the
+run happened to see. ⚠️ **Do not call that tail sequencing error.** 2168 §5.8.3 measured the
+opposite: the surviving singletons are not Hamming-1 neighbours of abundant barcodes, and the
+fraction *rises* after the package's own correction, so they are contamination, index hopping, or
+genuinely rare molecules. The floor argument does not depend on the mechanism, only on the
+abundance. Hence ``min_count`` is an explicit argument everywhere,
+:func:`representation_metrics` reports at several floors by default rather than one, and
+``min_count=0`` (keep the designed zeros) is a distinct, labelled choice.
 
 **The same floor choice already differs inside this package**, which is why the universe is
 recorded too: ``guide_donor_bc0.core.library_representation.gini_index`` documents that zero-count
@@ -52,17 +58,18 @@ From the 2026-11 rerun of the POL3 guide-donor-bc0 libraries (unit 2168 §6.0.2 
 job 53132655), scoring one arm frame against Alex's designed donor table — **the same comparison,
 two denominators**:
 
-====================================  =====================  ======================
-frame / source                        distinct-key hit rate  read/link-weighted rate
-====================================  =====================  ======================
-``(donor + SPS[:5])[-40:]`` (§6.0.2)  **0.90 %**             **89.31 %**
-``revcomp(donor[-35:] + SPS[:5])``    **0.59 %**             **90.91 %**
-(§5.5a, link-weighted)
-====================================  =====================  ======================
+===================================  =====================  =====================
+population (§6.0.2, frame             distinct-key hit rate  READ-WEIGHTED rate
+``(donor + SPS[:5])[-40:]``)
+===================================  =====================  =====================
+plasmid                              **0.90 %**             **89.31 %**
+yeast                                **0.24 %**             **96.86 %**
+===================================  =====================  =====================
 
-A factor of ~100–150 between two correct numbers for one comparison. The distinct-key rate is low
-only because most distinct keys are low-abundance error variants; it is almost never the number
-anyone wants, and reading one as the other was the single most repeated mistake in that unit.
+A factor of ~100–400 between two correct numbers for one comparison, in both populations. The
+distinct-key rate is low only because most distinct keys are low-abundance variants, real or not;
+it is almost never the number anyone wants, and reading one as the other was the single most
+repeated mistake in that unit (three times in one night, by its own count).
 :func:`coverage_fractions` returns both from one call so neither can be quoted alone.
 
 Author: Kevin R. Roy
