@@ -24,9 +24,17 @@ Two consequences are built into the API rather than left to the reader:
    libraries can be compared honestly, and records the depth, the replicate count and the seed.
    Anything not rarefied says so in its label.
 
-**The count floor is not cosmetic.** In the 2026-11 AsLOV2/POL3 guide-donor-bc0 data, 65–84 % of
-distinct barcodes are singletons, so the distinct-key denominator is dominated by the synthesis and
-sequencing error tail. An unfloored Gini over distinct keys is close to meaningless: it mostly
+**The count floor is not cosmetic, and how much it matters depends on the grain.** Measured on this
+project's own 2026-11 data, at the **bc1 grain** of the shipped barcode-to-site maps, **65.2 % and
+65.6 % of distinct bc1 are singletons** (unit 2168 §5.4, job 53132618), and after the package's own
+correction that fraction *rises* to **83.5 % / 75.6 %** (§5.8.3) — while those singletons carry only
+about **0.06 %** of the read pairs. At the coarser, already purity-filtered **guide-bc0 grain**
+of ``guide_donor_bc0`` step 05, the same project measures **34.5 %** singletons (POL3_lib1_LND,
+23,127 keys at depth 68,569). Three different numbers at three different grains and stages, so the
+floor and the grain are reported as columns and never assumed.
+
+Wherever the singleton share is large the distinct-key denominator is dominated by the synthesis and
+sequencing error tail, and an unfloored Gini over distinct keys is close to meaningless: it mostly
 measures how many error variants the run happened to see. Hence ``min_count`` is an explicit
 argument everywhere, :func:`representation_metrics` reports at several floors by default rather
 than one, and ``min_count=0`` (keep the designed zeros) is a distinct, labelled choice.

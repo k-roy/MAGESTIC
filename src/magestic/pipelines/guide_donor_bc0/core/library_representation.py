@@ -729,9 +729,10 @@ METRICS_TSV_NAME = "representation_metrics.tsv"
 METRICS_JSON_NAME = "representation_metrics.json"
 METRICS_FAILED_NAME = "representation_metrics.FAILED.txt"
 
-#: Count floors reported by default. Several, not one, because in this data 65-84 % of
-#: distinct barcodes are singletons: an unfloored statistic over distinct keys mostly
-#: measures the error tail. ``0`` keeps the designed zero-count oligos in the universe.
+#: Count floors reported by default. Several, not one, because a singleton-heavy distinct-key
+#: denominator mostly measures the error tail: 34.5 % singletons at the purity-filtered guide-bc0
+#: grain of the 2026-11 POL3 tables, 65.2-83.5 % at the finer bc1 grain of the shipped barcode maps
+#: (unit 2168 ss5.4 / 5.8.3). ``0`` keeps the designed zero-count oligos in the universe.
 DEFAULT_METRIC_MIN_COUNTS = (0, 1, 2, 5, 10)
 
 #: Grain -> count column. A floor of 2 means a different thing at each grain, so both are
@@ -834,9 +835,11 @@ def compute_representation_metrics(
 
     - ``oligo`` — from *oligo_df* (step 05's own output), counts per designed oligo per library.
     - ``guide_bc0`` — from the step-04 purity-filtered files in *purity_dir*, counts per
-      guide-barcode key. This is the grain at which the singleton tail lives (65-84 % of
-      distinct barcodes in the 2026-11 POL3 data), so it is the grain where the floor matters
-      most and where an unfloored Gini is least meaningful.
+      guide-barcode key. The finer grain, and the one where a count floor bites hardest: the
+      2026-11 POL3 purity-filtered tables are 34.5 % singletons at this grain, against 65.2-83.5 %
+      at the much finer bc1 grain of the shipped barcode maps (unit 2168 ss5.4 / 5.8.3). Those are
+      different grains at different stages, which is why the floor and the grain are columns of the
+      output rather than assumptions.
 
     Every value carries its depth, floor, n and universe; see :mod:`magestic.utils.metrics`.
 
@@ -854,7 +857,11 @@ def compute_representation_metrics(
             min_counts=min_counts, rarefy_to=rarefy_to, replicates=replicates, seed=seed,
         ))
 
+    purity_inputs: List[Path] = []
     if purity_dir is not None and Path(purity_dir).exists():
+        # Record the files actually read, not just the directory: the package's provenance policy
+        # is "every input path WITH its md5 -- a path is not a version".
+        purity_inputs = sorted(Path(purity_dir).glob(f"*{PURITY_INPUT_SUFFIX}"))
         purity_frames = load_purity_files(Path(purity_dir))
         if purity_frames:
             purity = pd.concat(purity_frames, ignore_index=True)
@@ -891,6 +898,8 @@ def compute_representation_metrics(
             for p in (provenance_inputs or []):
                 if Path(p).exists():
                     prov.add_input(p, role="representation_input")
+            for p in purity_inputs:
+                prov.add_input(p, role="purity_filtered_counts")
             prov.set_parameters(
                 min_counts=list(min_counts),
                 rarefy_to=rarefy_to,

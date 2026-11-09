@@ -121,6 +121,13 @@ class GuideDonorBC0Config:
     """Maps library ID → expected SPS sequence (e.g. {"V629": "CTTGAC..."}).
     Leave empty to skip missing-oligo filling."""
 
+    # Step 05: representation / evenness metrics (additive; see magestic.utils.metrics)
+    metrics_rarefy_to: Optional[int] = None
+    """Common depth to ALSO report the representation statistics at, so two libraries can be
+    compared honestly. None (default) means every value is labelled sample-specific, which is the
+    right default for a single run. Every statistic in that table is depth-dependent: computed on a
+    sample it describes the sample, not the library."""
+
     # Oligo-design source for Step 03 matching
     use_harmonized_table: bool = True
     """Match against the harmonized QTL oligo table (per-nuclease guide/donor)
