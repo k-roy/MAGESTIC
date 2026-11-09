@@ -704,3 +704,215 @@ def run_library_plots(
 
     # Plot: category percentages (only if match quality columns present)
     plot_category_percentages(combined, plots_dir)
+# ============================================================================
+# Step 05 (additive): native representation / evenness metrics
+#
+# 🔴 ADDITIVE ONLY. Nothing below is called by run_representation_analysis or
+# run_library_plots, and nothing below changes an existing column or file. It
+# writes NEW sidecars beside the existing step-05 outputs:
+#
+#     summary_plots/representation_metrics.tsv    (long format, one row per
+#                                                  library x grain x floor x metric)
+#     summary_plots/representation_metrics.json
+#     summary_plots/representation_metrics.tsv.provenance.json
+#
+# Why it lives here rather than inside run_representation_analysis: external
+# callers of that function must see byte-identical behaviour, so the pipeline
+# step calls this afterwards instead.
+#
+# The statistics themselves are in magestic.utils.metrics, which carries the
+# depth-dependence contract (no bare floats, rarefaction, explicit floors) and
+# the worked example from the 2026-11 POL3 rerun.
+# ============================================================================
+
+METRICS_TSV_NAME = "representation_metrics.tsv"
+METRICS_JSON_NAME = "representation_metrics.json"
+METRICS_FAILED_NAME = "representation_metrics.FAILED.txt"
+
+#: Count floors reported by default. Several, not one, because in this data 65-84 % of
+#: distinct barcodes are singletons: an unfloored statistic over distinct keys mostly
+#: measures the error tail. ``0`` keeps the designed zero-count oligos in the universe.
+DEFAULT_METRIC_MIN_COUNTS = (0, 1, 2, 5, 10)
+
+#: Grain -> count column. A floor of 2 means a different thing at each grain, so both are
+#: reported and the grain is a column rather than a footnote.
+OLIGO_COUNT_COL = "grouped_oligo_name_counts"
+GUIDE_BC0_COUNT_COL = "grouped_guide_bc0_counts"
+
+
+def library_metrics_table(
+    df: pd.DataFrame,
+    *,
+    count_col: str,
+    grain: str,
+    library_col: str = "library",
+    min_counts=DEFAULT_METRIC_MIN_COUNTS,
+    rarefy_to: Optional[int] = None,
+    replicates: int = 20,
+    seed: int = 20262174,
+    universe: Optional[str] = None,
+    n_designed: Optional[Dict[str, int]] = None,
+) -> pd.DataFrame:
+    """Long-format representation metrics per library for one grain.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must have *library_col* and *count_col*.
+    count_col : str
+        Column of counts per member, for example ``grouped_oligo_name_counts`` at oligo grain
+        or ``grouped_guide_bc0_counts`` at guide-bc0 grain.
+    grain : str
+        What one row of *df* is: ``oligo`` or ``guide_bc0``. Recorded in every output row,
+        because a count floor is not comparable across grains.
+    min_counts : sequence of int
+        Floors to report at. ``0`` keeps zero-count members.
+    rarefy_to : int, optional
+        Common depth to also report at. ``None`` (default) means every value is labelled
+        sample-specific, which is the honest default for a single run.
+    universe : str, optional
+        ``metrics.UNIVERSE_DESIGNED`` when absent designed members are present as zero rows
+        (which step 05 does when ``library_sps_map`` is set), else ``UNIVERSE_OBSERVED``.
+        Inferred from the presence of zero counts when not given.
+    n_designed : dict[str, int], optional
+        Designed universe size per library, for a coverage denominator.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per library x floor x metric, with the depth, floor, n, universe, grain and
+        rarefaction state as columns. Empty DataFrame if *df* lacks the required columns.
+    """
+    from magestic.utils import metrics as _metrics
+
+    if library_col not in df.columns or count_col not in df.columns:
+        return pd.DataFrame()
+
+    frames = []
+    for library, sub in df.groupby(library_col, sort=True):
+        counts = pd.to_numeric(sub[count_col], errors="coerce").fillna(0).to_numpy(dtype=float)
+        if counts.size == 0:
+            continue
+        lib_universe = universe
+        if lib_universe is None:
+            lib_universe = (
+                _metrics.UNIVERSE_DESIGNED if (counts == 0).any() else _metrics.UNIVERSE_OBSERVED
+            )
+        report = _metrics.representation_metrics(
+            counts,
+            min_counts=min_counts,
+            universe=lib_universe,
+            grain=grain,
+            n_designed=(n_designed or {}).get(str(library)),
+            rarefy_to=rarefy_to,
+            replicates=replicates,
+            seed=seed,
+            labels={"library": library, "count_column": count_col},
+        )
+        frames.append(report.to_dataframe())
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def compute_representation_metrics(
+    summary_dir: Path,
+    *,
+    oligo_df: Optional[pd.DataFrame] = None,
+    purity_dir: Optional[Path] = None,
+    min_counts=DEFAULT_METRIC_MIN_COUNTS,
+    rarefy_to: Optional[int] = None,
+    replicates: int = 20,
+    seed: int = 20262174,
+    write: bool = True,
+    provenance_inputs: Optional[List[Path]] = None,
+) -> pd.DataFrame:
+    """Compute and write the native representation / evenness metrics for step 05.
+
+    Runs at two grains, because the count floor means different things at each:
+
+    - ``oligo`` — from *oligo_df* (step 05's own output), counts per designed oligo per library.
+    - ``guide_bc0`` — from the step-04 purity-filtered files in *purity_dir*, counts per
+      guide-barcode key. This is the grain at which the singleton tail lives (65-84 % of
+      distinct barcodes in the 2026-11 POL3 data), so it is the grain where the floor matters
+      most and where an unfloored Gini is least meaningful.
+
+    Every value carries its depth, floor, n and universe; see :mod:`magestic.utils.metrics`.
+
+    Returns
+    -------
+    pd.DataFrame
+        The long-format table (also written to ``summary_dir`` when *write*). Empty if neither
+        input was usable.
+    """
+    frames = []
+
+    if oligo_df is not None and not oligo_df.empty:
+        frames.append(library_metrics_table(
+            oligo_df, count_col=OLIGO_COUNT_COL, grain="oligo",
+            min_counts=min_counts, rarefy_to=rarefy_to, replicates=replicates, seed=seed,
+        ))
+
+    if purity_dir is not None and Path(purity_dir).exists():
+        purity_frames = load_purity_files(Path(purity_dir))
+        if purity_frames:
+            purity = pd.concat(purity_frames, ignore_index=True)
+            frames.append(library_metrics_table(
+                purity, count_col=GUIDE_BC0_COUNT_COL, grain="guide_bc0",
+                min_counts=min_counts, rarefy_to=rarefy_to, replicates=replicates, seed=seed,
+                universe=None,
+            ))
+
+    frames = [f for f in frames if f is not None and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    table = pd.concat(frames, ignore_index=True)
+
+    if write:
+        summary_dir = Path(summary_dir)
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        tsv_path = summary_dir / METRICS_TSV_NAME
+        json_path = summary_dir / METRICS_JSON_NAME
+        table.to_csv(tsv_path, sep="\t", index=False)
+        table.to_json(json_path, orient="records", indent=2)
+
+        # Provenance sidecar, per the package policy: every step that writes a data file
+        # writes <output>.provenance.json beside it, with the parameters that set the result.
+        try:
+            from magestic.utils.provenance import StepProvenance
+
+            prov = StepProvenance(
+                pipeline="guide_donor_bc0",
+                step="05_representation_metrics",
+                output=str(tsv_path),
+            )
+            for p in (provenance_inputs or []):
+                if Path(p).exists():
+                    prov.add_input(p, role="representation_input")
+            prov.set_parameters(
+                min_counts=list(min_counts),
+                rarefy_to=rarefy_to,
+                rarefaction_replicates=replicates,
+                rarefaction_seed=seed,
+                grains=sorted(table["grain"].unique().tolist()),
+                oligo_count_column=OLIGO_COUNT_COL,
+                guide_bc0_count_column=GUIDE_BC0_COUNT_COL,
+            )
+            prov.set_counts(metric_rows=int(len(table)),
+                            libraries=int(table["library"].nunique()))
+            prov.note(
+                "Every statistic in this table is depth-dependent and describes the SAMPLE, not "
+                "the library, unless the 'rarefied' column is true. Quote the value only with its "
+                "'depth', 'min_count', 'universe' and 'grain' columns."
+            )
+            prov.add_output(tsv_path, rows=len(table))
+            prov.add_output(json_path)
+            prov.write()
+        except Exception as exc:  # pragma: no cover - provenance must never fail the metrics
+            (summary_dir / "representation_metrics.provenance_error.txt").write_text(
+                f"provenance sidecar failed: {exc!r}\n"
+            )
+
+    return table

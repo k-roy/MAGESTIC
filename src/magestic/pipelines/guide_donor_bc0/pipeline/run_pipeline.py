@@ -412,6 +412,59 @@ def run_library_representation(config: GuideDonorBC0Config) -> bool:
     )
     logger.info(f"  Libraries: {list(oligo_df['library'].unique())}")
     logger.info(f"  Total oligo-library rows: {len(oligo_df):,}")
+
+    # --- Representation / evenness metrics (ADDITIVE, 2026-11) -----------------------------
+    # Native Gini, Shannon, Pielou, Simpson / inverse Simpson, Hill numbers, top-N share and
+    # richness, so a run EMITS them instead of a panel being computed outside the package.
+    # Writes NEW sidecars only (representation_metrics.tsv / .json / .provenance.json); no
+    # existing column or file is touched, and run_representation_analysis above is unchanged.
+    # Every value carries the depth, floor, n, universe and grain it was computed at -- these
+    # statistics describe the SAMPLE, not the library, unless the 'rarefied' column is true.
+    try:
+        from ..core.library_representation import (
+            METRICS_TSV_NAME,
+            compute_representation_metrics,
+        )
+
+        metrics_table = compute_representation_metrics(
+            summary_dir=summary_dir,
+            oligo_df=oligo_df,
+            purity_dir=purity_dir,
+            rarefy_to=getattr(config, "metrics_rarefy_to", None),
+            provenance_inputs=[summary_dir / "all_libraries_oligo_name_filtered.tsv"],
+        )
+        if metrics_table is None or metrics_table.empty:
+            logger.warning("  Representation metrics: no usable counts; nothing written")
+        else:
+            logger.info(
+                f"  Representation metrics: {len(metrics_table):,} rows -> "
+                f"{summary_dir / METRICS_TSV_NAME}"
+            )
+            for grain in sorted(metrics_table["grain"].unique()):
+                sub = metrics_table[
+                    (metrics_table["grain"] == grain)
+                    & (metrics_table["metric"] == "gini")
+                    & (metrics_table["min_count"] == 1)
+                    & (~metrics_table["rarefied"])
+                ]
+                for _, row in sub.iterrows():
+                    logger.info(
+                        f"    {row['library']} [{grain}] gini={row['value']:.4f} "
+                        f"at depth={int(row['depth']):,}, floor=1, "
+                        f"n={int(row['n_observations']):,} (NOT rarefied: sample-specific)"
+                    )
+    except Exception as exc:
+        # Loud, not silent: the step still succeeds (the metrics are additive and no existing
+        # output depends on them), but the failure leaves a file on disk so it cannot be missed.
+        logger.error(f"  Representation metrics FAILED: {exc!r}")
+        try:
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            (summary_dir / "representation_metrics.FAILED.txt").write_text(
+                f"compute_representation_metrics raised: {exc!r}\n"
+            )
+        except Exception:
+            pass
+
     logger.info("Step 05: Complete")
     return True
 

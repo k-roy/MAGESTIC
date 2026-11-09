@@ -58,6 +58,14 @@ from .library_representation import (
     plot_gini_indices,
     plot_category_percentages,
     run_library_plots,
+    # Representation metrics (Step 05, additive)
+    METRICS_TSV_NAME,
+    METRICS_JSON_NAME,
+    DEFAULT_METRIC_MIN_COUNTS,
+    OLIGO_COUNT_COL,
+    GUIDE_BC0_COUNT_COL,
+    library_metrics_table,
+    compute_representation_metrics,
 )
 
 __all__ = [
@@ -109,4 +117,12 @@ __all__ = [
     "plot_gini_indices",
     "plot_category_percentages",
     "run_library_plots",
+    # Representation metrics (Step 05, additive)
+    "METRICS_TSV_NAME",
+    "METRICS_JSON_NAME",
+    "DEFAULT_METRIC_MIN_COUNTS",
+    "OLIGO_COUNT_COL",
+    "GUIDE_BC0_COUNT_COL",
+    "library_metrics_table",
+    "compute_representation_metrics",
 ]
