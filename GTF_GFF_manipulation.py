@@ -2,9 +2,9 @@
 set of tools to extract information from annotation files in GTF or GFF format
 '''
 import operator, bedgraph_computation
-import imp
+import importlib
 import logging
-bedgraph_computation = imp.reload(bedgraph_computation)
+bedgraph_computation = importlib.reload(bedgraph_computation)
 
 logger = logging.getLogger(__name__)
 

@@ -2,8 +2,8 @@
 computation on bedgraph files
 '''
 import numpy, GTF_GFF_manipulation
-import imp
-GTF_GFF_manipulation = imp.reload(GTF_GFF_manipulation)
+import importlib
+GTF_GFF_manipulation = importlib.reload(GTF_GFF_manipulation)
 
 def load_genome(genome_file, Mito = False):
     '''
