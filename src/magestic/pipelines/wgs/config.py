@@ -40,6 +40,7 @@ Author: Kevin R. Roy
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -965,11 +966,18 @@ def load_config(
             raise ValueError('sv_plasmid.contained_fragments auto/keep needs donor_plasmid_contigs')
         if sv_d.get('plasmid_mask') is None:
             raise ValueError('sv_plasmid.contained_fragments auto/keep needs an explicit plasmid_mask (use [] for none)')
-    if sv_d.get('plasmid_mates_are_template') and not contigs:
-        raise ValueError('sv_plasmid.plasmid_mates_are_template needs donor_plasmid_contigs')
+    if sv_d.get('plasmid_mates_are_template'):
+        if not contigs:
+            raise ValueError('sv_plasmid.plasmid_mates_are_template needs donor_plasmid_contigs')
+        # Half B forwards the contigs to TRACE's classifier, which refuses them outside standard mode;
+        # refuse here so the configuration fails at load, not on the first sample.
+        if sv_d.get('dup_mode', 'standard') != 'standard':
+            raise ValueError('sv_plasmid.plasmid_mates_are_template is a standard-mode policy')
     cap = sv_d.get('purged_max_copies', 0.05)
-    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not cap > 0:
-        raise ValueError('sv_plasmid.purged_max_copies must be a positive number')
+    # A non-finite cap is refused: `copies_upper95 <= inf` holds even for a sample with no nuclear depth,
+    # so `.inf` would let `auto` call an unbounded sample purged.
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)) or not 0 < cap < math.inf:
+        raise ValueError('sv_plasmid.purged_max_copies must be a positive number (finite)')
     sv_plasmid = WGSSvPlasmidConfig(**sv_d)
 
     recon_d = dict(data.get("reconcile", {}))

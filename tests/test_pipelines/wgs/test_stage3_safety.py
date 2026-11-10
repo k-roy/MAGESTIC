@@ -351,6 +351,27 @@ def test_contained_keep_still_discards_a_sample_that_shows_plasmid(fixture_facto
     assert 'template' not in kept
 
 
+def test_contained_keep_copy_number_veto_fires_without_a_donor_backbone_pair(fixture_factory):
+    # Backbone-only plasmid: 400 reads on the unmasked backbone, none paired into the donor window. Only the
+    # copy-number arm of the veto can discard here (~0.14 copies per genome against the 0.05 cap).
+    backbone = [dict(name=f'nb{i}', contig='plasmid_demo', start=200 + i % 60, seq='A' * 20, cigar='20M',
+                     mate_start=400, tlen=220) for i in range(400)]
+    row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC] + backbone + _deep(), contained_fragments='keep')
+    assert row['donor_backbone_pairs'] == '0' and row['plasmid_backbone_reads'] == '400'
+    assert row['contained_policy'] == 'discard_plasmid_seen'
+    assert row['frags_contained_kept'] == '0' and 'template' not in kept
+
+
+@pytest.mark.parametrize('n', [0, 1, 5, 50, 500])
+def test_pooled_poisson_bound_is_the_trace_limit_in_closed_form(n):
+    assert s3._poisson_upper(n) == pytest.approx(sv.poisson_upper(n), rel=1e-9)
+
+
+def test_pooled_poisson_bound_is_constant_time_on_cohort_totals():
+    n = 50_000_000
+    assert n < s3._poisson_upper(n) < n + 3 * n ** 0.5
+
+
 def test_contained_keep_is_honoured_without_plasmid(fixture_factory):
     row, kept = _policy_run(fixture_factory, [CONTAINED, GENOMIC], contained_fragments='keep')
     assert row['contained_policy'] == 'keep_declared' and kept == ['genome', 'template']
@@ -363,6 +384,9 @@ def test_contained_keep_is_honoured_without_plasmid(fixture_factory):
     ({'contained_fragments': 'keep', 'donor_plasmid_contigs': ['p'], 'plasmid_mask': [], 'dup_mode': 'parity'}, 'standard-mode'),
     ({'contained_fragments': 'auto', 'donor_plasmid_contigs': ['p'], 'plasmid_mask': ['p:10']}, 'contig:start-end'),
     ({'purged_max_copies': 0}, 'positive number'),
+    ({'purged_max_copies': float('inf')}, 'positive number'),
+    ({'purged_max_copies': float('nan')}, 'positive number'),
+    ({'plasmid_mates_are_template': True, 'donor_plasmid_contigs': ['p'], 'dup_mode': 'parity'}, 'standard-mode'),
 ])
 def test_contained_policy_config_is_refused_when_incomplete(fixture_factory, sv, message):
     from magestic.pipelines.wgs.config import load_config

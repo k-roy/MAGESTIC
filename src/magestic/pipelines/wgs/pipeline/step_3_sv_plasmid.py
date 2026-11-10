@@ -694,8 +694,22 @@ def _pooled_contained_evidence(rows: Sequence[str]) -> dict[str, object]:
     out: dict[str, object] = {"samples_by_policy": policies, "fragments_kept": kept}
     if expected:
         out.update({"pooled_backbone_reads": reads,
-                    "pooled_copies_upper95": sv_plasmid.poisson_upper(reads) / expected})
+                    "pooled_copies_upper95": _poisson_upper(reads) / expected})
     return out
+
+
+def _poisson_upper(n: int, tail: float = 0.025) -> float:
+    """TRACE's `poisson_upper` in closed form, for the POOLED count.
+
+    The lambda at which P(X <= n) = tail is the gamma quantile chi2.ppf(1 - tail, 2(n + 1)) / 2: the same
+    exact limit (3.689 for n = 0), constant-time in n. TRACE solves it by bisection over an n-term sum, which
+    is right for one sample's backbone reads and quadratic on a plasmid-positive cohort's total.
+    """
+    from scipy.stats import chi2
+
+    if type(n) is not int or n < 0 or not 0 < tail < 1:
+        raise ValueError("n must be a non-negative int and tail in (0, 1)")
+    return float(chi2.ppf(1.0 - tail, 2 * (n + 1)) / 2.0)
 
 
 def _provenance_counts(counts: dict[str, object]) -> dict[str, object]:
