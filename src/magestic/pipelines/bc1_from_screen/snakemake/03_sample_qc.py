@@ -784,7 +784,10 @@ def plot_read_count_distribution(
     conditions = sorted(sample_metrics["condition"].unique())
     data = [sample_metrics[sample_metrics["condition"] == c]["total_reads"].values for c in conditions]
 
-    bp = ax.boxplot(data, labels=conditions, patch_artist=True)
+    # `labels=` was renamed `tick_labels` in matplotlib 3.9 and removed in 3.11; setting the tick
+    # labels afterwards is the one spelling every supported release accepts.
+    bp = ax.boxplot(data, patch_artist=True)
+    ax.set_xticklabels(conditions)
 
     # Color by library distribution
     for i, patch in enumerate(bp["boxes"]):
