@@ -645,7 +645,7 @@ def plot_pca(
     # Get unique conditions and assign colors
     conditions = plot_df["condition"].fillna("Unknown").unique()
     n_conditions = len(conditions)
-    cmap = plt.cm.get_cmap("tab20", n_conditions)
+    cmap = plt.get_cmap("tab20", n_conditions)
     condition_colors = {cond: cmap(i) for i, cond in enumerate(conditions)}
 
     # Library markers
@@ -834,7 +834,7 @@ def plot_clustering_dendrogram(
     # Get condition colors
     conditions = sample_metrics.set_index("sample_name")["condition"]
     unique_conditions = conditions.unique()
-    cmap = plt.cm.get_cmap("tab20", len(unique_conditions))
+    cmap = plt.get_cmap("tab20", len(unique_conditions))
     condition_colors = {cond: cmap(i) for i, cond in enumerate(unique_conditions)}
 
     # Map to colors
