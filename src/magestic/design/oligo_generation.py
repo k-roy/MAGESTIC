@@ -801,6 +801,7 @@ def design_oligos_from_vcf(
     global_max_poly_t: int = 8,
     nuclease_label: str = "",
     progress_interval: int = 1_000,
+    cds_annotation_file: Optional[str | Path] = None,
 ) -> None:
     """
     Design guide-donor oligos for all variants in a processed VCF file.
@@ -918,6 +919,47 @@ def design_oligos_from_vcf(
     total_variants = sum(len(v) for chrom_v in variants.values() for v in chrom_v.values())
     logger.info("Loaded %d variants from %s", total_variants, processed_vcf_file)
 
+    # ---- CDS annotation, which is what lets the synonymous-codon rescue fire.
+    # Without it `cds_model` stays None at every call site and a donor whose restriction
+    # site cannot be shifted out of the homology arms is rejected, exactly as before. The
+    # rescue was previously reachable only from a per-project script, so a library built
+    # through this CLI silently lost every design it could have saved.
+    cds_by_gene: Dict[str, Tuple[List[Tuple[int, int]], str, str]] = {}
+    if cds_annotation_file is not None:
+        from magestic.genomics.consequence import (
+            build_cds as _build_cds,
+            load_cds_from_gff,
+            load_cds_table,
+        )
+
+        path = str(cds_annotation_file)
+        loader = load_cds_from_gff if path.endswith((".gff", ".gff3", ".gtf")) else load_cds_table
+        model = loader(path)
+        for gene, (gchrom, gstrand, exons0) in model.items():
+            seq = genome_seq.get(gchrom)
+            if seq is None:
+                continue
+            # `recode_donor_to_remove_sites` wants 1-based INCLUSIVE blocks, while the
+            # consequence model carries 0-based half-open exons. Converting here, once,
+            # keeps the off-by-one in a single place instead of at three call sites.
+            blocks = [(a + 1, b) for a, b in exons0]
+            cds_by_gene[gene] = (blocks, gstrand, _build_cds(seq, exons0, gstrand))
+        logger.info(
+            "Loaded CDS annotation for %d genes from %s; the synonymous-codon rescue is ACTIVE",
+            len(cds_by_gene), path,
+        )
+        if not cds_by_gene:
+            raise ValueError(
+                f"{path} produced no usable CDS model against this genome. A rescue that "
+                "cannot fire is indistinguishable from one that found nothing, so this is "
+                "an error rather than a silent fallback."
+            )
+    else:
+        logger.info(
+            "No --cds annotation supplied: the synonymous-codon rescue is INACTIVE and donors "
+            "with an unshiftable restriction site will be rejected."
+        )
+
     # -------------------------------------------------------------------
     # Write output files
     # -------------------------------------------------------------------
@@ -982,6 +1024,9 @@ def design_oligos_from_vcf(
                         desc_lst, guide_length, donor_length, minimum_homology,
                         genome_seq, plus_strand_bedgraph, minus_strand_bedgraph,
                         restriction_sites,
+                        # None for a variant with no CDS model (non-coding, or no --cds),
+                        # which reproduces the previous behaviour byte for byte.
+                        cds_model=cds_by_gene.get(orf),
                     )
 
                     if donor_result[0] is None:

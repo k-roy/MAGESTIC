@@ -163,6 +163,12 @@ def design_vcf_main() -> None:
                         help="Maximum variant-to-PAM distance in bp. (default: 20)")
     parser.add_argument("--fasta-exclusion", nargs="*", metavar="FASTA",
                         help="FASTA files whose guides must be excluded from the design.")
+    parser.add_argument("--cds", metavar="PATH", default=None,
+                        help="CDS annotation for the design frame, enabling the synonymous-codon "
+                             "rescue of donors whose restriction site cannot be shifted out of the "
+                             "homology arms. Accepts a GFF3 (CDS features) or the headerless CDS "
+                             "table (chrom, start, end, strand, phase, attributes). Without it the "
+                             "rescue cannot fire and those donors are rejected as before.")
     args = parser.parse_args()
 
     from magestic.design.guide_donor_functions import load_genome, load_transcript_coverage
@@ -206,6 +212,7 @@ def design_vcf_main() -> None:
         max_guides_per_donor=args.max_guides_per_donor,
         max_dist_to_pam=args.max_dist_to_pam,
         nuclease_label=args.nuclease,
+        cds_annotation_file=args.cds,
     )
 
 
