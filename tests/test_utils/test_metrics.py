@@ -314,6 +314,41 @@ def test_rarefy_counts_subsamples_without_replacement_and_preserves_length():
         M.rarefy_counts(counts, 10 ** 6)
 
 
+def test_rarefaction_refuses_fractional_counts_instead_of_rounding_them_away():
+    """[0.4, 0.4, 0.4] totals 1.2, so depth 1 passes the depth check, and every colour rounds to 0."""
+    with pytest.raises(ValueError, match="whole-number"):
+        M.rarefy_counts([0.4, 0.4, 0.4], 1, seed=1)
+    with pytest.raises(ValueError, match="whole-number"):
+        M.rarefied_metric(M.gini, [2.5, 3.5, 4.0], 5, replicates=2, seed=1)
+    # whole numbers stored as floats are counts, and still subsample to exactly the target
+    assert M.rarefy_counts([4.0, 3.0, 3.0], 5, seed=1).sum() == 5
+
+
+def test_a_rarefied_metric_still_reports_what_the_floor_removed():
+    """Rarefying [1, 9] to its full depth with floor 2 drops the singleton in every replicate."""
+    m = M.rarefied_metric(M.richness, [1, 9], 10, replicates=3, seed=5, min_count=2)
+    assert m.context.depth == 9 and m.context.n_observations == 1
+    assert m.context.n_excluded_by_floor == 1
+    assert m.context.counts_excluded_by_floor == 1
+
+
+def test_hill_number_stays_finite_and_bounded_at_large_finite_orders():
+    """The direct power sum underflows to 0.0 at q=1000, which the exponent then turned into inf."""
+    uniform = [7] * 10
+    for q in (50.0, 1000.0, 1e6):
+        assert M.hill_number(uniform, q).value == pytest.approx(10.0, rel=1e-9)
+    skewed = [900, 50, 30, 20]
+    floor = M.hill_number(skewed, math.inf).value            # 1 / max(p), the profile's lower bound
+    values = [M.hill_number(skewed, q).value for q in (2.0, 100.0, 1000.0, 1e5)]
+    assert all(math.isfinite(v) for v in values)
+    for a, b in zip(values, values[1:]):
+        assert a >= b - 1e-9                                  # still non-increasing in q
+    assert values[-1] == pytest.approx(floor, rel=1e-3) and values[-1] >= floor - 1e-9
+    # a large negative order overflows instead; the limit there is 1 / min(p)
+    assert M.hill_number(skewed, -1000.0).value == pytest.approx(
+        M.hill_number(skewed, -math.inf).value, rel=1e-2)
+
+
 # ---------------------------------------------------------------------------
 # 🔴 The distinct-key vs read-weighted denominator
 # ---------------------------------------------------------------------------

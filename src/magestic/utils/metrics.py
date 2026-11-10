@@ -221,7 +221,17 @@ def _hill(x: np.ndarray, q: float) -> float:
         if q > 0:
             return float(1.0 / p.max())
         return float(1.0 / p.min())
-    return float(np.sum(p ** q) ** (1.0 / (1.0 - q)))
+    with np.errstate(over="ignore", under="ignore"):
+        power_sum = float(np.sum(p ** q))
+    if math.isfinite(power_sum) and power_sum > 0.0:
+        return float(power_sum ** (1.0 / (1.0 - q)))
+    # A large finite |q| under- or overflows the direct power sum (ten equal members at q=1000 sum
+    # to exactly 0.0, which the exponent then turns into inf). The same quantity in log space stays
+    # finite; it is the fallback, not the default, so ordinary orders keep their exact value.
+    terms = q * np.log(p)
+    peak = float(terms.max())
+    log_sum = peak + math.log(float(np.sum(np.exp(terms - peak))))
+    return float(math.exp(log_sum / (1.0 - q)))
 
 
 def _top_n_share(x: np.ndarray, n: int) -> float:
@@ -646,8 +656,15 @@ def rarefy_counts(counts, depth: int, *, rng: Optional[np.random.Generator] = No
     ValueError
         If *depth* exceeds the available total — you cannot rarefy upward. Callers that want a
         flagged nan instead should use :func:`rarefied_metric`.
+        If any count is not a whole number. Subsampling draws molecules, so a normalised or
+        fractional vector has no population to draw from; rounding it would change the available
+        total after the depth check (``[0.4, 0.4, 0.4]`` at depth 1 rounds to nothing).
     """
     x = _as_counts(counts)
+    if x.size and np.any(x != np.rint(x)):
+        raise ValueError(
+            "rarefaction needs whole-number read counts; these are fractional. Subsample the "
+            "raw counts, not a normalised or averaged vector")
     total = int(x.sum())
     if depth < 0:
         raise ValueError("depth must be >= 0")
@@ -716,6 +733,8 @@ def rarefied_metric(
     values: List[float] = []
     depths: List[int] = []
     n_obs: List[int] = []
+    n_excluded: List[int] = []
+    counts_excluded: List[int] = []
     for _ in range(max(1, int(replicates))):
         sub = rarefy_counts(x, target_depth, rng=rng)
         m = statistic(sub, min_count=min_count, universe=universe, grain=grain,
@@ -723,6 +742,8 @@ def rarefied_metric(
         values.append(m.value)
         depths.append(m.context.depth)
         n_obs.append(m.context.n_observations)
+        n_excluded.append(m.context.n_excluded_by_floor)
+        counts_excluded.append(m.context.counts_excluded_by_floor)
 
     arr = np.asarray(values, dtype=float)
     finite = arr[np.isfinite(arr)]
@@ -730,6 +751,10 @@ def rarefied_metric(
         depth=int(round(float(np.mean(depths)))),
         n_observations=int(round(float(np.mean(n_obs)))),
         min_count=int(min_count),
+        # What the floor removed AFTER subsampling, as replicate means like depth and
+        # n_observations; left at the default 0 they would deny a discard that every replicate made.
+        n_excluded_by_floor=int(round(float(np.mean(n_excluded)))),
+        counts_excluded_by_floor=int(round(float(np.mean(counts_excluded)))),
         weighting=probe.context.weighting,
         universe=universe,
         grain=grain,

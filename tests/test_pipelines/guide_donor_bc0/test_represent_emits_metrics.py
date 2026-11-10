@@ -9,7 +9,9 @@ project and assert the positive evidence: the metrics file exists, the FAILED ma
 the pre-existing step-05 outputs are still written exactly as before.
 """
 
+import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -79,7 +81,13 @@ def test_represent_step_emits_metrics_on_a_normal_run(tmp_path, caplog):
         "the metrics block raised; see the ERROR in the step log"
     assert (summary_dir / METRICS_TSV_NAME).exists()
     assert (summary_dir / METRICS_JSON_NAME).exists()
-    assert (summary_dir / f"{METRICS_TSV_NAME}.provenance.json").exists()
+    sidecar = summary_dir / f"{METRICS_TSV_NAME}.provenance.json"
+    assert sidecar.exists()
+    # the guide_bc0 rows are computed from the purity file, so it must be a recorded input with its
+    # md5: two count distributions can share one oligo total and so one oligo-table checksum
+    recorded = {Path(rec["path"]).name: rec for rec in json.loads(sidecar.read_text())["inputs"]}
+    purity_record = recorded[f"V629{PURITY_SUFFIX}"]
+    assert purity_record["role"] == "purity_filtered_counts" and purity_record["md5"]
     assert "Representation metrics FAILED" not in caplog.text
 
 
