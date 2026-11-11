@@ -19,6 +19,10 @@ Modules:
     pam_search            — Genome-wide PAM site enumeration and off-target analysis
     guide_selection       — Allowable guide classification from off-target analysis
     oligo_generation      — VCF-based guide-donor oligo design orchestrator
+    pool                  — DECLARED pool composition: pool_recipe.toml, build_pool(), and
+                             the G-COMPOSITION / G-SCHEMA / G-PARENT / G-COAMPLIFY gates.
+                             🔴 Its "arm"/"category" is NOT oligo_generation's PAM-preference
+                             synthesis `subpool_idx`; see magestic.design.pool's docstring.
 
 CLI entry points (see magestic.design._cli):
     magestic-design-vcf        — VCF-based oligo design
