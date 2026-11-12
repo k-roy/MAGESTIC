@@ -140,12 +140,46 @@ class ColumnGroup:
 
 
 @dataclass(frozen=True)
+class PopulationRule:
+    """Columns that must actually CARRY A VALUE, on the rows where they mean something.
+
+    🔴 Why this exists, and it is not hypothetical. G-SCHEMA checks that a column is PRESENT and
+    never that it is populated. The TRIUMPH v6 pool shipped `aa_change` present and **empty for
+    all 1,821 natural missense designs**, where Library A populated all 1,894 — so a collaborator
+    could not say which substitution any natural missense variant makes. No schema diff and no
+    gate could see it, because the column was right there (NN 512 finding 1).
+
+    `where` scopes the rule, because a blanket "never empty" would be wrong and would get switched
+    off: `aa_change` means nothing on a non-coding design and `recut_cfd` means nothing on a
+    non-targeting control. A rule nobody can satisfy is a rule everybody disables.
+    """
+
+    name: str
+    columns: tuple[str, ...] = ()
+    where: Mapping[str, str] = field(default_factory=dict)
+    min_fraction: float = 1.0
+
+    def rows_in_scope(self, pool) -> list:
+        return [r for r in pool
+                if all(str(r.get(k, "")) == str(v) for k, v in self.where.items())]
+
+    def check(self, pool) -> tuple[int, dict[str, int]]:
+        """``(n_in_scope, {column: n_populated})``."""
+        scope = self.rows_in_scope(pool)
+        got = {}
+        for c in self.columns:
+            got[c] = sum(1 for r in scope if str(r.get(c, "")).strip())
+        return len(scope), got
+
+
+@dataclass(frozen=True)
 class SchemaSpec:
     """The intended output schema: exact columns plus named column-groups."""
 
     columns: tuple[str, ...] = ()
     groups: Mapping[str, ColumnGroup] = field(default_factory=dict)
     require_groups: tuple[str, ...] = ()
+    populated: Mapping[str, PopulationRule] = field(default_factory=dict)
 
     def missing(self, present: Sequence[str]) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
         """``(missing_columns, {group_name: missing_members})`` against *present*."""
@@ -450,6 +484,28 @@ def _parse_schema(body: Mapping[str, Any]) -> SchemaSpec:
             min_count=int(gbody.get("min_count", 1)),
         )
 
+    pop_raw = body.get("populated", {}) or {}
+    populated: dict[str, PopulationRule] = {}
+    for pname, pbody in pop_raw.items():
+        if isinstance(pbody, (list, tuple)):
+            populated[pname] = PopulationRule(name=pname, columns=tuple(pbody))
+            continue
+        if not isinstance(pbody, Mapping):
+            raise RecipeError(f"[schema.populated.{pname}] must be a list or a table")
+        cols = tuple(pbody.get("columns", ()) or ())
+        if not cols:
+            raise RecipeError(f"[schema.populated.{pname}] needs 'columns'")
+        mf = float(pbody.get("min_fraction", 1.0))
+        if not 0 < mf <= 1:
+            raise RecipeError(
+                f"[schema.populated.{pname}] min_fraction must be in (0, 1], got {mf}"
+            )
+        populated[pname] = PopulationRule(
+            name=pname, columns=cols,
+            where={str(k): str(v) for k, v in (pbody.get("where", {}) or {}).items()},
+            min_fraction=mf,
+        )
+
     require = tuple(body.get("require_groups", ()) or ())
     for gname in require:
         if gname not in groups:
@@ -461,6 +517,7 @@ def _parse_schema(body: Mapping[str, Any]) -> SchemaSpec:
         columns=tuple(body.get("columns", ()) or ()),
         groups=groups,
         require_groups=require,
+        populated=populated,
     )
 
 

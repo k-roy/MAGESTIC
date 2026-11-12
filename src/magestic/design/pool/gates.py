@@ -224,6 +224,67 @@ def gate_schema(
 # G-PARENT
 # ---------------------------------------------------------------------------
 
+def gate_populated(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+) -> GateResult:
+    """🔴 Does every column the recipe says must CARRY A VALUE actually carry one?
+
+    G-SCHEMA asks whether a column is present. This asks whether it is populated, on the rows
+    where it means something. The two are not the same question, and the TRIUMPH v6 pool is the
+    proof: it shipped `aa_change` present and empty for all 1,821 of its natural missense designs
+    (NN 512 finding 1). The column was in the header, so the schema diff and G-SCHEMA both passed
+    it, and a collaborator holding the file could not say which substitution any natural missense
+    variant makes.
+    """
+    rules = list(recipe.schema.populated.values())
+    if not rules:
+        return GateResult(
+            gate="G-POPULATED",
+            status=NOT_APPLICABLE,
+            detail="the recipe declares no [schema.populated.*] rule",
+        )
+
+    header = ("rule", "column", "in_scope", "populated", "fraction", "required")
+    rows: list[tuple[Any, ...]] = []
+    problems: list[str] = []
+    for rule in rules:
+        n, got = rule.check(pool)
+        if n == 0:
+            rows.append((rule.name, ",".join(rule.columns), 0, 0, "-", rule.min_fraction))
+            problems.append(
+                f"rule '{rule.name}' matched NO rows (where={dict(rule.where)}) — a population "
+                f"rule that selects nothing checks nothing, so it is a defect in the rule"
+            )
+            continue
+        for col, k in got.items():
+            frac = k / n
+            rows.append((rule.name, col, n, k, f"{frac:.4f}", rule.min_fraction))
+            if frac < rule.min_fraction:
+                problems.append(
+                    f"'{col}' is populated on {k:,} of {n:,} rows in scope "
+                    f"({100 * frac:.2f}%), below the declared {100 * rule.min_fraction:.2f}%"
+                    + (f" (where={dict(rule.where)})" if rule.where else "")
+                )
+
+    if problems:
+        return GateResult(
+            gate="G-POPULATED",
+            status=FAIL,
+            detail="; ".join(problems),
+            rows=tuple(rows),
+            header=header,
+        )
+    return GateResult(
+        gate="G-POPULATED",
+        status=PASS,
+        detail=f"{len(rules)} population rule(s) satisfied over "
+               f"{sum(1 for _ in rules)} scope(s)",
+        rows=tuple(rows),
+        header=header,
+    )
+
+
 def gate_parent(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
@@ -441,10 +502,13 @@ def run_gates(
     recipe: PoolRecipe,
     columns: Sequence[str] | None = None,
 ) -> list[GateResult]:
-    """Run all four composition gates and return their verdicts in a fixed order."""
+    """Run every composition gate and return their verdicts in a fixed order."""
     return [
         gate_composition(pool, recipe),
         gate_schema(pool, recipe, columns=columns),
+        # G-POPULATED runs right after G-SCHEMA because it asks the question G-SCHEMA cannot:
+        # presence is not population (NN 512 finding 1).
+        gate_populated(pool, recipe),
         gate_parent(pool, recipe),
         gate_coamplify(pool, recipe),
     ]
