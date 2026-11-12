@@ -19,6 +19,7 @@ Modules:
 - config_utils: YAML config loading utilities
 - path_utils: Path resolution helpers
 - thread_limiting: SLURM thread-count environment setup
+- metrics: library representation / evenness statistics that carry their own depth
 """
 
 from .sequence_utils import (
@@ -39,6 +40,25 @@ from .alignment_utils import (
     parse_sam_file,
     select_best_alignment,
     select_best_alignment_paired,
+)
+
+from .metrics import (
+    Metric,
+    MetricContext,
+    MetricReport,
+    gini,
+    shannon_entropy,
+    pielou_evenness,
+    simpson_index,
+    inverse_simpson,
+    hill_number,
+    effective_number_of_species,
+    top_n_share,
+    richness,
+    coverage_fractions,
+    rarefy_counts,
+    rarefied_metric,
+    representation_metrics,
 )
 
 from .oligo_annotations import (
@@ -74,4 +94,21 @@ __all__ = [
     'get_annotation_columns_for_bc1_from_screen',
     'get_annotation_columns_for_bc1_donor_bc0',
     'HARMONIZED_OLIGO_TABLE',
+    # metrics
+    'Metric',
+    'MetricContext',
+    'MetricReport',
+    'gini',
+    'shannon_entropy',
+    'pielou_evenness',
+    'simpson_index',
+    'inverse_simpson',
+    'hill_number',
+    'effective_number_of_species',
+    'top_n_share',
+    'richness',
+    'coverage_fractions',
+    'rarefy_counts',
+    'rarefied_metric',
+    'representation_metrics',
 ]

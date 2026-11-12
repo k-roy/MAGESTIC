@@ -25,7 +25,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.24",
-    "pandas>=2.0",
+    "pandas>=2.0,<3",  # pandas 3 (copy-on-write, str dtype) silently changes bc1_donor_bc0 counts; port before lifting
     "scipy>=1.10",
     "biopython>=1.79",
     "pyyaml>=6.0",
