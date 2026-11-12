@@ -160,6 +160,54 @@ def _check_reference(
         )
 
 
+def _rank_key(row: Mapping[str, Any], rank_by: Sequence[str], id_column: str) -> tuple:
+    """A sort key from the declared ``rank_by`` columns, numeric where possible.
+
+    A leading ``-`` on a column name means descending. Values are coerced to float when they
+    parse as one, because a TSV carries ``"0.9"`` and ``"0.12"`` as strings and a string sort
+    would put ``"0.12"`` above ``"0.9"``. A value that is missing or unparseable sorts LAST
+    within its direction rather than crashing, and the id column is always appended as the final
+    tie-break so the same recipe over the same designs always keeps the same oligos.
+    """
+    key: list[Any] = []
+    for col in rank_by:
+        desc = col.startswith("-")
+        name = col[1:] if desc else col
+        raw = row.get(name, "")
+        try:
+            val = float(raw)
+            missing = 0
+        except (TypeError, ValueError):
+            val = 0.0
+            missing = 1
+            if isinstance(raw, str) and raw:
+                # a non-numeric value still orders, just after every numeric one
+                key.extend((1, 0.0))
+                key.append(_neg_str(raw) if desc else raw)
+                continue
+        # missing sorts last in both directions
+        key.append(missing)
+        key.append(-val if desc else val)
+    key.append(str(row.get(id_column, "")))
+    return tuple(key)
+
+
+class _neg_str(str):
+    """A string that sorts in reverse, so a descending text key needs no separate pass."""
+
+    def __lt__(self, other):  # type: ignore[override]
+        return str.__gt__(self, other)
+
+    def __gt__(self, other):  # type: ignore[override]
+        return str.__lt__(self, other)
+
+    def __le__(self, other):  # type: ignore[override]
+        return str.__ge__(self, other)
+
+    def __ge__(self, other):  # type: ignore[override]
+        return str.__le__(self, other)
+
+
 def _gc_of(row: Mapping[str, Any], sequence_column: str) -> float | None:
     g = row.get("gc_frac")
     if isinstance(g, (int, float)):
@@ -271,6 +319,7 @@ def build_pool(
     pool: list[dict[str, Any]] = []
     designed_gc: list[float] = []
     arm_reports: dict[str, ArmReport] = {}
+    rank_note: dict[str, dict[str, Any]] = {}
     drops = drops or {}
 
     # Pass 1: the supplied arms, so the generated arms can match their GC distribution.
@@ -287,6 +336,26 @@ def build_pool(
         elif spec.select == "tail" and supplied_n > target:
             trimmed = supplied_n - target
             rows = rows[-target:]
+        elif spec.select == "rank" and supplied_n > target:
+            # 🔴 Trim by the DECLARED ranking. This is the only selection that can honestly cut
+            # an over-supplied arm: head/tail cut by whatever order the caller passed, so the
+            # same recipe over the same designs could drop different oligos on two runs.
+            trimmed = supplied_n - target
+            rows.sort(key=lambda r: _rank_key(r, spec.rank_by, recipe.id_column))
+            kept_rows, dropped_rows = rows[:target], rows[target:]
+            rows = kept_rows
+
+            def _at(r):
+                return {k.lstrip("-"): r.get(k.lstrip("-"), "") for k in spec.rank_by}
+
+            # The boundary is the interesting part of a ranked trim: it says what the cut
+            # actually cost. Both sides are recorded so the threshold is readable afterwards.
+            rank_note[spec.name] = {
+                "rank_by": list(spec.rank_by),
+                "dropped": trimmed,
+                "last_kept": _at(kept_rows[-1]) if kept_rows else {},
+                "first_dropped": _at(dropped_rows[0]) if dropped_rows else {},
+            }
 
         for r in rows:
             r[recipe.arm_column] = spec.name
@@ -303,6 +372,7 @@ def build_pool(
             trimmed=trimmed,
             select=spec.select,
             drops=dict(drops.get(spec.name, {})),
+            extra=rank_note.get(spec.name, {}),
         )
 
     # Pass 2: the generated arms.
@@ -348,6 +418,12 @@ def build_pool(
 
     report.arms = [arm_reports[s.name] for s in recipe.arms]
     report.total_built = len(pool)
+
+    if recipe.disabled_arms:
+        report.notes.append(
+            "🔴 the recipe DISABLES these categories, so they are absent on purpose and are "
+            f"neither built nor gated: {sorted(recipe.disabled_arms)}"
+        )
 
     unused_drops = sorted(set(drops) - declared_names)
     if unused_drops:

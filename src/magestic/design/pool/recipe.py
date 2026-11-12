@@ -61,6 +61,20 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on 3.10 only
 #: ``target = "remainder"`` — the one arm whose count is derived rather than declared.
 REMAINDER = "remainder"
 
+#: ``target = "fill"`` — the one arm that absorbs the slots left over, and that MAY be trimmed
+#: by its declared ranking to reach them exactly.
+#:
+#: 🔴 The difference from :data:`REMAINDER` is the whole point. A *remainder* arm's count is
+#: derived and then checked: if it does not match, G-COMPOSITION fails. A *fill* arm is declared
+#: to be the flexible one, so trimming it is its stated job rather than a silent correction, and
+#: the rule it is trimmed by is written in the recipe. Every OTHER arm still has to match its
+#: own target exactly, so a loss elsewhere still fails the gate — a fill arm cannot absorb one
+#: the way ``natural`` absorbed 454 oligos in NN 505. An UNDER-supplied fill arm fails too.
+FILL = "fill"
+
+#: The two derived target forms. At most one arm in a recipe may use either.
+DERIVED = frozenset({REMAINDER, FILL})
+
 #: Every category the module understands. A recipe naming anything else is an error, so a
 #: typo in a category name cannot create a silently-empty arm.
 KNOWN_KINDS = frozenset(
@@ -71,6 +85,10 @@ KNOWN_KINDS = frozenset(
         "recoded_missense",
         "control_recoding_helper",
         "control_nontargeting",
+        # Extra guides for a variant whose first-choice design is most at risk of being re-cut —
+        # the "second and third shots on goal". A distinct KIND because it is a distinct purpose:
+        # not another variant, but another attempt at one already in the pool.
+        "natural_extra_shots",
     }
 )
 
@@ -82,7 +100,13 @@ GENERATED_KINDS = frozenset({"control_nontargeting"})
 #: row untouched and lets G-COMPOSITION fail, which is the default and the safe answer.
 #: ``"head"``/``"tail"`` trim to the target and are recorded in the report — trimming is
 #: possible only because a human declared it in the recipe.
-SELECT_POLICIES = frozenset({"error", "head", "tail"})
+#:
+#: ``"rank"`` trims to the target by a DECLARED ordering (``rank_by``), which is the only
+#: honest way to cut an over-supplied arm: ``head``/``tail`` cut by whatever order the caller
+#: happened to pass, so the same recipe over the same designs could drop different oligos.
+#: ``rank`` always appends the id column as the final tie-break, so a rebuild reproduces the
+#: same pool exactly.
+SELECT_POLICIES = frozenset({"error", "head", "tail", "rank"})
 
 
 class RecipeError(ValueError):
@@ -177,11 +201,29 @@ class ArmSpec:
     generate: str | None = None
     select: str = "error"
     coamplify: bool = True
+    #: ``"remainder"``, ``"fill"``, or ``None`` when the target is declared outright.
+    derive: str | None = None
+    #: Columns to order by when ``select == "rank"``. A leading ``-`` means descending.
+    rank_by: tuple[str, ...] = ()
+    #: ``pct`` as written in the recipe, kept for the report; ``target`` already holds the
+    #: resolved integer.
+    pct: float | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def is_remainder(self) -> bool:
-        return self.target is None
+        """True only for a ``remainder`` arm, whose count must match once derived."""
+        return self.derive == REMAINDER
+
+    @property
+    def is_fill(self) -> bool:
+        """True only for a ``fill`` arm, which may be trimmed by its declared ranking."""
+        return self.derive == FILL
+
+    @property
+    def is_derived(self) -> bool:
+        """True for either derived form — the arm whose target comes from ``total``."""
+        return self.derive is not None
 
     @property
     def is_generated(self) -> bool:
@@ -201,6 +243,8 @@ class PoolRecipe:
     reverse_primers: int = 1
     schema: SchemaSpec = field(default_factory=SchemaSpec)
     segments: Mapping[str, tuple[int, int | None]] = field(default_factory=dict)
+    #: Arms the recipe declares but switches off with ``enabled = false``. Reported, never silent.
+    disabled_arms: tuple[str, ...] = ()
     arm_column: str = "arm"
     id_column: str = "oligo_id"
     sequence_column: str = "oligo_seq"
@@ -225,19 +269,37 @@ class PoolRecipe:
                 return a
         return None
 
-    def resolved_targets(self) -> dict[str, int]:
-        """Every arm's intended count, with the remainder arm's derived from ``total``.
+    @property
+    def fill_arm(self) -> ArmSpec | None:
+        for a in self.arms:
+            if a.is_fill:
+                return a
+        return None
 
-        🔴 This is why a remainder arm cannot absorb the others: its target is
-        ``total`` minus the **declared** targets, so if another arm shrinks the remainder's
+    @property
+    def derived_arm(self) -> ArmSpec | None:
+        """The one arm whose target comes from ``total``, in either derived form."""
+        for a in self.arms:
+            if a.is_derived:
+                return a
+        return None
+
+    def resolved_targets(self) -> dict[str, int]:
+        """Every arm's intended count, with the derived arm's taken from ``total``.
+
+        🔴 This is why a derived arm cannot absorb the others: its target is
+        ``total`` minus the **declared** targets, so if another arm shrinks the derived arm's
         target grows to match and the shrunken arm still fails its own target. The 454-oligo
-        drift of NN 505 fails here regardless of which arm it moved into.
+        drift of NN 505 fails here regardless of which arm it moved into. That holds for a
+        ``fill`` arm exactly as it does for a ``remainder`` arm — what ``fill`` changes is only
+        whether an OVER-supply of that one arm may be trimmed to its target, not whether the
+        other arms are checked.
         """
-        declared = {a.name: a.target for a in self.arms if not a.is_remainder}
+        declared = {a.name: a.target for a in self.arms if not a.is_derived}
         out: dict[str, int] = {k: int(v) for k, v in declared.items()}  # type: ignore[arg-type]
-        rem = self.remainder_arm
-        if rem is not None:
-            out[rem.name] = self.total - sum(out.values())
+        der = self.derived_arm
+        if der is not None:
+            out[der.name] = self.total - sum(out.values())
         return out
 
 
@@ -247,10 +309,10 @@ class PoolRecipe:
 
 def _parse_target(raw: Any, arm_name: str) -> int | None:
     if isinstance(raw, str):
-        if raw != REMAINDER:
+        if raw not in DERIVED:
             raise RecipeError(
-                f"arm '{arm_name}': target must be an integer or the string "
-                f"'{REMAINDER}', got {raw!r}"
+                f"arm '{arm_name}': target must be an integer or one of "
+                f"{sorted(DERIVED)}, got {raw!r}"
             )
         return None
     if isinstance(raw, bool) or not isinstance(raw, int):
@@ -271,10 +333,28 @@ def _parse_arm(name: str, body: Mapping[str, Any]) -> ArmSpec:
             f"arm '{name}': unknown kind {kind!r}. Known kinds: "
             f"{', '.join(sorted(KNOWN_KINDS))}"
         )
+    # `pct` is an alternative to an absolute count, for an arm sized as a share of the pool —
+    # the non-targeting floor is specified that way ("1 to 5% of the pool"), so the recipe can
+    # now say so directly instead of carrying a number whose relation to the total is implicit.
+    pct = body.get("pct")
+    if pct is not None:
+        if "target" in body:
+            raise RecipeError(
+                f"arm '{name}': give either 'target' or 'pct', not both — two numbers that "
+                f"can disagree is how an intended composition stops being readable."
+            )
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            raise RecipeError(f"arm '{name}': pct must be a number, got {pct!r}")
+        if not 0 < float(pct) <= 100:
+            raise RecipeError(f"arm '{name}': pct must be in (0, 100], got {pct}")
+        # resolved against [pool] total by load_recipe, which is where total is known
+        return _finish_arm(name, body, kind, None, float(pct))
+
     if "target" not in body:
         raise RecipeError(
-            f"arm '{name}': 'target' is required. Declare a count, or '{REMAINDER}' for "
-            f"the single derived arm — an undeclared count is how composition drifted."
+            f"arm '{name}': 'target' is required. Declare a count, a 'pct', or one of "
+            f"{sorted(DERIVED)} for the single derived arm — an undeclared count is how "
+            f"composition drifted."
         )
     target = _parse_target(body["target"], name)
 
@@ -293,9 +373,40 @@ def _parse_arm(name: str, body: Mapping[str, Any]) -> ArmSpec:
             f"{sorted(GENERATED_KINDS)} can."
         )
 
+    return _finish_arm(name, body, kind, target, None, select=select, generate=generate)
+
+
+def _finish_arm(name: str, body: Mapping[str, Any], kind: str, target: int | None,
+                pct: float | None, *, select: str | None = None,
+                generate: str | None = None) -> ArmSpec:
+    if select is None:
+        select = body.get("select", "error")
+        if select not in SELECT_POLICIES:
+            raise RecipeError(
+                f"arm '{name}': select must be one of {sorted(SELECT_POLICIES)}, got {select!r}"
+            )
+    if generate is None:
+        generate = body.get("generate")
+        if generate is None and kind in GENERATED_KINDS:
+            generate = "scrambled"
+
+    raw_target = body.get("target")
+    derive = raw_target if isinstance(raw_target, str) and raw_target in DERIVED else None
+
+    rank_by = tuple(body.get("rank_by", ()) or ())
+    if select == "rank" and not rank_by:
+        raise RecipeError(
+            f"arm '{name}': select='rank' needs 'rank_by'. Trimming an arm without saying "
+            f"what to keep is the same as trimming it arbitrarily."
+        )
+    if rank_by and select != "rank":
+        raise RecipeError(
+            f"arm '{name}': 'rank_by' is set but select is {select!r}; it would be ignored."
+        )
+
     known_keys = {
-        "kind", "target", "parent", "parent_key", "donors", "gc_match",
-        "generate", "select", "coamplify",
+        "kind", "target", "pct", "parent", "parent_key", "donors", "gc_match",
+        "generate", "select", "coamplify", "rank_by", "enabled",
     }
     options = {k: v for k, v in body.items() if k not in known_keys}
 
@@ -310,6 +421,9 @@ def _parse_arm(name: str, body: Mapping[str, Any]) -> ArmSpec:
         generate=generate,
         select=select,
         coamplify=bool(body.get("coamplify", True)),
+        derive=derive,
+        rank_by=rank_by,
+        pct=pct,
         options=options,
     )
 
@@ -378,26 +492,34 @@ def _validate(recipe: PoolRecipe) -> PoolRecipe:
     if dupes:
         raise RecipeError(f"duplicate arm names: {sorted(dupes)}")
 
-    remainders = [a.name for a in recipe.arms if a.is_remainder]
-    if len(remainders) > 1:
+    derived = [a.name for a in recipe.arms if a.is_derived]
+    if len(derived) > 1:
         raise RecipeError(
-            f"exactly one arm may be '{REMAINDER}', got {len(remainders)}: "
-            f"{sorted(remainders)}. With two derived arms neither one is pinned and a loss "
+            f"exactly one arm may be derived ({sorted(DERIVED)}), got {len(derived)}: "
+            f"{sorted(derived)}. With two derived arms neither one is pinned and a loss "
             f"in one is absorbed by the other, which is the NN 505 failure."
         )
+    fills = [a for a in recipe.arms if a.is_fill]
+    for a in fills:
+        if a.select != "rank":
+            raise RecipeError(
+                f"arm '{a.name}': target='{FILL}' requires select='rank'. A fill arm is the one "
+                f"arm allowed to be trimmed to fit, so the rule it is trimmed by has to be "
+                f"declared — otherwise the pool depends on the order rows happened to arrive in."
+            )
 
-    declared_sum = sum(a.target for a in recipe.arms if not a.is_remainder)  # type: ignore[misc]
-    if remainders:
+    declared_sum = sum(a.target for a in recipe.arms if not a.is_derived)  # type: ignore[misc]
+    if derived:
         if declared_sum > recipe.total:
             raise RecipeError(
                 f"declared arm targets sum to {declared_sum:,}, which already exceeds "
-                f"[pool] total {recipe.total:,}; the remainder arm "
-                f"'{remainders[0]}' would need a negative count"
+                f"[pool] total {recipe.total:,}; the derived arm "
+                f"'{derived[0]}' would need a negative count"
             )
     elif declared_sum != recipe.total:
         raise RecipeError(
             f"declared arm targets sum to {declared_sum:,} but [pool] total is "
-            f"{recipe.total:,}. With no '{REMAINDER}' arm the two must agree exactly — "
+            f"{recipe.total:,}. With no derived arm the two must agree exactly — "
             f"G-COMPOSITION never pads to fit."
         )
 
@@ -426,15 +548,35 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
     arms_raw = data.get("arm", {}) or {}
     if not isinstance(arms_raw, Mapping):
         raise RecipeError("[arm.<name>] tables expected")
-    arms = tuple(_parse_arm(n, b) for n, b in arms_raw.items())
+    total = int(pool["total"])
+
+    # 🔴 `enabled = false` is how a category is left OUT of a pool. It is deliberately not the
+    # same as deleting the block: the block stays, diffable, saying what was excluded and why,
+    # and the build report names every disabled arm out loud. That is the difference between
+    # this and NN 505 — there the missing arm existed nowhere a reader or a checker could see it.
+    all_arms = []
+    disabled = []
+    for n, b in arms_raw.items():
+        if isinstance(b, Mapping) and b.get("enabled") is False:
+            disabled.append(str(n))
+            continue
+        all_arms.append(_parse_arm(n, b))
+
+    # resolve `pct` now that [pool] total is known
+    arms = tuple(
+        (a if a.pct is None else
+         ArmSpec(**{**a.__dict__, "target": int(round(total * a.pct / 100.0))}))
+        for a in all_arms
+    )
 
     schema = _parse_schema(data.get("schema", {}) or {})
     segments = _parse_segments(data.get("segments", {}) or {})
 
     recipe = PoolRecipe(
         name=str(pool.get("name", "unnamed_pool")),
-        total=int(pool["total"]),
+        total=total,
         arms=arms,
+        disabled_arms=tuple(disabled),
         reference=pool.get("reference"),
         reference_md5=pool.get("reference_md5"),
         oligo_nt=pool.get("oligo_nt"),

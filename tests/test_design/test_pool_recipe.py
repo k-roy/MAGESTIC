@@ -69,7 +69,9 @@ def test_two_remainder_arms_are_refused():
         '[arm.ptc]\nkind   = "control_ptc"\ntarget = 10',
         '[arm.ptc]\nkind   = "control_ptc"\ntarget = "remainder"',
     )
-    with pytest.raises(RecipeError, match="exactly one arm may be 'remainder'"):
+    # the message generalised when `fill` joined `remainder` as a derived form; the refusal,
+    # and the reason for it, are unchanged
+    with pytest.raises(RecipeError, match="exactly one arm may be derived"):
         load_recipe_string(bad)
 
 
