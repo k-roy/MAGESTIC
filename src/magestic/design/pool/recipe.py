@@ -598,13 +598,24 @@ def _validate(recipe: PoolRecipe) -> PoolRecipe:
         )
 
     for a in recipe.arms:
-        if a.parent is not None and a.parent not in names:
+        _ps = ([a.parent] if isinstance(a.parent, str)
+               else (list(a.parent) if a.parent is not None else []))
+        _missing = [p for p in _ps if p not in names]
+        if _missing:
             raise RecipeError(
-                f"arm '{a.name}': parent '{a.parent}' is not a declared arm "
+                f"arm '{a.name}': parent '{', '.join(map(str, _missing))}' is not a declared arm "
                 f"(declared: {sorted(names)})"
             )
-        if a.parent == a.name:
+        # `parent` may name ONE arm or SEVERAL: a helper arm can control more than one
+        # category of parent. The self-parent check applies to each name.
+        _pnames = ([a.parent] if isinstance(a.parent, str)
+                   else (list(a.parent) if a.parent is not None else []))
+        if a.name in _pnames:
             raise RecipeError(f"arm '{a.name}': cannot be its own parent")
+        for _p in _pnames:
+            if not isinstance(_p, str):
+                raise RecipeError(
+                    f"arm '{a.name}': every parent must be an arm name, got {_p!r}")
         if a.parent_key is not None and a.parent is None:
             raise RecipeError(
                 f"arm '{a.name}': parent_key is set but no parent is declared"

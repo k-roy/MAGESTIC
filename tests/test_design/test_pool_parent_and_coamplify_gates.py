@@ -203,3 +203,49 @@ def test_no_primer_column_is_not_applicable_rather_than_a_silent_pass():
     result = gate_coamplify(pool, fx.recipe())
     assert result.status == NOT_APPLICABLE
     assert "primer_column" in result.detail
+
+
+def test_a_helper_arm_may_declare_SEVERAL_parent_arms():
+    """🔴 One helper arm can control more than one category of parent.
+
+    v7 adds three recoded-alternative arms beside the original missense one, and the silent
+    change for every one of them lives in the SAME helper arm. With a single parent name the
+    gate reported every helper of the other categories as an orphan: 624 of 1,033 rows on the
+    real build, while all four parent arms were present in the pool.
+    """
+    recipe = load_recipe_string(
+        fx.RECIPE_TOML.replace(
+            'target = 5\nparent = "missense_recoded"',
+            'target = 5\nparent = ["missense_recoded", "ptc"]\nparent_key = "gene"',
+        )
+    )
+    pool = fx.built_pool()
+    # half the helpers point at a missense parent, half at a ptc parent
+    mis = sorted({r["gene"] for r in pool if r["subpool"] == "missense_recoded"})
+    ptc = sorted({r["gene"] for r in pool if r["subpool"] == "ptc"})
+    helpers = [r for r in pool if r["subpool"] == "syn_recoded"]
+    for i, r in enumerate(helpers):
+        r["gene"] = (mis[i % len(mis)] if i % 2 == 0 else ptc[i % len(ptc)])
+
+    result = gate_parent(pool, recipe)
+    assert result.status == PASS, result.detail
+
+
+def test_several_parent_arms_still_catch_a_genuine_orphan():
+    """Widening the parent set must not weaken the check it exists for."""
+    recipe = load_recipe_string(
+        fx.RECIPE_TOML.replace(
+            'target = 5\nparent = "missense_recoded"',
+            'target = 5\nparent = ["missense_recoded", "ptc"]\nparent_key = "gene"',
+        )
+    )
+    pool = fx.built_pool()
+    mis = sorted({r["gene"] for r in pool if r["subpool"] == "missense_recoded"})
+    helpers = [r for r in pool if r["subpool"] == "syn_recoded"]
+    for i, r in enumerate(helpers):
+        r["gene"] = mis[i % len(mis)]
+    helpers[0]["gene"] = "YGHOST999W"          # in NEITHER parent arm
+
+    result = gate_parent(pool, recipe)
+    assert result.status == FAIL
+    assert "1 of 5 rows" in result.detail

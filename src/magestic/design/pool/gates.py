@@ -308,22 +308,34 @@ def gate_parent(
     for row in pool:
         by_arm[row.get(arm_column)].append(row)
 
+    def parent_arms(child: Any) -> list[str]:
+        """🔴 ONE control arm can control SEVERAL parent arms.
+
+        The helper arm holds the silent change for every recoded-alternative category, so a
+        single parent name here reports every helper of the other categories as an orphan. A
+        string stays a string so every existing recipe is unchanged.
+        """
+        p = child.parent
+        return [p] if isinstance(p, str) else list(p)
+
     problems: list[str] = []
     rows: list[tuple[Any, ...]] = []
     row_level = 0
     for child in children:
         kids = by_arm.get(child.name, [])
-        parents = by_arm.get(child.parent, [])
+        pnames = parent_arms(child)
+        pname = ", ".join(pnames)
+        parents = [r for n in pnames for r in by_arm.get(n, [])]
         if not kids:
             # An absent child is G-COMPOSITION's finding, not this gate's.
-            rows.append((child.name, child.parent, 0, len(parents), "child absent"))
+            rows.append((child.name, pname, 0, len(parents), "child absent"))
             continue
         if not parents:
             problems.append(
                 f"arm '{child.name}' ({len(kids):,} oligos) declares parent "
-                f"'{child.parent}', which is ABSENT from the pool — it controls for nothing"
+                f"'{pname}', which is ABSENT from the pool — it controls for nothing"
             )
-            rows.append((child.name, child.parent, len(kids), 0, "parent absent"))
+            rows.append((child.name, pname, len(kids), 0, "parent absent"))
             continue
         if child.parent_key:
             key = child.parent_key
@@ -333,19 +345,19 @@ def gate_parent(
             if orphans:
                 problems.append(
                     f"arm '{child.name}': {len(orphans):,} of {len(kids):,} rows have a "
-                    f"{key} absent from parent '{child.parent}', e.g. {orphans[:3]}"
+                    f"{key} absent from parent '{pname}', e.g. {orphans[:3]}"
                 )
                 rows.append(
-                    (child.name, child.parent, len(kids), len(parents),
+                    (child.name, pname, len(kids), len(parents),
                      f"{len(orphans)} orphan rows")
                 )
             else:
                 rows.append(
-                    (child.name, child.parent, len(kids), len(parents), "every row matched")
+                    (child.name, pname, len(kids), len(parents), "every row matched")
                 )
         else:
             rows.append(
-                (child.name, child.parent, len(kids), len(parents), "arm-level only")
+                (child.name, pname, len(kids), len(parents), "arm-level only")
             )
 
     header = ("arm", "parent", "child_rows", "parent_rows", "note")
