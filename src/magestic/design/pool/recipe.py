@@ -89,6 +89,23 @@ KNOWN_KINDS = frozenset(
         # the "second and third shots on goal". A distinct KIND because it is a distinct purpose:
         # not another variant, but another attempt at one already in the pool.
         "natural_extra_shots",
+        # Recoded alternatives for NATURAL variants, one kind per parent class. All three install
+        # the variant unchanged and add synonymous changes in NEIGHBOUR codons; they are distinct
+        # kinds because their parents and their justifications differ, and because a count that
+        # moves needs to fail against the arm that owns it rather than against a shared total.
+        #
+        #   recoded_synonymous  a PAM-distal synonymous variant, whose own codon is FIXED (it IS
+        #                       the variant), so the protective change must come from a neighbour.
+        #                       Measured 555 of 1,028 candidates (planning/530).
+        #   recoded_stop_lost   the same, for a stop_lost parent. Measured 1 of 2 (planning/530).
+        #   recoded_pam_access  ruling 2: an allowed guide CUTS but the variant is the N of NGG, so
+        #                       the PAM survives the edit and the allele is re-cut forever. The
+        #                       recoding destroys the GG or mismatches the seed. Measured 73 of 101
+        #                       (planning/531). NOT "PAM creation" — a donor recoding can never
+        #                       create a PAM in the recipient that has to be cut (planning/528).
+        "recoded_synonymous",
+        "recoded_stop_lost",
+        "recoded_pam_access",
     }
 )
 
