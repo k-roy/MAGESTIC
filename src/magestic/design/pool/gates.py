@@ -28,6 +28,9 @@ PASS = "pass"
 FAIL = "fail"
 NOT_APPLICABLE = "not_applicable"
 
+#: Separator for a list-valued parent key on one row (see :func:`gate_parent`).
+PARENT_KEY_SEP = ";"
+
 
 class PoolGateError(AssertionError):
     """One or more gates failed. Carries the failing :class:`GateResult` objects."""
@@ -340,7 +343,22 @@ def gate_parent(
         if child.parent_key:
             key = child.parent_key
             parent_keys = {p.get(key) for p in parents}
-            orphans = [k.get(recipe.id_column) for k in kids if k.get(key) not in parent_keys]
+            # 🔴 A child may legitimately carry SEVERAL parent keys: one molecule can serve two
+            # parents once duplicate designs are collapsed onto a single row, which is why the
+            # recipe already allows `parent` to be a list. Resolving the value ATOMICALLY read such
+            # a row as an orphan and failed a correct pool (measured 2026-11-17: "1 of 1,344 rows
+            # have a recode_pair_key absent from parent"). Every element must resolve, so this is
+            # strictly stronger than the old check, not a relaxation of it.
+            def _elements(value: Any) -> list[Any]:
+                if isinstance(value, str) and PARENT_KEY_SEP in value:
+                    return [v.strip() for v in value.split(PARENT_KEY_SEP) if v.strip()]
+                return [value]
+
+            orphans = [
+                k.get(recipe.id_column)
+                for k in kids
+                if any(e not in parent_keys for e in _elements(k.get(key)))
+            ]
             row_level += 1
             if orphans:
                 problems.append(
@@ -509,6 +527,167 @@ def gate_coamplify(
 # runner
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# G-RESITE and G-RECUT
+#
+# 🔴 WHY THESE EXIST (2026-11-17). The design code already refuses a bad oligo as it builds one:
+# ``remove_bspqi_sites_from_donor`` drops a design whose extra restriction site cannot be removed,
+# and ``guide_disruption`` drops a guide the repaired donor would still match. Both are correct and
+# both are per-oligo, at design time. **Nothing re-asked either question of the assembled pool.**
+# So when a LATER stage rebuilt a donor — which is exactly what the codon unit rule does when it
+# splits a linked variant — the rebuilt molecule was never re-checked, and a 24,000-oligo order was
+# assembled carrying 63 donors with an internal SapI site (the cloning enzyme would cut the insert)
+# and 127 whose repair product is still a perfect substrate for its own guide (the edit is installed
+# and then cut back out). The pool that shipped before the rebuild had ZERO of either.
+#
+# A guard that runs only at design time protects only designs that nothing touches afterwards.
+# These gates ask the same two questions of whatever actually ends up in the pool.
+# ---------------------------------------------------------------------------
+
+def _donor_bounds(recipe: PoolRecipe) -> tuple[int, int] | None:
+    seg = recipe.segments.get("donor") if recipe.segments else None
+    if not seg:
+        return None
+    lo, hi = seg
+    if hi is None:
+        hi = recipe.oligo_nt
+    if lo is None or hi is None:
+        return None
+    return int(lo), int(hi)
+
+
+def gate_restriction_sites(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+) -> GateResult:
+    """G-RESITE — the cloning enzyme must cut the linker and nothing else.
+
+    Fails if any oligo carries a declared recognition site INSIDE the donor window, or if the
+    per-oligo site count differs from ``restriction_sites_per_oligo``.
+    """
+    sites = recipe.restriction_sites
+    if not sites:
+        return GateResult(
+            gate="G-RESITE", status=NOT_APPLICABLE,
+            detail="no [cloning] restriction_sites declared, so nothing to check",
+        )
+    seqcol = recipe.sequence_column
+    bounds = _donor_bounds(recipe)
+    want = recipe.restriction_sites_per_oligo
+    internal: list[tuple[Any, ...]] = []
+    miscount: list[tuple[Any, ...]] = []
+    for row in pool:
+        seq = str(row.get(seqcol) or "").upper()
+        if not seq:
+            continue
+        offsets: list[int] = []
+        for site in sites:
+            start = seq.find(site)
+            while start != -1:
+                offsets.append(start)
+                start = seq.find(site, start + 1)
+        if want is not None and len(offsets) != want:
+            miscount.append((row.get(recipe.id_column), row.get(recipe.arm_column),
+                             f"{len(offsets)} site(s), expected {want}"))
+        if bounds is not None:
+            lo, hi = bounds
+            inside = sorted(o for o in offsets if lo <= o < hi)
+            if inside:
+                internal.append((row.get(recipe.id_column), row.get(recipe.arm_column),
+                                 ",".join(str(i) for i in inside)))
+    if internal or miscount:
+        bits = []
+        if internal:
+            bits.append(
+                f"{len(internal):,} oligo(s) carry a restriction site INSIDE the donor window "
+                f"{bounds} — the cloning enzyme would cut the insert"
+            )
+        if miscount:
+            bits.append(
+                f"{len(miscount):,} oligo(s) do not carry exactly {want} site(s)"
+            )
+        return GateResult(
+            gate="G-RESITE", status=FAIL, detail="; ".join(bits),
+            header=("oligo_id", "arm", "detail"),
+            # both lists carry (oligo_id, arm, detail); keeping one shape is what makes this
+            # safe to concatenate -- an earlier version mixed a 4-tuple in and raised here.
+            rows=tuple((a, b, c) for a, b, c in (internal + miscount)[:20]),
+        )
+    detail = f"every oligo carries exactly {want} site(s)" if want is not None else "sites counted"
+    if bounds is not None:
+        detail += f" and none inside the donor window {bounds}"
+    return GateResult(gate="G-RESITE", status=PASS, detail=detail)
+
+
+def gate_recut(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+    guide_column: str = "guide_seq",
+) -> GateResult:
+    """G-RECUT — the repair product must not still be a perfect target for its own guide.
+
+    Scans each oligo's donor window for ``guide + PAM`` on either strand. A perfect match means
+    the installed edit is cut out again and the lineage is lost, so it fails.
+    """
+    pam = recipe.recut_pam
+    if not pam:
+        return GateResult(
+            gate="G-RECUT", status=NOT_APPLICABLE,
+            detail="no [cloning] recut_pam declared, so nothing to check",
+        )
+    bounds = _donor_bounds(recipe)
+    if bounds is None:
+        return GateResult(
+            gate="G-RECUT", status=NOT_APPLICABLE,
+            detail="no donor segment declared in [segments], so the donor cannot be located",
+        )
+    lo, hi = bounds
+    seqcol = recipe.sequence_column
+    comp = str.maketrans("ACGTN", "TGCAN")
+
+    def matches(window: str, guide: str) -> bool:
+        if len(window) != len(guide) + len(pam):
+            return False
+        if window[: len(guide)] != guide:
+            return False
+        tail = window[len(guide):]
+        return all(p == "N" or p == t for p, t in zip(pam, tail))
+
+    hits: list[tuple[Any, ...]] = []
+    checked = 0
+    for row in pool:
+        guide = str(row.get(guide_column) or "").upper()
+        seq = str(row.get(seqcol) or "").upper()
+        if not guide or not seq:
+            continue
+        donor = seq[lo:hi]
+        checked += 1
+        span = len(guide) + len(pam)
+        rc_donor = donor.translate(comp)[::-1]
+        retained = any(
+            matches(d[i: i + span], guide)
+            for d in (donor, rc_donor)
+            for i in range(max(0, len(d) - span + 1))
+        )
+        if retained:
+            hits.append((row.get(recipe.id_column), row.get(recipe.arm_column), guide))
+    if hits:
+        return GateResult(
+            gate="G-RECUT", status=FAIL,
+            detail=(
+                f"{len(hits):,} of {checked:,} design(s) whose donor still contains "
+                f"guide+{pam} on one strand, so the repaired site is re-cut and the edit lost"
+            ),
+            header=("oligo_id", "arm", "guide_seq"),
+            rows=tuple(hits[:20]),
+        )
+    return GateResult(
+        gate="G-RECUT", status=PASS,
+        detail=f"no donor of {checked:,} design(s) retains guide+{pam} on either strand",
+    )
+
+
 def run_gates(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
@@ -523,6 +702,10 @@ def run_gates(
         gate_populated(pool, recipe),
         gate_parent(pool, recipe),
         gate_coamplify(pool, recipe),
+        # G-RESITE and G-RECUT re-ask at POOL level what the design code already enforces per
+        # oligo, because a later stage can rebuild a donor and nothing else would notice.
+        gate_restriction_sites(pool, recipe),
+        gate_recut(pool, recipe),
     ]
 
 

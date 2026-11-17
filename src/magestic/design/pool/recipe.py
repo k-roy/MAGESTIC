@@ -296,6 +296,21 @@ class PoolRecipe:
     segments: Mapping[str, tuple[int, int | None]] = field(default_factory=dict)
     #: Arms the recipe declares but switches off with ``enabled = false``. Reported, never silent.
     disabled_arms: tuple[str, ...] = ()
+    #: 🔴 The CLONING contract, from ``[cloning]``. The assembled oligo carries the enzyme's
+    #: recognition site in its cloning linker, so a correct pool has EXACTLY
+    #: ``restriction_sites_per_oligo`` of them and NONE inside the donor window. The design code
+    #: already enforces this per oligo as it builds one (``remove_bspqi_sites_from_donor``,
+    #: ``guide_disruption``), but nothing re-checked it after a LATER stage rebuilt a donor, and a
+    #: donor rebuild is exactly what the codon unit rule does. Declaring it here lets G-RESITE and
+    #: G-RECUT re-ask the question of the assembled pool, whatever produced it.
+    restriction_sites: tuple[str, ...] = ()
+    restriction_sites_per_oligo: int | None = None
+    #: The PAM the pool's own guides are re-checked against by G-RECUT, e.g. ``"NGG"``.
+    recut_pam: str | None = None
+    #: ``[invariants]``, parsed rather than ignored. It used to be read by NOTHING: the loader
+    #: dropped the table on the floor while its own comment claimed "a future silent dedupe fails
+    #: loudly". It could not. Kept as data so a checker can read it.
+    invariants: Mapping[str, Any] = field(default_factory=dict)
     arm_column: str = "arm"
     id_column: str = "oligo_id"
     sequence_column: str = "oligo_seq"
@@ -656,6 +671,36 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
 
     schema = _parse_schema(data.get("schema", {}) or {})
     segments = _parse_segments(data.get("segments", {}) or {})
+    cloning = data.get("cloning", {}) or {}
+    re_sites = cloning.get("restriction_sites", ()) or ()
+    if isinstance(re_sites, str):
+        re_sites = (re_sites,)
+    re_sites = tuple(str(x).upper() for x in re_sites)
+    for site in re_sites:
+        if set(site) - set("ACGT"):
+            raise RecipeError(
+                f"[cloning] restriction_sites must be plain ACGT, got {site!r}"
+            )
+    per_oligo = cloning.get("restriction_sites_per_oligo")
+    if per_oligo is not None:
+        if isinstance(per_oligo, bool) or not isinstance(per_oligo, int) or per_oligo < 0:
+            raise RecipeError(
+                f"[cloning] restriction_sites_per_oligo must be a non-negative int, "
+                f"got {per_oligo!r}"
+            )
+    if per_oligo is not None and not re_sites:
+        raise RecipeError(
+            "[cloning] restriction_sites_per_oligo is declared but restriction_sites is empty, "
+            "so nothing would be counted. Declare both or neither."
+        )
+    recut_pam = cloning.get("recut_pam")
+    if recut_pam is not None:
+        recut_pam = str(recut_pam).upper()
+        if set(recut_pam) - set("ACGTN"):
+            raise RecipeError(f"[cloning] recut_pam must be ACGT/N, got {recut_pam!r}")
+    invariants = data.get("invariants", {}) or {}
+    if not isinstance(invariants, Mapping):
+        raise RecipeError("[invariants] must be a table")
 
     recipe = PoolRecipe(
         name=str(pool.get("name", "unnamed_pool")),
@@ -668,6 +713,10 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
         reverse_primers=int(pool.get("reverse_primers", 1)),
         schema=schema,
         segments=segments,
+        restriction_sites=re_sites,
+        restriction_sites_per_oligo=per_oligo,
+        recut_pam=recut_pam,
+        invariants=invariants,
         arm_column=str(pool.get("arm_column", "arm")),
         id_column=str(pool.get("id_column", "oligo_id")),
         sequence_column=str(pool.get("sequence_column", "oligo_seq")),
