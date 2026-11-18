@@ -588,7 +588,9 @@ def guide_disruption(
         guide_with_pam = pam_to_check + guide
 
     query_len = len(guide_with_pam)
-    for idx in range(donor_length - query_len):
+    # 🔴 `+ 1`: see the twin fix in guide_donor_functions.guide_disruption. The last window was
+    # never examined, so a site flush against the end of the scanned span read as disrupted.
+    for idx in range(donor_length - query_len + 1):
         window = donor[idx: idx + query_len]
         if hamming_distance(window, guide_with_pam) == 0:
             return False

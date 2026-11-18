@@ -561,7 +561,11 @@ def guide_disruption(
         guide_seq + PAM_to_check if GUIDE_UPSTREAM_PAM else PAM_to_check + guide_seq
     )
     query_length = len(guide_seq_with_PAM)
-    for idx in range(len(donor) - query_length):
+    # 🔴 `+ 1`: the number of windows is len - query + 1. Without it the LAST window is never
+    # examined, so a guide+PAM flush against the 3' end of the donor was reported as disrupted
+    # while it was still perfectly present — a false "safe" verdict, which is the direction that
+    # ships a design that re-cuts. Found auditing the 127 re-cutting designs of NN 581.
+    for idx in range(len(donor) - query_length + 1):
         query = donor[idx : idx + query_length]
         query_rc = rev_comp(query)
         if (

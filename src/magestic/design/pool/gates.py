@@ -31,6 +31,89 @@ NOT_APPLICABLE = "not_applicable"
 #: Separator for a list-valued parent key on one row (see :func:`gate_parent`).
 PARENT_KEY_SEP = ";"
 
+#: Complement table used by the re-cut predicate.
+_COMPLEMENT = str.maketrans("ACGTN", "TGCAN")
+
+#: IUPAC degenerate bases, expanded. Kept LOCAL to this module on purpose: stage 0 of the pool
+#: pipeline content-verifies exactly the six files of this package against the pinned commit, so a
+#: gate that imported its matcher from elsewhere in magestic would depend on a file whose contents
+#: nothing checks. Six lines of table are cheaper than a hole in the provenance chain.
+_IUPAC = {
+    "A": "A", "C": "C", "G": "G", "T": "T",
+    "R": "AG", "Y": "CT", "S": "CG", "W": "AT", "K": "GT", "M": "AC",
+    "B": "CGT", "D": "AGT", "H": "ACT", "V": "ACG", "N": "ACGT",
+}
+
+
+def _base_matches(pattern_base: str, seq_base: str) -> bool:
+    """Does ``seq_base`` satisfy the possibly-degenerate ``pattern_base``?"""
+    return seq_base in _IUPAC.get(pattern_base, pattern_base)
+
+
+def donor_retains_target(
+    donor: str, guide: str, pam: str = "NGG", pam_first: bool = False
+) -> bool:
+    """Does ``donor`` still contain a perfect ``guide`` + ``pam`` target on either strand?
+
+    This is THE re-cut predicate. :func:`gate_recut` is a thin wrapper over it, and any
+    design-time step that REBUILDS a donor must call this same function rather than reimplement
+    the test — a design-time guard that differs from the shipping gate protects nothing, which
+    is exactly how 127 re-cutting designs reached a finished pool (NN 581).
+
+    ``pam`` is matched as an IUPAC pattern, so the default ``"NGG"`` accepts AGG/CGG/GGG/TGG and a
+    ``"TTTV"`` Cas12a PAM works too. A perfect match means the nuclease cuts the repaired site
+    again and the edit is lost, so a donor for which this returns ``True`` must never ship.
+
+    Set ``pam_first`` for a nuclease whose PAM precedes the protospacer, such as Cas12a. Note that
+    magestic's older ``guide_disruption`` spells the same idea as ``pam_upstream``, whose ``True``
+    means the PAM comes AFTER the guide — the flag's name says the opposite of what it does, which
+    is why this one is named for what is actually placed first.
+
+    The test is strand-symmetric: the guide may be retained on either strand of the donor,
+    because the donor is double-stranded once it is in the cell.
+    """
+    donor = (donor or "").upper()
+    guide = (guide or "").upper()
+    pam = (pam or "").upper()
+    if not donor or not guide or not pam:
+        return False
+    motif = (pam + guide) if pam_first else (guide + pam)
+    span = len(motif)
+    # 🔴 `+ 1`. The window count is len - span + 1, not len - span. Both older copies of
+    # guide_disruption dropped the +1 and so never examined the LAST window, reporting a site
+    # flush against the 3' end of the donor as disrupted when it is plainly still there.
+    for strand in (donor, donor.translate(_COMPLEMENT)[::-1]):
+        for i in range(max(0, len(strand) - span + 1)):
+            window = strand[i : i + span]
+            if len(window) == span and all(
+                _base_matches(p, t) for p, t in zip(motif, window)
+            ):
+                return True
+    return False
+
+
+def restriction_site_offsets(seq: str, sites: Iterable[str]) -> list[int]:
+    """Every start offset in ``seq`` at which one of ``sites`` occurs, sorted.
+
+    Shared by :func:`gate_restriction_sites` and by any design-time step that rebuilds part of
+    an oligo, for the same one-implementation reason as :func:`donor_retains_target`.
+
+    Offsets are site STARTS. A caller asking "is a site inside the donor window" should also
+    remember that a site starting just before the window extends into it; the cloning linker is
+    positioned so that its own site abuts the donor start rather than overlapping it.
+    """
+    seq = (seq or "").upper()
+    offsets: list[int] = []
+    for site in sites:
+        site = site.upper()
+        if not site:
+            continue
+        start = seq.find(site)
+        while start != -1:
+            offsets.append(start)
+            start = seq.find(site, start + 1)
+    return sorted(offsets)
+
 
 class PoolGateError(AssertionError):
     """One or more gates failed. Carries the failing :class:`GateResult` objects."""
@@ -581,12 +664,7 @@ def gate_restriction_sites(
         seq = str(row.get(seqcol) or "").upper()
         if not seq:
             continue
-        offsets: list[int] = []
-        for site in sites:
-            start = seq.find(site)
-            while start != -1:
-                offsets.append(start)
-                start = seq.find(site, start + 1)
+        offsets = restriction_site_offsets(seq, sites)
         if want is not None and len(offsets) != want:
             miscount.append((row.get(recipe.id_column), row.get(recipe.arm_column),
                              f"{len(offsets)} site(s), expected {want}"))
@@ -644,15 +722,6 @@ def gate_recut(
         )
     lo, hi = bounds
     seqcol = recipe.sequence_column
-    comp = str.maketrans("ACGTN", "TGCAN")
-
-    def matches(window: str, guide: str) -> bool:
-        if len(window) != len(guide) + len(pam):
-            return False
-        if window[: len(guide)] != guide:
-            return False
-        tail = window[len(guide):]
-        return all(p == "N" or p == t for p, t in zip(pam, tail))
 
     hits: list[tuple[Any, ...]] = []
     checked = 0
@@ -661,16 +730,9 @@ def gate_recut(
         seq = str(row.get(seqcol) or "").upper()
         if not guide or not seq:
             continue
-        donor = seq[lo:hi]
         checked += 1
-        span = len(guide) + len(pam)
-        rc_donor = donor.translate(comp)[::-1]
-        retained = any(
-            matches(d[i: i + span], guide)
-            for d in (donor, rc_donor)
-            for i in range(max(0, len(d) - span + 1))
-        )
-        if retained:
+        # 🔴 ONE implementation, shared with every design-time step that rebuilds a donor.
+        if donor_retains_target(seq[lo:hi], guide, pam):
             hits.append((row.get(recipe.id_column), row.get(recipe.arm_column), guide))
     if hits:
         return GateResult(
