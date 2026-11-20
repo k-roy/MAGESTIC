@@ -45,3 +45,5 @@ __all__ = [
     "load_common_to_systematic_gene_name_dict",
     "get_annotation_fields_from_gff",
 ]
+
+from .consequence import classify_translations  # noqa: F401

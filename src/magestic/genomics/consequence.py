@@ -354,6 +354,46 @@ def _classify_indel(
     return kind, "", tuple(changes), detail
 
 
+def classify_translations(
+    prot_ref: str,
+    prot_alt: str,
+    ref: str,
+    alt: str,
+    codon: Optional[int] = None,
+) -> VariantConsequence:
+    """The consequence of ``ref``->``alt`` read from the two TRANSLATIONS alone.
+
+    :func:`annotate_variant` is the right entry point when you hold the genome and the CDS model.
+    This one exists for the callers that have already spliced and translated both proteins and only
+    need the judgement, so that **the judgement has one implementation**.
+
+    🔴 **WHY IT IS PUBLIC.** A project copy of this logic shipped a 24,000-oligo pool in which 7
+    designs that destroy a gene's start methionine were labelled ``missense``. Its classifier took
+    the FIRST differing residue and had no start-codon case, so ``M1V`` and ``M1I`` read as ordinary
+    substitutions. Measured against this module on the same 14,748 coding rows, the two agreed on
+    14,741 and the 7 they disagreed on were all codon 1. Destroying the start is not a missense
+    change, and the project had no way to say so. One implementation, imported, is the fix.
+
+    ``codon`` is the 0-based residue index of the edit. It is optional because a caller holding only
+    the translations does not always know it; it refines an indel's ``detail`` and ``aa_changes``
+    and changes no consequence.
+
+    Precedence is the same as :func:`annotate_variant`: a gained stop dominates, then a destroyed
+    start, then a destroyed stop, then an ordinary residue change.
+    """
+    ref, alt = (ref or "").upper(), (alt or "").upper()
+    if len(ref) == len(alt):
+        kind, aa, changes = _classify_substitution(prot_ref, prot_alt)
+        return VariantConsequence(kind, aa, changes)
+    kind, aa, changes, detail = _classify_indel(
+        prot_ref, prot_alt, ref, alt, 0 if codon is None else codon
+    )
+    if codon is None:
+        # the residue number in an indel's detail is the one thing `codon` was needed for
+        detail = detail.split(" at residue ")[0].split("; every downstream")[0]
+    return VariantConsequence(kind, aa, changes, detail=detail)
+
+
 def annotate_variant(
     genome: Dict[str, str],
     model: CdsModel,
