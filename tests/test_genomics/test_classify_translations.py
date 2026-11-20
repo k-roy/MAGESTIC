@@ -117,3 +117,48 @@ def test_it_agrees_with_annotate_variant_on_the_same_translations():
         )
         assert av.consequence == ct.consequence, (pos0, ref, alt)
         assert av.aa_change == ct.aa_change, (pos0, ref, alt)
+
+
+# ------------- the unshifted-window bug, which this module ALSO had until 2026-11-20
+
+def test_shift_exons_for_indel_moves_only_what_the_edit_moves():
+    from magestic.genomics.consequence import shift_exons_for_indel as sh
+    assert sh([(0, 30)], 10, +3) == [(0, 33)]
+    assert sh([(0, 30), (50, 80)], 10, +3) == [(0, 33), (53, 83)]
+    assert sh([(0, 30), (50, 80)], 60, +3) == [(0, 30), (50, 83)]
+    assert sh([(0, 30)], 10, -3) == [(0, 27)]
+
+
+def test_shift_declines_rather_than_guesses_at_a_boundary():
+    from magestic.genomics.consequence import shift_exons_for_indel as sh
+    assert sh([(0, 30), (50, 80)], 40, +3) is None      # between the exons
+    assert sh([(0, 30)], 10, -40) is None               # removes more than the exon holds
+
+
+def test_annotate_variant_now_lengthens_the_protein_for_an_insertion():
+    """🔴 The bug: splicing the edited genome with the ORIGINAL exons kept the CDS the same width,
+    so an insertion displaced downstream bases instead of extending the protein."""
+    from magestic.genomics.consequence import annotate_variant, build_cds, translate
+    seq = "ATG" + "AAA" * 10 + "TAA" + "G" * 30
+    model = {"G1": ("chrT", "+", [(0, 36)])}
+    v = annotate_variant({"chrT": seq}, model, "G1", "chrT", 6, "", "GGG")
+    assert v.consequence == "inframe_insertion"
+    # and the edited protein really is one residue longer
+    from magestic.genomics.consequence import shift_exons_for_indel
+    ex2 = shift_exons_for_indel(model["G1"][2], 6, +3)
+    edited = seq[:6] + "GGG" + seq[6:]
+    assert len(translate(build_cds(edited, ex2, "+"))) == len(
+        translate(build_cds(seq, model["G1"][2], "+"))) + 1
+
+
+def test_classify_translations_REFUSES_an_unshifted_window():
+    """The caller did the splicing, so the caller can have done it wrong. Equal-length
+    translations with a non-zero in-frame net is the signature, and it is refused, not guessed."""
+    v = classify_translations("MKVA*", "MKVA*", "", "GGG")
+    assert v.consequence == "non_coding"
+    assert "UNSHIFTED" in v.detail and "annotate_variant" in v.detail
+
+
+def test_a_frameshift_is_still_classified_without_the_guard_firing():
+    """net %% 3 != 0 cannot be checked this way and must still answer."""
+    assert classify_translations("MKVA*", "MKVA*", "A", "").consequence == "frameshift"

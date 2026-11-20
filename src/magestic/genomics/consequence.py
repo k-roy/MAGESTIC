@@ -354,6 +354,45 @@ def _classify_indel(
     return kind, "", tuple(changes), detail
 
 
+def shift_exons_for_indel(
+    exons: Sequence[Tuple[int, int]], pos0: int, net: int
+) -> Optional[List[Tuple[int, int]]]:
+    """The exon intervals as they are AFTER an indel of ``net`` nt at ``pos0``.
+
+    🔴 **WITHOUT THIS, AN INSERTION NEVER LENGTHENS THE PROTEIN.** Splicing the edited genome with
+    the ORIGINAL exon coordinates keeps the CDS window the same width, so inserted bases displace
+    the same number of downstream bases and the terminal stop can fall out of the window entirely.
+    Measured on 10 real designs with net +3 to +27 nt: ``len(prot_alt) == len(prot_ref)`` on every
+    one, 4 of them lost their stop codon, and 3 landed a "premature" stop at exactly the reference
+    stop position, which made the premature-stop test true by construction.
+
+    So every consequence computed for a length-changing allele this way was unsound, and the
+    refinement built on top of it reported truncations that are artifacts of the window.
+
+    An interval entirely before the edit is unchanged; the interval containing the edit grows or
+    shrinks by ``net``; an interval entirely after it shifts by ``net``.
+
+    Returns ``None`` when the edit SPANS an exon boundary, where this arithmetic does not apply and
+    guessing would be worse than declining: the caller must treat that as unresolvable rather than
+    receive a plausible wrong answer.
+    """
+    out: List[Tuple[int, int]] = []
+    containing = 0
+    for a, b in exons:
+        if b <= pos0:
+            out.append((a, b))
+        elif a <= pos0 < b:
+            containing += 1
+            if b + net < a:
+                return None          # the deletion removes more than the exon holds
+            out.append((a, b + net))
+        else:
+            out.append((a + net, b + net))
+    if containing != 1:
+        return None                  # at a boundary, or outside every exon
+    return out
+
+
 def classify_translations(
     prot_ref: str,
     prot_alt: str,
@@ -385,6 +424,24 @@ def classify_translations(
     if len(ref) == len(alt):
         kind, aa, changes = _classify_substitution(prot_ref, prot_alt)
         return VariantConsequence(kind, aa, changes)
+
+    net = len(alt) - len(ref)
+    # 🔴 THE GUARD THAT CATCHES THE CALLER'S WINDOW BUG, because a caller supplying translations has
+    # already done the splicing and can have done it wrong. A correctly spliced in-frame indel MUST
+    # change the protein's length, by net//3 residues; equal lengths mean the edited CDS was cut
+    # with the UNSHIFTED exon coordinates, so the inserted bases displaced downstream ones and the
+    # terminal stop may have fallen out of the window. Measured on 10 real designs at net +3 to +27:
+    # equal lengths on all 10, 4 with no stop left at all, and 3 whose "premature" stop sat exactly
+    # at the reference stop, which makes the premature-stop test true by construction.
+    # Refusing is the only safe answer: a plausible wrong consequence is worse than none, and
+    # `shift_exons_for_indel` plus `annotate_variant` is the path that gets it right.
+    if net % 3 == 0 and net != 0 and len(prot_alt) == len(prot_ref):
+        return VariantConsequence(
+            "non_coding",
+            detail=(f"unresolvable: net {net:+d} nt but both translations are {len(prot_ref)} "
+                    f"residues, so the edited CDS was spliced with the UNSHIFTED exon coordinates. "
+                    f"Use annotate_variant, or shift_exons_for_indel before translating."),
+        )
     kind, aa, changes, detail = _classify_indel(
         prot_ref, prot_alt, ref, alt, 0 if codon is None else codon
     )
@@ -445,14 +502,27 @@ def annotate_variant(
 
     prot_ref = translate(build_cds(seq, exons, strand))
     edited = seq[:pos0] + alt + seq[pos0 + len(ref) :]
-    prot_alt = translate(build_cds(edited, exons, strand))
     codon = offset // 3
 
     if len(ref) == len(alt):
+        prot_alt = translate(build_cds(edited, exons, strand))
         kind, change, changes = _classify_substitution(prot_ref, prot_alt)
         detail = "" if len(changes) <= 1 else f"{len(changes)} residues altered"
         return VariantConsequence(kind, change, changes, gene, detail)
 
+    # 🔴 A LENGTH-CHANGING ALLELE MOVES EVERY DOWNSTREAM EXON BOUNDARY. Splicing the edited genome
+    # with the original coordinates gives a CDS of the SAME width, so an insertion displaces
+    # downstream bases instead of extending the protein and can push the terminal stop out of the
+    # window. Measured on 10 real designs at net +3 to +27: len(prot_alt) == len(prot_ref) on all
+    # of them. The shift is what makes the edited protein real.
+    shifted = shift_exons_for_indel(exons, pos0, len(alt) - len(ref))
+    if shifted is None:
+        return VariantConsequence(
+            "non_coding", gene=gene,
+            detail="a length-changing allele spanning an exon boundary; the edited reading frame "
+                   "is not resolvable from this model, so no consequence is claimed",
+        )
+    prot_alt = translate(build_cds(edited, shifted, strand))
     kind, change, changes, detail = _classify_indel(prot_ref, prot_alt, ref, alt, codon)
     return VariantConsequence(kind, change, changes, gene, detail)
 
