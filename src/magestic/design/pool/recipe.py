@@ -329,6 +329,10 @@ class PoolRecipe:
     #: that claim is false.
     nontargeting_arms: tuple[str, ...] = ()
     nontargeting_max_genomic_mismatch: int | None = None
+    #: ``[invariants] recoded_flag_arms`` — the arms whose designs carry a synonymous recoding, so
+    #: the boolean that says so can be checked BOTH ways: true inside them, false outside.
+    recoded_flag_arms: tuple[str, ...] = ()
+    recoded_flag_column: str | None = None
     arm_column: str = "arm"
     id_column: str = "oligo_id"
     sequence_column: str = "oligo_seq"
@@ -736,6 +740,16 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
     if max_id is not None:
         if not isinstance(max_id, int) or isinstance(max_id, bool) or max_id <= 0:
             raise RecipeError("[invariants] max_oligo_id_chars must be a positive integer")
+    rf_arms = tuple(invariants.get("recoded_flag_arms", ()) or ())
+    rf_col = invariants.get("recoded_flag_column")
+    if rf_arms and not all(isinstance(x, str) and x for x in rf_arms):
+        raise RecipeError("[invariants] recoded_flag_arms must be a list of arm names")
+    if bool(rf_arms) != bool(rf_col):
+        raise RecipeError(
+            "[invariants] recoded_flag_arms and recoded_flag_column must be declared together: "
+            "an arm list with no column names nothing to check, and a column with no arm list has "
+            "no expectation to check it against."
+        )
     nt_arms = tuple(invariants.get("nontargeting_arms", ()) or ())
     nt_mm = invariants.get("nontargeting_max_genomic_mismatch")
     if nt_arms and not all(isinstance(a, str) and a for a in nt_arms):
@@ -780,6 +794,8 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
         max_oligo_id_chars=max_id,
         nontargeting_arms=nt_arms,
         nontargeting_max_genomic_mismatch=nt_mm,
+        recoded_flag_arms=rf_arms,
+        recoded_flag_column=(str(rf_col) if rf_col else None),
         arm_column=str(pool.get("arm_column", "arm")),
         id_column=str(pool.get("id_column", "oligo_id")),
         sequence_column=str(pool.get("sequence_column", "oligo_seq")),

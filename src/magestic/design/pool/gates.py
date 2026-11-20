@@ -954,6 +954,87 @@ def gate_identifier_length(
     )
 
 
+_TRUEY = {"true", "t", "yes", "y", "1"}
+_FALSEY = {"false", "f", "no", "n", "0", ""}
+
+
+def gate_recoded_flag(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+) -> GateResult:
+    """G-RECODED — the boolean that says a design carries a recoding must agree with its arm.
+
+    🔴 **FOUND BY THE COLLABORATOR, NOT BY A GATE, AND IT IS THE SAME BUG TWICE IN ONE EXPRESSION.**
+    The packer wrote ``recoded=("true" if name in ("recoded", "syn_recoded") else "false")`` while
+    the line twenty rows below it, ``recode_pair_key``, already named all FOUR recoded arms with a
+    comment explaining that scoping it to one arm had hidden 642 helpers. The flag was never
+    widened. So ``syn_recoded_alternatives``, ``ruling2_recoded`` and ``stop_lost_recoded`` — arms
+    whose entire purpose is to add synonymous changes in neighbouring codons — shipped with
+    ``recoded`` reading FALSE, and 914 of those 938 rows even had a helper pointing at them.
+
+    Chris Wood at EMBL hit it immediately: *"out of 2735 total recoded variant designs, 1797 are
+    TRUE for recoded"*. A reader cannot select the recoded designs from the column that exists to
+    name them.
+
+    Checked BOTH WAYS on purpose. A gate that only asked "is it true inside the arms" would pass a
+    column that was true everywhere, which carries exactly as little information as one that is
+    false everywhere.
+
+    Declared as ``[invariants] recoded_flag_arms`` and ``recoded_flag_column``; neither may be
+    declared without the other, and undeclared is ``not_applicable``.
+    """
+    arms = tuple(recipe.recoded_flag_arms or ())
+    col = recipe.recoded_flag_column
+    if not arms or not col:
+        return GateResult(
+            gate="G-RECODED", status=NOT_APPLICABLE,
+            detail="no [invariants] recoded_flag_arms/recoded_flag_column declared",
+        )
+    if col not in _columns_of(pool):
+        return GateResult(
+            gate="G-RECODED", status=FAIL,
+            detail=f"recoded_flag_column {col!r} is not a column of this pool",
+        )
+    armset = set(arms)
+    missing_arms = armset - {str(r.get(recipe.arm_column) or "") for r in pool}
+    if missing_arms:
+        return GateResult(
+            gate="G-RECODED", status=FAIL,
+            detail=(f"recoded_flag_arms names arm(s) absent from this pool: "
+                    f"{sorted(missing_arms)}. An expectation about an arm that is not here is not "
+                    f"a check."),
+        )
+    wrong_false: list[tuple[Any, ...]] = []
+    wrong_true: list[tuple[Any, ...]] = []
+    n_in = n_out = 0
+    for row in pool:
+        arm = str(row.get(recipe.arm_column) or "")
+        raw = str(row.get(col) or "").strip().lower()
+        if arm in armset:
+            n_in += 1
+            if raw not in _TRUEY:
+                wrong_false.append((row.get(recipe.id_column), arm, raw or "(blank)", "expected true"))
+        else:
+            n_out += 1
+            if raw in _TRUEY:
+                wrong_true.append((row.get(recipe.id_column), arm, raw, "expected false"))
+    bad = wrong_false + wrong_true
+    if bad:
+        return GateResult(
+            gate="G-RECODED", status=FAIL,
+            detail=(f"{len(wrong_false):,} row(s) in {arms} do not say {col}=true and "
+                    f"{len(wrong_true):,} row(s) outside them do. A boolean that disagrees with the "
+                    f"arm it sits in cannot be used to select designs"),
+            header=("oligo_id", "arm", col, "expected"),
+            rows=tuple(bad[:20]),
+        )
+    return GateResult(
+        gate="G-RECODED", status=PASS,
+        detail=(f"{n_in:,} row(s) in {arms} all say {col}=true and {n_out:,} row(s) "
+                f"outside them all say false"),
+    )
+
+
 def gate_nontargeting(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
@@ -1053,6 +1134,7 @@ def run_gates(
         gate_gc_fraction(pool, recipe),
         gate_identifier_length(pool, recipe, identifier_names_are_final),
         gate_nontargeting(pool, recipe, nontargeting_index),
+        gate_recoded_flag(pool, recipe),
     ]
 
 

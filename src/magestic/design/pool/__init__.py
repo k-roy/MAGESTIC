@@ -89,6 +89,7 @@ from .gates import (
     gate_gc_fraction,
     gate_identifier_length,
     gate_nontargeting,
+    gate_recoded_flag,
     GateResult,
     PoolGateError,
     gate_composition,
@@ -143,6 +144,7 @@ __all__ = [
     "gate_gc_fraction",
     "gate_identifier_length",
     "gate_nontargeting",
+    "gate_recoded_flag",
     # the two predicates the gates are built from. A design-time step that rebuilds a donor
     # imports these rather than reimplementing them, so source and gate cannot diverge.
     "donor_retains_target",

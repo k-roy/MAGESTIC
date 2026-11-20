@@ -234,3 +234,56 @@ def test_run_gates_threads_the_scope_through():
     assert by["G-IDLEN"].status == "not_applicable"
     by = {g.gate: g for g in run_gates(pool, r, identifier_names_are_final=True)}
     assert by["G-IDLEN"].status == "fail"
+
+
+# ------------------------------------------------------------- G-RECODED
+
+RF = 'recoded_flag_arms = ["a"]\nrecoded_flag_column = "recoded"'
+
+
+def rrow(oid, arm, recoded):
+    return {"oligo_id": oid, "subpool": arm, "oligo_seq": "ACGT", "recoded": recoded}
+
+
+def test_recoded_flag_undeclared_is_not_applicable():
+    from magestic.design.pool import gate_recoded_flag
+    assert gate_recoded_flag([rrow("o", "a", "true")], rec("")).status == "not_applicable"
+
+
+def test_recoded_flag_agreeing_both_ways_passes():
+    from magestic.design.pool import gate_recoded_flag
+    pool = [rrow("i", "a", "true"), rrow("o", "scrambled", "false")]
+    assert gate_recoded_flag(pool, rec(RF)).status == "pass"
+
+
+def test_recoded_flag_false_inside_a_recoded_arm_fails():
+    """🔴 The shipped defect: an arm that is recoded by construction reading FALSE."""
+    from magestic.design.pool import gate_recoded_flag
+    g = gate_recoded_flag([rrow("synalt_1", "a", "false")], rec(RF))
+    assert g.status == "fail" and "synalt_1" in str(g.rows)
+
+
+def test_recoded_flag_true_outside_is_also_a_failure():
+    """A one-way gate would pass a column that is true everywhere, which says nothing."""
+    from magestic.design.pool import gate_recoded_flag
+    g = gate_recoded_flag([rrow("i", "a", "true"), rrow("x", "scrambled", "true")], rec(RF))
+    assert g.status == "fail" and "expected false" in str(g.rows)
+
+
+def test_recoded_flag_blank_inside_is_a_failure_not_a_skip():
+    from magestic.design.pool import gate_recoded_flag
+    g = gate_recoded_flag([rrow("i", "a", "")], rec(RF))
+    assert g.status == "fail" and "(blank)" in str(g.rows)
+
+
+def test_recoded_flag_naming_an_absent_arm_fails():
+    from magestic.design.pool import gate_recoded_flag
+    g = gate_recoded_flag([rrow("o", "scrambled", "false")], rec(RF))
+    assert g.status == "fail" and "absent from this pool" in g.detail
+
+
+def test_half_a_recoded_flag_declaration_is_refused_at_load():
+    with pytest.raises(RecipeError):
+        rec('recoded_flag_arms = ["a"]')
+    with pytest.raises(RecipeError):
+        rec('recoded_flag_column = "recoded"')
