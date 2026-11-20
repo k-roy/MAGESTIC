@@ -698,6 +698,82 @@ def gate_restriction_sites(
     return GateResult(gate="G-RESITE", status=PASS, detail=detail)
 
 
+def gate_unique_design(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+) -> GateResult:
+    """G-UNIQUE — no two designs may describe the same edit reached by the same guide.
+
+    🔴 THE KEY IS THE WHOLE POINT, and the pool shipped a defect because the declared key was the
+    wrong one. A collaborator found 20 variants present twice in a finished 24,000-oligo pool, 40
+    oligos, each pair carrying the SAME guide and the SAME edit over byte-identical donor content
+    and differing only in where the 129-nt window was placed, by 1 to 3 nt (NN 600).
+
+    Nothing caught it, and the near misses are instructive:
+
+    * a gate on SEQUENCE identity cannot see it. The 200-mers genuinely differ once the window
+      shifts, so "no two oligos share a sequence" passed legitimately. **Sequence identity and
+      DESIGN identity are different questions** and only one of them was ever asked.
+    * the recipe's own ``duplicate_biology_rows`` keyed on ``(gene, guide_seq, ref, alt)``, which
+      measured 308 groups and 313 excess rows on that pool because it swept in **1,584 legitimate
+      second and third shots**. A number that large is not actionable, so three sessions deferred
+      it, and the 20 real duplicates hid inside it.
+
+    The key that separates them is the one declared here. An extra shot at the same edit carries a
+    DIFFERENT guide by construction, so it drops out; two designs that share edit AND guide are the
+    same experiment twice.
+
+    Declared as ``[invariants] design_identity_key = ["chrom", "edit_pos", "ref_allele",
+    "alt_allele", "guide_seq"]``. Undeclared means ``not_applicable``: this gate never invents a key,
+    because the wrong key is exactly how the defect survived.
+    """
+    key_cols = recipe.design_identity_key
+    if not key_cols:
+        return GateResult(
+            gate="G-UNIQUE", status=NOT_APPLICABLE,
+            detail="no [invariants] design_identity_key declared, so design identity is undefined",
+        )
+    missing = [c for c in key_cols if not any(c in row for row in pool[:1])] if pool else []
+    if missing:
+        return GateResult(
+            gate="G-UNIQUE", status=FAIL,
+            detail=(f"design_identity_key names column(s) the pool does not have: {missing}. "
+                    f"A key that cannot be read is not a check."),
+        )
+    exempt = set(recipe.design_identity_exempt_arms or ())
+    groups: dict[tuple, list[Any]] = defaultdict(list)
+    skipped = 0
+    for row in pool:
+        if str(row.get(recipe.arm_column) or "") in exempt:
+            skipped += 1
+            continue
+        if any((row.get(c) or "") == "" for c in key_cols):
+            skipped += 1
+            continue
+        groups[tuple(str(row.get(c)) for c in key_cols)].append(row.get(recipe.id_column))
+    dups = {k: v for k, v in groups.items() if len(v) > 1}
+    if dups:
+        rows = tuple(
+            (ids[0], ids[1] if len(ids) > 1 else "", " / ".join(k))
+            for k, ids in sorted(dups.items())[:20]
+        )
+        return GateResult(
+            gate="G-UNIQUE", status=FAIL,
+            detail=(
+                f"{len(dups):,} group(s) of design(s), {sum(len(v) for v in dups.values()):,} "
+                f"oligo(s), share {tuple(key_cols)}. The same edit reached by the same guide is the "
+                f"same experiment twice, however the donor window is placed"
+            ),
+            header=("oligo_id", "duplicate_of", "shared key"),
+            rows=rows,
+        )
+    return GateResult(
+        gate="G-UNIQUE", status=PASS,
+        detail=(f"{len(groups):,} design(s) are unique on {tuple(key_cols)}"
+                + (f"; {skipped:,} row(s) exempt or key-incomplete" if skipped else "")),
+    )
+
+
 def gate_recut(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
@@ -768,6 +844,7 @@ def run_gates(
         # oligo, because a later stage can rebuild a donor and nothing else would notice.
         gate_restriction_sites(pool, recipe),
         gate_recut(pool, recipe),
+        gate_unique_design(pool, recipe),
     ]
 
 

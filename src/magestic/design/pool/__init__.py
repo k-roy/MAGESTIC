@@ -95,6 +95,7 @@ from .gates import (
     gate_coamplify,
     gate_restriction_sites,
     gate_recut,
+    gate_unique_design,
     donor_retains_target,
     restriction_site_offsets,
     run_gates,
@@ -134,6 +135,7 @@ __all__ = [
     "gate_coamplify",
     "gate_restriction_sites",
     "gate_recut",
+    "gate_unique_design",
     # the two predicates the gates are built from. A design-time step that rebuilds a donor
     # imports these rather than reimplementing them, so source and gate cannot diverge.
     "donor_retains_target",

@@ -311,6 +311,12 @@ class PoolRecipe:
     #: dropped the table on the floor while its own comment claimed "a future silent dedupe fails
     #: loudly". It could not. Kept as data so a checker can read it.
     invariants: Mapping[str, Any] = field(default_factory=dict)
+    #: ``[invariants] design_identity_key`` — the columns that jointly identify ONE design, read by
+    #: :func:`gate_unique_design`. There is no default on purpose: a gate that invents its own key
+    #: is how 20 duplicate designs shipped under a key that swept in 1,584 legitimate extra shots.
+    design_identity_key: tuple[str, ...] = ()
+    #: arms exempt from that uniqueness check, e.g. non-targeting controls that carry no coordinates.
+    design_identity_exempt_arms: tuple[str, ...] = ()
     arm_column: str = "arm"
     id_column: str = "oligo_id"
     sequence_column: str = "oligo_seq"
@@ -701,6 +707,15 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
     invariants = data.get("invariants", {}) or {}
     if not isinstance(invariants, Mapping):
         raise RecipeError("[invariants] must be a table")
+    did_key = tuple(invariants.get("design_identity_key", ()) or ())
+    did_exempt = tuple(invariants.get("design_identity_exempt_arms", ()) or ())
+    if did_key and not all(isinstance(c, str) and c for c in did_key):
+        raise RecipeError("[invariants] design_identity_key must be a list of column names")
+    if did_exempt and not did_key:
+        raise RecipeError(
+            "[invariants] design_identity_exempt_arms is declared without design_identity_key, "
+            "so the exemption applies to no check. Declare the key or drop the exemption."
+        )
 
     recipe = PoolRecipe(
         name=str(pool.get("name", "unnamed_pool")),
@@ -717,6 +732,8 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
         restriction_sites_per_oligo=per_oligo,
         recut_pam=recut_pam,
         invariants=invariants,
+        design_identity_key=did_key,
+        design_identity_exempt_arms=did_exempt,
         arm_column=str(pool.get("arm_column", "arm")),
         id_column=str(pool.get("id_column", "oligo_id")),
         sequence_column=str(pool.get("sequence_column", "oligo_seq")),
