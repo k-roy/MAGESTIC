@@ -901,6 +901,7 @@ def gate_gc_fraction(
 def gate_identifier_length(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
+    names_are_final: bool = True,
 ) -> GateResult:
     """G-IDLEN — no identifier may exceed the declared length.
 
@@ -916,6 +917,18 @@ def gate_identifier_length(
         return GateResult(
             gate="G-IDLEN", status=NOT_APPLICABLE,
             detail="no [invariants] max_oligo_id_chars declared, so no length is claimed",
+        )
+    # 🔴 THE GATE HAS TO RUN ON THE NAME THAT SHIPS. In this screen's pipeline the pool is built
+    # with the generator's own long identifiers and a later step rewrites every one of them into the
+    # short nine-field form, so running this at build time measures 23,000 names that nobody will
+    # ever see (longest 209) and says nothing about the order file. The caller therefore states
+    # which it is holding, and a provisional pool gets an explicit not_applicable naming the stage
+    # that does own the check, never a silent skip.
+    if not names_are_final:
+        return GateResult(
+            gate="G-IDLEN", status=NOT_APPLICABLE,
+            detail=(f"the caller declares these identifiers PROVISIONAL, so the {cap}-character "
+                    f"limit is not theirs to meet; it is checked on the renamed pool that ships"),
         )
     col = recipe.id_column
     if col not in _columns_of(pool):
@@ -1018,6 +1031,7 @@ def run_gates(
     recipe: PoolRecipe,
     columns: Sequence[str] | None = None,
     nontargeting_index: Any = None,
+    identifier_names_are_final: bool = True,
 ) -> list[GateResult]:
     """Run every composition gate and return their verdicts in a fixed order."""
     return [
@@ -1037,7 +1051,7 @@ def run_gates(
         # pool whose other eight gates all passed: a column that stopped being true of its own
         # molecule, an identifier the vendor has to carry, and a baseline arm that can be cut.
         gate_gc_fraction(pool, recipe),
-        gate_identifier_length(pool, recipe),
+        gate_identifier_length(pool, recipe, identifier_names_are_final),
         gate_nontargeting(pool, recipe, nontargeting_index),
     ]
 

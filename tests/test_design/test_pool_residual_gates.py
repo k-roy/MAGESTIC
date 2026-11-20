@@ -206,3 +206,31 @@ def test_half_a_screen_is_refused_at_load():
         rec('nontargeting_arms = ["scrambled"]')
     with pytest.raises(RecipeError):
         rec("nontargeting_max_genomic_mismatch = 2")
+
+
+# ------------------- G-IDLEN's scope: the name that ships, not the name in flight
+
+def test_idlen_on_provisional_names_is_not_applicable_and_says_why():
+    """🔴 Measured: run at build time this gate failed on 23,000 internal names, longest 209,
+    none of which reaches the order file. A gate pointed at the wrong artifact is noise."""
+    g = gate_identifier_length([row(oid="x" * 209)], rec("max_oligo_id_chars = 80"),
+                               names_are_final=False)
+    assert g.status == "not_applicable"
+    assert "PROVISIONAL" in g.detail and "renamed pool that ships" in g.detail
+
+
+def test_idlen_still_fails_when_the_names_are_final():
+    g = gate_identifier_length([row(oid="x" * 209)], rec("max_oligo_id_chars = 80"),
+                               names_are_final=True)
+    assert g.status == "fail"
+
+
+def test_run_gates_threads_the_scope_through():
+    from magestic.design.pool import run_gates
+    pool = [row(oid="x" * 209, arm="a", guide="T" * 20),
+            row(oid="scrambled_00001", arm="scrambled", guide="T" * 20)]
+    r = rec('gc_fraction_column = "gc_frac"\nmax_oligo_id_chars = 80')
+    by = {g.gate: g for g in run_gates(pool, r, identifier_names_are_final=False)}
+    assert by["G-IDLEN"].status == "not_applicable"
+    by = {g.gate: g for g in run_gates(pool, r, identifier_names_are_final=True)}
+    assert by["G-IDLEN"].status == "fail"
