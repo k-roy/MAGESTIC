@@ -21,7 +21,8 @@ from typing import Any, Mapping, Sequence
 
 from .gates import GateResult, assert_gates, run_gates
 from .recipe import PoolRecipe
-from .scramble import OligoArchitecture, gc_fraction, make_nontargeting_controls
+from .scramble import (OligoArchitecture, ProtospacerIndex, gc_fraction,
+                       make_nontargeting_controls)
 
 
 class PoolBuildError(ValueError):
@@ -228,6 +229,7 @@ def build_pool(
     row_template: Mapping[str, Any] | None = None,
     columns: Sequence[str] | None = None,
     on_gate_failure: str = "raise",
+    nontargeting_index: "ProtospacerIndex | None" = None,
 ) -> tuple[list[dict[str, Any]], BuildReport]:
     """Assemble the pool the *recipe* declares from the caller's *arms*.
 
@@ -391,11 +393,19 @@ def build_pool(
                 f"OligoArchitecture was passed for it; build_pool cannot invent the fixed "
                 f"priming and cloning sequences."
             )
+        # 🔴 The screen runs at DRAW time when an index is supplied, so a control with a near
+        # genomic target is never kept in the first place. G-NONTARGET below then re-asks the same
+        # question of the shipped arm: prevention and proof are different jobs and the pool needs
+        # both (NN 580 \u00a78, five cutting "non-targeting" controls).
         rows, gen_report = make_nontargeting_controls(
             target,
             designed_gc,
             arch,
             id_prefix=spec.name,
+            reject=(nontargeting_index.rejector()
+                    if nontargeting_index is not None
+                    and spec.name in set(recipe.nontargeting_arms or ())
+                    else None),
         )
         full: list[dict[str, Any]] = []
         for r in rows:
@@ -432,7 +442,8 @@ def build_pool(
         )
 
     # ---- the gates re-read the same recipe ----------------------------------------
-    report.gates = run_gates(pool, recipe, columns=columns)
+    report.gates = run_gates(pool, recipe, columns=columns,
+                             nontargeting_index=nontargeting_index)
     if on_gate_failure == "raise":
         assert_gates(report.gates)
     return pool, report

@@ -317,6 +317,18 @@ class PoolRecipe:
     design_identity_key: tuple[str, ...] = ()
     #: arms exempt from that uniqueness check, e.g. non-targeting controls that carry no coordinates.
     design_identity_exempt_arms: tuple[str, ...] = ()
+    #: ``[invariants] gc_fraction_column`` — the column that must AGREE with the sequence it
+    #: describes. A stage that rebuilds an oligo and forgets this column leaves a value that was
+    #: true of the molecule before the edit; 200 rows of v9 carried one (NN 580 §8.1).
+    gc_fraction_column: str | None = None
+    #: ``[invariants] max_oligo_id_chars`` — the identifier is column 1 of the order file, so its
+    #: length is a vendor-facing property of the pool, not cosmetics.
+    max_oligo_id_chars: int | None = None
+    #: ``[invariants] nontargeting_arms`` / ``nontargeting_max_genomic_mismatch`` — the arms that
+    #: claim not to target the genome, and how close a genomic PAM-adjacent site may come before
+    #: that claim is false.
+    nontargeting_arms: tuple[str, ...] = ()
+    nontargeting_max_genomic_mismatch: int | None = None
     arm_column: str = "arm"
     id_column: str = "oligo_id"
     sequence_column: str = "oligo_seq"
@@ -717,6 +729,36 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
             "so the exemption applies to no check. Declare the key or drop the exemption."
         )
 
+    gc_col = invariants.get("gc_fraction_column")
+    if gc_col is not None and not (isinstance(gc_col, str) and gc_col):
+        raise RecipeError("[invariants] gc_fraction_column must be a column name")
+    max_id = invariants.get("max_oligo_id_chars")
+    if max_id is not None:
+        if not isinstance(max_id, int) or isinstance(max_id, bool) or max_id <= 0:
+            raise RecipeError("[invariants] max_oligo_id_chars must be a positive integer")
+    nt_arms = tuple(invariants.get("nontargeting_arms", ()) or ())
+    nt_mm = invariants.get("nontargeting_max_genomic_mismatch")
+    if nt_arms and not all(isinstance(a, str) and a for a in nt_arms):
+        raise RecipeError("[invariants] nontargeting_arms must be a list of arm names")
+    if nt_mm is not None:
+        if not isinstance(nt_mm, int) or isinstance(nt_mm, bool) or nt_mm < 0:
+            raise RecipeError(
+                "[invariants] nontargeting_max_genomic_mismatch must be a non-negative integer"
+            )
+    # 🔴 Each half of the screen is useless alone, so neither may be declared alone: an arm list
+    # with no bound checks nothing, and a bound naming no arm applies to nothing. The same shape
+    # as design_identity_exempt_arms above, and for the same reason.
+    if nt_arms and nt_mm is None:
+        raise RecipeError(
+            "[invariants] nontargeting_arms is declared without nontargeting_max_genomic_mismatch, "
+            "so there is no bound to screen against. Declare both or neither."
+        )
+    if nt_mm is not None and not nt_arms:
+        raise RecipeError(
+            "[invariants] nontargeting_max_genomic_mismatch is declared without nontargeting_arms, "
+            "so the bound applies to no arm. Declare both or neither."
+        )
+
     recipe = PoolRecipe(
         name=str(pool.get("name", "unnamed_pool")),
         total=total,
@@ -734,6 +776,10 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
         invariants=invariants,
         design_identity_key=did_key,
         design_identity_exempt_arms=did_exempt,
+        gc_fraction_column=(str(gc_col) if gc_col else None),
+        max_oligo_id_chars=max_id,
+        nontargeting_arms=nt_arms,
+        nontargeting_max_genomic_mismatch=nt_mm,
         arm_column=str(pool.get("arm_column", "arm")),
         id_column=str(pool.get("id_column", "oligo_id")),
         sequence_column=str(pool.get("sequence_column", "oligo_seq")),

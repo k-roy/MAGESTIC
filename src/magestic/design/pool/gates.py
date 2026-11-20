@@ -826,10 +826,198 @@ def gate_recut(
     )
 
 
+# ---------------------------------------------------------------------------
+# G-GC, G-IDLEN, G-NONTARGET
+# ---------------------------------------------------------------------------
+
+def gate_gc_fraction(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+    tolerance: float = 5e-6,
+) -> GateResult:
+    """G-GC — every declared GC fraction must be true of the sequence on its own row.
+
+    🔴 **This is the same failure as G-RECUT and G-RESITE, in a different column.** A late stage
+    rebuilds an oligo and the columns describing the old molecule ride along unchanged. The codon
+    unit rule rebuilds a donor and splices a new 200-mer; nothing recomputed ``gc_frac``, so 200
+    rows of the v9 pool carried the GC of the molecule *before* its own edit, some of them the
+    pre-edit value shared by two different alleles (NN 580 §8.1).
+
+    ⚠️ **Stated honestly: nothing downstream of this column was wrong.** ``gc_frac`` exists to flag
+    oligos outside a synthesisable 25-75 % band and the whole pool sits inside 27-70 %, so this
+    gate protects an ANNOTATION, not the synthesis. It earns its place because a column that
+    silently describes a different molecule is how a reader is misled later, and because the cheap
+    gate is the one that proves no future stage forgot.
+
+    Declared as ``[invariants] gc_fraction_column``. Undeclared is ``not_applicable``; declared but
+    naming a column the pool does not have is a FAIL, because a check that cannot be made is not a
+    check.
+    """
+    col = recipe.gc_fraction_column
+    if not col:
+        return GateResult(
+            gate="G-GC", status=NOT_APPLICABLE,
+            detail="no [invariants] gc_fraction_column declared, so nothing claims a GC fraction",
+        )
+    seq_col = recipe.sequence_column
+    present = _columns_of(pool)
+    missing = [c for c in (col, seq_col) if c not in present]
+    if missing:
+        return GateResult(
+            gate="G-GC", status=FAIL,
+            detail=(f"gc_fraction_column/sequence_column name column(s) the pool does not have: "
+                    f"{missing}. A column that cannot be read is not a check."),
+        )
+    bad: list[tuple[Any, ...]] = []
+    checked = 0
+    for row in pool:
+        seq = str(row.get(seq_col) or "")
+        raw = row.get(col)
+        if not seq or raw is None or str(raw).strip() == "":
+            continue
+        try:
+            declared = float(raw)
+        except (TypeError, ValueError):
+            bad.append((row.get(recipe.id_column), raw, "not a number"))
+            continue
+        checked += 1
+        true = (seq.upper().count("G") + seq.upper().count("C")) / len(seq)
+        if abs(declared - true) > tolerance:
+            bad.append((row.get(recipe.id_column), f"{declared:.5f}", f"{true:.5f}"))
+    if bad:
+        return GateResult(
+            gate="G-GC", status=FAIL,
+            detail=(f"{len(bad):,} row(s) declare a {col} that is not true of their own "
+                    f"{seq_col}. A stage that rebuilt the molecule did not recompute the column"),
+            header=("oligo_id", "declared", "sequence"),
+            rows=tuple(bad[:20]),
+        )
+    return GateResult(
+        gate="G-GC", status=PASS,
+        detail=f"{checked:,} row(s) carry a {col} that matches their own {seq_col}",
+    )
+
+
+def gate_identifier_length(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+) -> GateResult:
+    """G-IDLEN — no identifier may exceed the declared length.
+
+    The identifier is **column 1 of the order file**, so its length is a property the vendor and
+    the collaborator both see, not cosmetics. v9 shipped 110 names over 80 characters with a
+    maximum of 151, every one of them carrying a long indel allele inline (NN 580 §8.2).
+
+    Declared as ``[invariants] max_oligo_id_chars``. Undeclared is ``not_applicable``: this gate
+    does not invent a vendor's limit.
+    """
+    cap = recipe.max_oligo_id_chars
+    if cap is None:
+        return GateResult(
+            gate="G-IDLEN", status=NOT_APPLICABLE,
+            detail="no [invariants] max_oligo_id_chars declared, so no length is claimed",
+        )
+    col = recipe.id_column
+    if col not in _columns_of(pool):
+        return GateResult(
+            gate="G-IDLEN", status=FAIL,
+            detail=f"id_column {col!r} is not a column of this pool, so lengths cannot be checked",
+        )
+    over = [(row.get(col), len(str(row.get(col) or ""))) for row in pool
+            if len(str(row.get(col) or "")) > cap]
+    if over:
+        over.sort(key=lambda x: -x[1])
+        return GateResult(
+            gate="G-IDLEN", status=FAIL,
+            detail=(f"{len(over):,} identifier(s) exceed {cap} characters, longest "
+                    f"{over[0][1]}. The identifier is column 1 of the order file"),
+            header=("oligo_id", "characters"),
+            rows=tuple(over[:20]),
+        )
+    longest = max((len(str(row.get(col) or "")) for row in pool), default=0)
+    return GateResult(
+        gate="G-IDLEN", status=PASS,
+        detail=f"every identifier is at most {cap} characters (longest {longest})",
+    )
+
+
+def gate_nontargeting(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+    index: Any = None,
+) -> GateResult:
+    """G-NONTARGET — an arm that claims not to target the genome must not target the genome.
+
+    🔴 **An exact-match check passed here and proved nothing.** Five of a thousand "non-targeting"
+    controls carried a genomic site two mismatches from their guide with an NGG PAM, and three of
+    the six sites held both mismatches outside the PAM-proximal seed, which is the regime SpCas9
+    tolerates best (NN 568 Team A). The closest approach of those guides is two mismatches, never
+    zero or one, so a test for a perfect site could never have found them. This is the one defect
+    on that list with a scientific consequence: the non-targeting arm is the baseline the whole
+    screen is normalised against, and a baseline that cuts is not a baseline.
+
+    Declared as ``[invariants] nontargeting_arms`` and ``nontargeting_max_genomic_mismatch``.
+    Undeclared is ``not_applicable``. 🔴 **Declared without an index is a FAIL**, never a skip: the
+    recipe says this pool claims something the build was then unable to verify, and a claim nobody
+    checked is exactly what shipped the five.
+    """
+    arms = tuple(recipe.nontargeting_arms or ())
+    max_mm = recipe.nontargeting_max_genomic_mismatch
+    if not arms or max_mm is None:
+        return GateResult(
+            gate="G-NONTARGET", status=NOT_APPLICABLE,
+            detail="no [invariants] nontargeting_arms screen declared",
+        )
+    if index is None:
+        return GateResult(
+            gate="G-NONTARGET", status=FAIL,
+            detail=(f"the recipe declares arm(s) {arms} non-targeting within {max_mm} mismatch(es) "
+                    f"but the build supplied no genomic index, so the claim was never checked. "
+                    f"An unverifiable claim is not a passing one."),
+        )
+    if getattr(index, "max_mm", max_mm) < max_mm:
+        return GateResult(
+            gate="G-NONTARGET", status=FAIL,
+            detail=(f"the index tolerates {getattr(index, 'max_mm', None)} mismatch(es) but the "
+                    f"recipe declares {max_mm}. A narrower index cannot answer the wider question."),
+        )
+    armset = set(arms)
+    bad: list[tuple[Any, ...]] = []
+    checked = 0
+    for row in pool:
+        if str(row.get(recipe.arm_column) or "") not in armset:
+            continue
+        guide = str(row.get("guide_seq") or "")
+        if not guide:
+            continue
+        checked += 1
+        for (chrom, pos, strand, pam), mm in index.hits(guide):
+            if len(mm) <= max_mm:
+                bad.append((row.get(recipe.id_column), f"{chrom}:{pos}{strand}", pam,
+                            len(mm), ",".join(str(x) for x in mm)))
+    if bad:
+        guilty = {b[0] for b in bad}
+        return GateResult(
+            gate="G-NONTARGET", status=FAIL,
+            detail=(f"{len(guilty):,} supposedly non-targeting guide(s) have {len(bad):,} genomic "
+                    f"site(s) within {max_mm} mismatch(es) of a {getattr(index, 'pam', 'PAM')}. "
+                    f"A control that can be cut is not a baseline"),
+            header=("oligo_id", "site", "pam", "mismatches", "offsets"),
+            rows=tuple(bad[:20]),
+        )
+    return GateResult(
+        gate="G-NONTARGET", status=PASS,
+        detail=(f"{checked:,} guide(s) in {arms} have no genomic "
+                f"{getattr(index, 'pam', 'PAM')} site within {max_mm} mismatch(es) "
+                f"({len(index):,} genomic protospacers searched)"),
+    )
+
+
 def run_gates(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
     columns: Sequence[str] | None = None,
+    nontargeting_index: Any = None,
 ) -> list[GateResult]:
     """Run every composition gate and return their verdicts in a fixed order."""
     return [
@@ -845,6 +1033,12 @@ def run_gates(
         gate_restriction_sites(pool, recipe),
         gate_recut(pool, recipe),
         gate_unique_design(pool, recipe),
+        # G-GC, G-IDLEN and G-NONTARGET close the three residual classes NN 580 §8 measured on a
+        # pool whose other eight gates all passed: a column that stopped being true of its own
+        # molecule, an identifier the vendor has to carry, and a baseline arm that can be cut.
+        gate_gc_fraction(pool, recipe),
+        gate_identifier_length(pool, recipe),
+        gate_nontargeting(pool, recipe, nontargeting_index),
     ]
 
 

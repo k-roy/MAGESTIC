@@ -86,6 +86,9 @@ from .build import (
     PoolBuildError,
 )
 from .gates import (
+    gate_gc_fraction,
+    gate_identifier_length,
+    gate_nontargeting,
     GateResult,
     PoolGateError,
     gate_composition,
@@ -102,7 +105,8 @@ from .gates import (
     assert_gates,
     format_gate_results,
 )
-from .scramble import make_nontargeting_controls, OligoArchitecture, ks_statistic
+from .scramble import (make_nontargeting_controls, OligoArchitecture, ks_statistic,
+                       ProtospacerIndex)
 from .diff import diff_pools, DiffReport
 
 __all__ = [
@@ -136,6 +140,9 @@ __all__ = [
     "gate_restriction_sites",
     "gate_recut",
     "gate_unique_design",
+    "gate_gc_fraction",
+    "gate_identifier_length",
+    "gate_nontargeting",
     # the two predicates the gates are built from. A design-time step that rebuilds a donor
     # imports these rather than reimplementing them, so source and gate cannot diverge.
     "donor_retains_target",
@@ -147,6 +154,7 @@ __all__ = [
     "make_nontargeting_controls",
     "OligoArchitecture",
     "ks_statistic",
+    "ProtospacerIndex",
     # diff
     "diff_pools",
     "DiffReport",

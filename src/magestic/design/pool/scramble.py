@@ -26,7 +26,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 _COMPLEMENT = str.maketrans("ACGTN", "TGCAN")
 
@@ -101,6 +101,116 @@ class OligoArchitecture:
         )
 
 
+#: IUPAC degenerate bases, expanded. Kept LOCAL for the same reason ``gates.py`` keeps its copy
+#: local: stage 0 of the pool pipeline content-verifies exactly the six files of this package
+#: against the pinned commit, so a screen that imported its matcher from elsewhere in magestic
+#: would depend on a file whose contents nothing checks.
+_IUPAC = {
+    "A": "A", "C": "C", "G": "G", "T": "T",
+    "R": "AG", "Y": "CT", "S": "CG", "W": "AT", "K": "GT", "M": "AC",
+    "B": "CGT", "D": "AGT", "H": "ACT", "V": "ACG", "N": "ACGT",
+}
+
+
+def _pam_matches(pattern: str, seq: str) -> bool:
+    return len(seq) == len(pattern) and all(
+        b in _IUPAC.get(p, p) for p, b in zip(pattern.upper(), seq.upper())
+    )
+
+
+class ProtospacerIndex:
+    """Every PAM-adjacent genomic protospacer, indexed for an EXACT mismatch-tolerant lookup.
+
+    🔴 **A test for a perfect genomic match cannot find a near target, and that is how five
+    "non-targeting" controls shipped in a 24,000-oligo pool** (NN 568 Team A, NN 580 §8). The
+    closest approach of the offending guides is TWO mismatches, never 0 or 1, so an exact-match
+    check passed and proved nothing. Three of the six sites carried both mismatches entirely
+    outside the PAM-proximal seed, the regime SpCas9 tolerates best. A control Cas9 can cut is not
+    a baseline, and it contaminates the arm the whole screen is normalised against.
+
+    The lookup is **pigeonhole-exact, not heuristic**: with at most ``max_mm`` mismatches over a
+    ``guide_length``-nt word split into ``max_mm + 1`` blocks, at least one block must be identical,
+    so indexing every protospacer under each of its block strings and then verifying candidates in
+    full finds every qualifying site and misses none. A seed-only or BLAST-style screen would not
+    carry that guarantee, and the whole point here is that the previous screen looked like a check.
+    """
+
+    __slots__ = ("guide_length", "max_mm", "pam", "_protos", "_meta", "_idx", "_blocks")
+
+    def __init__(self, guide_length: int = 20, max_mm: int = 2, pam: str = "NGG"):
+        self.guide_length = guide_length
+        self.max_mm = max_mm
+        self.pam = pam.upper()
+        self._protos: list[str] = []
+        self._meta: list[tuple[str, int, str, str]] = []
+        self._blocks = self._block_bounds(guide_length, max_mm)
+        self._idx: list[dict[str, list[int]]] = [{} for _ in self._blocks]
+
+    @staticmethod
+    def _block_bounds(n: int, m: int) -> list[tuple[int, int]]:
+        k = m + 1
+        cuts = [round(i * n / k) for i in range(k + 1)]
+        return [(cuts[i], cuts[i + 1]) for i in range(k)]
+
+    @classmethod
+    def from_genome(cls, genome: Mapping[str, str], guide_length: int = 20,
+                    max_mm: int = 2, pam: str = "NGG") -> "ProtospacerIndex":
+        """Index ``{chrom: sequence}`` on both strands. Minutes of work, done once per build."""
+        self = cls(guide_length, max_mm, pam)
+        g, p = guide_length, len(pam)
+        for chrom, seq in genome.items():
+            seq = seq.upper()
+            n = len(seq)
+            for strand, s in (("+", seq), ("-", rev_comp(seq))):
+                for i in range(n - g - p + 1):
+                    if not _pam_matches(self.pam, s[i + g:i + g + p]):
+                        continue
+                    proto = s[i:i + g]
+                    if "N" in proto:
+                        continue
+                    j = len(self._protos)
+                    self._protos.append(proto)
+                    # report the PLUS-strand start of the protospacer either way, so a hit is
+                    # locatable in the reference without the reader redoing the arithmetic
+                    self._meta.append((chrom, i if strand == "+" else n - i - g, strand,
+                                       s[i + g:i + g + p]))
+                    for b, (a, z) in enumerate(self._blocks):
+                        self._idx[b].setdefault(proto[a:z], []).append(j)
+        return self
+
+    def __len__(self) -> int:
+        return len(self._protos)
+
+    def hits(self, guide: str) -> list[tuple[tuple[str, int, str, str], list[int]]]:
+        """Every genomic site within ``max_mm`` mismatches of ``guide``, with its mismatch offsets."""
+        guide = (guide or "").upper()
+        if len(guide) != self.guide_length:
+            return []
+        seen: set[int] = set()
+        found = []
+        for b, (a, z) in enumerate(self._blocks):
+            for j in self._idx[b].get(guide[a:z], ()):
+                if j in seen:
+                    continue
+                seen.add(j)
+                proto = self._protos[j]
+                mm = [k for k in range(self.guide_length) if guide[k] != proto[k]]
+                if len(mm) <= self.max_mm:
+                    found.append((self._meta[j], mm))
+        return found
+
+    def rejector(self):
+        """A ``reject(guide, oligo)`` callable for :func:`make_nontargeting_controls`."""
+        def reject(guide: str, oligo: str) -> str | None:
+            h = self.hits(guide)
+            if not h:
+                return None
+            (chrom, pos, strand, pam), mm = h[0]
+            return (f"genomic {self.pam} site at {chrom}:{pos}{strand} within "
+                    f"{len(mm)} mismatch(es)")
+        return reject
+
+
 def _draw(rng: random.Random, target_gc: float, length: int) -> str:
     return "".join(
         rng.choice("GC") if rng.random() < target_gc else rng.choice("AT")
@@ -119,6 +229,7 @@ def make_nontargeting_controls(
     id_prefix: str = "scrambled",
     id_width: int = 5,
     max_tries_per_oligo: int = 4000,
+    reject: "Callable[[str, str], str | None] | None" = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Make exactly *n* non-targeting controls matching the *reference_gc* distribution.
 
@@ -171,6 +282,7 @@ def make_nontargeting_controls(
         return sum(oligo.count(s) for s in restriction_sites) == 1
 
     rows: list[dict[str, Any]] = []
+    rejected: Counter = Counter()
 
     def _make_in_bin(b: int, k: int, budget: int) -> int:
         """Append up to *k* oligos whose GC lands in bin *b*; return how many were made."""
@@ -184,6 +296,13 @@ def make_nontargeting_controls(
             g = gc_fraction(oligo)
             if not (lo <= g < hi) or not _acceptable(oligo):
                 continue
+            # 🔴 THE CANDIDATE IS SCREENED BEFORE IT IS KEPT, not audited after the pool ships.
+            # A rejected draw costs one more loop; a rejected draw that nobody made costs an arm.
+            if reject is not None:
+                why = reject(variable[: architecture.guide_length], oligo)
+                if why is not None:
+                    rejected[why.split(" at ")[0]] += 1
+                    continue
             made += 1
             rows.append(
                 {
@@ -234,6 +353,8 @@ def make_nontargeting_controls(
         "trimmed": trimmed,
         "bin_width": bin_width,
         "seed": seed,
+        "screened": reject is not None,
+        "rejected_by_screen": dict(rejected),
         "ks_statistic_vs_reference": round(ks_statistic(reference_gc, made_gc), 5),
         "reference_gc_median": round(ref_sorted[len(ref_sorted) // 2], 5),
         "generated_gc_median": round(sorted(made_gc)[len(made_gc) // 2], 5),
