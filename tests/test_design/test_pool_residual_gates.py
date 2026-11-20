@@ -287,3 +287,69 @@ def test_half_a_recoded_flag_declaration_is_refused_at_load():
         rec('recoded_flag_arms = ["a"]')
     with pytest.raises(RecipeError):
         rec('recoded_flag_column = "recoded"')
+
+
+# --------------------------------------------------------------- G-CODON
+
+AAC = 'aa_change_column = "aa_change"'
+
+
+def arow(oid="o1", aa="Q37R", arm="a"):
+    return {"oligo_id": oid, "subpool": arm, "oligo_seq": "ACGT", "aa_change": aa}
+
+
+def test_codon_undeclared_is_not_applicable():
+    from magestic.design.pool import gate_aa_change_codon
+    assert gate_aa_change_codon([arow()], rec("")).status == "not_applicable"
+
+
+def test_codon_declared_without_a_resolver_FAILS():
+    """🔴 The house rule: a claim the build could not check is not a passing claim."""
+    from magestic.design.pool import gate_aa_change_codon
+    g = gate_aa_change_codon([arow()], rec(AAC), None)
+    assert g.status == "fail" and "never checked" in g.detail
+
+
+def test_codon_naming_a_residue_that_changes_passes():
+    from magestic.design.pool import gate_aa_change_codon
+    assert gate_aa_change_codon([arow(aa="Q37R")], rec(AAC), lambda r: {37}).status == "pass"
+
+
+def test_codon_off_by_one_fails_which_is_the_shipped_shape():
+    """The measured defect: the parent block's first changed codon, one below the unit's."""
+    from magestic.design.pool import gate_aa_change_codon
+    g = gate_aa_change_codon([arow(oid="natural_YGL237C", aa="Q37R")], rec(AAC), lambda r: {38})
+    assert g.status == "fail"
+    assert "natural_YGL237C" in str(g.rows) and "38" in str(g.rows)
+
+
+def test_codon_several_changed_residues_accepts_any_of_them():
+    from magestic.design.pool import gate_aa_change_codon
+    assert gate_aa_change_codon([arow(aa="Q37R")], rec(AAC), lambda r: {37, 38}).status == "pass"
+
+
+def test_codon_a_row_outside_coding_sequence_is_skipped_not_failed():
+    """The resolver returns None where it cannot answer; that is not a defect in the row."""
+    from magestic.design.pool import gate_aa_change_codon
+    assert gate_aa_change_codon([arow()], rec(AAC), lambda r: None).status == "pass"
+
+
+def test_codon_a_blank_aa_change_is_skipped():
+    from magestic.design.pool import gate_aa_change_codon
+    assert gate_aa_change_codon([arow(aa="")], rec(AAC), lambda r: {99}).status == "pass"
+
+
+def test_codon_a_synonymous_marker_with_no_number_is_skipped():
+    from magestic.design.pool import gate_aa_change_codon
+    assert gate_aa_change_codon([arow(aa="=")], rec(AAC), lambda r: {99}).status == "pass"
+
+
+def test_run_gates_threads_the_resolver():
+    from magestic.design.pool import run_gates
+    pool = [arow(arm="a"), {"oligo_id": "s1", "subpool": "scrambled", "oligo_seq": "ACGT",
+                            "aa_change": ""}]
+    r = rec(AAC)
+    by = {g.gate: g for g in run_gates(pool, r)}
+    assert by["G-CODON"].status == "fail"            # declared, no resolver
+    by = {g.gate: g for g in run_gates(pool, r, changed_codons=lambda x: {37})}
+    assert by["G-CODON"].status == "pass"

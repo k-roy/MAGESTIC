@@ -231,6 +231,7 @@ def build_pool(
     on_gate_failure: str = "raise",
     nontargeting_index: "ProtospacerIndex | None" = None,
     identifier_names_are_final: bool = True,
+    changed_codons: Any = None,
 ) -> tuple[list[dict[str, Any]], BuildReport]:
     """Assemble the pool the *recipe* declares from the caller's *arms*.
 
@@ -445,7 +446,8 @@ def build_pool(
     # ---- the gates re-read the same recipe ----------------------------------------
     report.gates = run_gates(pool, recipe, columns=columns,
                              nontargeting_index=nontargeting_index,
-                             identifier_names_are_final=identifier_names_are_final)
+                             identifier_names_are_final=identifier_names_are_final,
+                             changed_codons=changed_codons)
     if on_gate_failure == "raise":
         assert_gates(report.gates)
     return pool, report

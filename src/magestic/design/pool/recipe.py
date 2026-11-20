@@ -333,6 +333,9 @@ class PoolRecipe:
     #: the boolean that says so can be checked BOTH ways: true inside them, false outside.
     recoded_flag_arms: tuple[str, ...] = ()
     recoded_flag_column: str | None = None
+    #: ``[invariants] aa_change_column`` — the column naming the residue a design changes. Checked
+    #: against the codons that ACTUALLY change, which only a caller holding the genome can resolve.
+    aa_change_column: str | None = None
     arm_column: str = "arm"
     id_column: str = "oligo_id"
     sequence_column: str = "oligo_seq"
@@ -740,6 +743,9 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
     if max_id is not None:
         if not isinstance(max_id, int) or isinstance(max_id, bool) or max_id <= 0:
             raise RecipeError("[invariants] max_oligo_id_chars must be a positive integer")
+    aa_col = invariants.get("aa_change_column")
+    if aa_col is not None and not (isinstance(aa_col, str) and aa_col):
+        raise RecipeError("[invariants] aa_change_column must be a column name")
     rf_arms = tuple(invariants.get("recoded_flag_arms", ()) or ())
     rf_col = invariants.get("recoded_flag_column")
     if rf_arms and not all(isinstance(x, str) and x for x in rf_arms):
@@ -796,6 +802,7 @@ def _from_mapping(data: Mapping[str, Any], source: Path | None = None) -> PoolRe
         nontargeting_max_genomic_mismatch=nt_mm,
         recoded_flag_arms=rf_arms,
         recoded_flag_column=(str(rf_col) if rf_col else None),
+        aa_change_column=(str(aa_col) if aa_col else None),
         arm_column=str(pool.get("arm_column", "arm")),
         id_column=str(pool.get("id_column", "oligo_id")),
         sequence_column=str(pool.get("sequence_column", "oligo_seq")),

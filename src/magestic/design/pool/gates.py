@@ -958,6 +958,83 @@ _TRUEY = {"true", "t", "yes", "y", "1"}
 _FALSEY = {"false", "f", "no", "n", "0", ""}
 
 
+def gate_aa_change_codon(
+    pool: Sequence[Mapping[str, Any]],
+    recipe: PoolRecipe,
+    changed_codons: Any = None,
+) -> GateResult:
+    """G-CODON — the residue a design names must be a residue that actually changes.
+
+    🔴 **THE CALLER WAS BLAMED FOR THIS AND THE CALLER IS CORRECT.** An audit described the symptom
+    exactly, *"the consequence is computed at the codon on the edge of the multi-nucleotide ref/alt
+    block instead of the codon containing the differing base"*, and placed the cause in the
+    consequence annotator. Measured per pipeline stage, the annotator's own output had **0** wrong
+    rows and the stage after it had **13**: the codon-splitting rule rewrites a row's allele and the
+    annotation written for the PARENT rides along, so the named codon is one lower than the real one.
+
+    That is the **third** defect of this exact shape from that one stage, after 127 donors that
+    retained their own guide and 63 that carried an internal cloning site. A stage that rebuilds a
+    row must re-ask every question the row already answered, and this gate is what proves it did.
+
+    ``changed_codons`` is ``(row) -> set[int] | None`` returning the 1-based residue positions that
+    differ between the reference and edited translations, or ``None`` where the row is outside a
+    coding sequence or its coordinates do not resolve. Only the CALLER has the genome and the CDS
+    model, so the plumbing stays there and the predicate lives here, with one implementation.
+
+    Declared as ``[invariants] aa_change_column``. Undeclared is ``not_applicable``; declared with no
+    resolver is a FAIL, because a claim the build could not check is not a passing one.
+    """
+    col = recipe.aa_change_column
+    if not col:
+        return GateResult(
+            gate="G-CODON", status=NOT_APPLICABLE,
+            detail="no [invariants] aa_change_column declared, so no residue is claimed",
+        )
+    if col not in _columns_of(pool):
+        return GateResult(
+            gate="G-CODON", status=FAIL,
+            detail=f"aa_change_column {col!r} is not a column of this pool",
+        )
+    if changed_codons is None:
+        return GateResult(
+            gate="G-CODON", status=FAIL,
+            detail=(f"the recipe declares {col!r} but the build supplied no resolver for the codons "
+                    f"that change, so the claim was never checked. An unverifiable claim is not a "
+                    f"passing one."),
+        )
+    bad: list[tuple[Any, ...]] = []
+    checked = 0
+    for row in pool:
+        declared_text = str(row.get(col) or "").strip()
+        if not declared_text:
+            continue
+        digits = "".join(c for c in declared_text if c.isdigit())
+        if not digits:
+            continue
+        real = changed_codons(row)
+        if real is None:
+            continue
+        checked += 1
+        if not real:
+            continue
+        declared = int(digits)
+        if declared not in real:
+            bad.append((row.get(recipe.id_column), str(row.get(recipe.arm_column) or ""),
+                        declared_text, declared, ",".join(str(x) for x in sorted(real))))
+    if bad:
+        return GateResult(
+            gate="G-CODON", status=FAIL,
+            detail=(f"{len(bad):,} row(s) name a residue that does not change. A stage that rewrote "
+                    f"the allele did not re-run the consequence call"),
+            header=("oligo_id", "arm", col, "declared codon", "codons that change"),
+            rows=tuple(bad[:20]),
+        )
+    return GateResult(
+        gate="G-CODON", status=PASS,
+        detail=f"{checked:,} row(s) name a residue that their own alleles actually change",
+    )
+
+
 def gate_recoded_flag(
     pool: Sequence[Mapping[str, Any]],
     recipe: PoolRecipe,
@@ -1113,6 +1190,7 @@ def run_gates(
     columns: Sequence[str] | None = None,
     nontargeting_index: Any = None,
     identifier_names_are_final: bool = True,
+    changed_codons: Any = None,
 ) -> list[GateResult]:
     """Run every composition gate and return their verdicts in a fixed order."""
     return [
@@ -1135,6 +1213,7 @@ def run_gates(
         gate_identifier_length(pool, recipe, identifier_names_are_final),
         gate_nontargeting(pool, recipe, nontargeting_index),
         gate_recoded_flag(pool, recipe),
+        gate_aa_change_codon(pool, recipe, changed_codons),
     ]
 
 
